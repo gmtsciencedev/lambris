@@ -1,8 +1,9 @@
 # lambris
 
-A terminal parquet file viewer, in the manner of [csvlens](https://github.com/YS-L/csvlens).
+A terminal viewer for parquet, CSV, and TSV files, in the manner of
+[csvlens](https://github.com/YS-L/csvlens).
 
-Opens a `.parquet` file and lets you scroll around it in a TUI — a header row with
+Opens a data file and lets you scroll around it in a TUI — a header row with
 column names, a row-number gutter, a status bar showing the selected cell's column
 name and Arrow type, and truncation of wide values. Null values render as a
 highlighted `NA`. Supports global regex search (`/`), column-scoped search
@@ -41,6 +42,16 @@ info view.
 While typing a search or filter, `Enter` commits and `Esc` cancels. Submitting an
 empty query clears that search/filter.
 
+## Formats
+
+The format is autodetected:
+
+- **Parquet** — recognised by its `PAR1` magic number.
+- **CSV / TSV** — anything else is read as delimited text. The delimiter comes
+  from the extension (`.tsv`/`.tab` → tab, `.csv` → comma) or, for unknown
+  extensions, is sniffed from the header line. The first row is treated as a
+  header, and column types are inferred from a sample of the data.
+
 ## Scope
 
 Core viewer plus regex search, row filtering, type-aware sorting, and column
@@ -49,10 +60,12 @@ filter, and the cursor stays on the same record across a re-sort.
 
 ## How it works
 
-The whole file is read into memory and its row groups concatenated into a single
-Arrow `RecordBatch`, so cell access is an O(1) index into one array per column.
-Cells are formatted on demand for the visible window using Arrow's `ArrayFormatter`,
-and column widths are computed from the visible rows each frame.
+Every format is read fully into memory and concatenated into a single Arrow
+`RecordBatch`, so cell access is an O(1) index into one array per column — and
+everything above the loader (sorting, filtering, search, null handling) is
+format-agnostic. Cells are formatted on demand for the visible window using
+Arrow's `ArrayFormatter`, and column widths are computed from the visible rows
+each frame.
 
 ## Development
 

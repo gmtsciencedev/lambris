@@ -104,6 +104,17 @@ mod tests {
         path
     }
 
+    /// Write `content` to a uniquely-named temp file with the given extension.
+    fn write_text_fixture(ext: &str, content: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!("lambris_test_text_{n}.{ext}"));
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
     fn buffer_text(app: &mut App, w: u16, h: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal
@@ -137,6 +148,44 @@ mod tests {
         assert_eq!(ds.column_types, vec!["Int64", "Utf8", "Int64"]);
         assert!(ds.is_null(2, 0), "row 0 score should be null");
         assert!(!ds.is_null(2, 1), "row 1 score should be present");
+    }
+
+    #[test]
+    fn loads_csv_with_inferred_types_and_nulls() {
+        let csv = "id,name,score\n1,alpha,10\n2,beta,\n3,gamma,30\n";
+        let ds = Dataset::load(&write_text_fixture("csv", csv)).unwrap();
+        assert_eq!(ds.nrows, 3);
+        assert_eq!(ds.ncols, 3);
+        assert_eq!(ds.column_names, vec!["id", "name", "score"]);
+        // Types are inferred from the data.
+        assert_eq!(ds.column_types, vec!["Int64", "Utf8", "Int64"]);
+        // The empty score cell (row index 1) is a null.
+        assert!(ds.is_null(2, 1), "empty field should parse as null");
+
+        // The Arrow pipeline (formatters, NA rendering) works on CSV too.
+        let mut app = App::new(ds);
+        let text = buffer_text(&mut app, 60, 10);
+        assert!(text.contains("alpha"), "cell missing: {text}");
+        assert!(text.contains("NA"), "null not rendered as NA: {text}");
+    }
+
+    #[test]
+    fn loads_tsv_by_extension() {
+        let tsv = "id\tname\n1\talpha\n2\tbeta\n";
+        let ds = Dataset::load(&write_text_fixture("tsv", tsv)).unwrap();
+        assert_eq!(ds.ncols, 2, "tab delimiter split into two columns");
+        assert_eq!(ds.nrows, 2);
+        assert_eq!(ds.column_names, vec!["id", "name"]);
+    }
+
+    #[test]
+    fn detects_delimiter_for_unknown_extension() {
+        // A .txt file with tab-separated content must be sniffed as TSV;
+        // if it were parsed as CSV the whole line would be a single column.
+        let tsv = "a\tb\tc\n1\t2\t3\n";
+        let ds = Dataset::load(&write_text_fixture("txt", tsv)).unwrap();
+        assert_eq!(ds.ncols, 3, "sniffed tab delimiter");
+        assert_eq!(ds.nrows, 1);
     }
 
     #[test]
