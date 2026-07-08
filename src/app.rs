@@ -38,10 +38,26 @@ pub struct Search {
     pub re: Regex,
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum SortDir {
+    Asc,
+    Desc,
+}
+
+/// The column the view is currently sorted by, and in which direction.
+#[derive(Clone, Copy)]
+pub struct SortSpec {
+    pub col: usize,
+    pub dir: SortDir,
+}
+
 /// UI state: selection, viewport, the current row view, and search/filter.
 pub struct App {
     pub data: Dataset,
-    /// Original row indices currently shown (all rows, or the filter result).
+    /// Original row indices matching the current filter, in natural order.
+    /// `rows` is derived from this by applying the active sort.
+    base_rows: Vec<usize>,
+    /// Original row indices currently shown (filter applied, then sorted).
     pub rows: Vec<usize>,
     pub row_offset: usize,
     pub col_offset: usize,
@@ -64,15 +80,21 @@ pub struct App {
     /// When set, the bottom line shows the selected column's info instead of
     /// the command hints (toggled with `i`).
     pub show_info: bool,
+    /// Number of leftmost columns pinned in place while scrolling horizontally.
+    pub frozen_cols: usize,
+    /// Active sort, if any.
+    pub sort: Option<SortSpec>,
     /// State for held-key scroll acceleration.
     repeat: Option<Repeat>,
 }
 
 impl App {
     pub fn new(data: Dataset) -> Self {
-        let rows = (0..data.nrows).collect();
+        let base_rows: Vec<usize> = (0..data.nrows).collect();
+        let rows = base_rows.clone();
         Self {
             data,
+            base_rows,
             rows,
             row_offset: 0,
             col_offset: 0,
@@ -87,6 +109,8 @@ impl App {
             filter_query: None,
             status_msg: None,
             show_info: false,
+            frozen_cols: 0,
+            sort: None,
             repeat: None,
         }
     }
@@ -134,6 +158,8 @@ impl App {
             }
 
             KeyCode::Char('i') => self.show_info = !self.show_info,
+            KeyCode::Char('s') => self.cycle_sort(),
+            KeyCode::Char('f') if !ctrl => self.toggle_freeze(),
             KeyCode::Char('/') => self.enter_input(InputKind::Search),
             KeyCode::Char('&') => self.enter_input(InputKind::Filter),
             KeyCode::Char(':') => self.enter_input(InputKind::Goto),
@@ -252,8 +278,9 @@ impl App {
         match self.data.filter_rows(&re) {
             Ok(rows) => {
                 let n = rows.len();
-                self.rows = rows;
+                self.base_rows = rows;
                 self.filter_query = Some(query);
+                self.rebuild_rows();
                 self.selected_row = 0;
                 self.row_offset = 0;
                 self.status_msg = Some(format!("{n} rows matched"));
@@ -264,10 +291,66 @@ impl App {
 
     fn clear_filter(&mut self) {
         self.filter_query = None;
-        self.rows = (0..self.data.nrows).collect();
-        self.selected_row = self.selected_row.min(self.last_row());
-        self.row_offset = 0;
+        self.base_rows = (0..self.data.nrows).collect();
+        self.rebuild_rows();
         self.status_msg = Some("filter cleared".into());
+    }
+
+    /// Cycle the selected column through none → ascending → descending → none.
+    fn cycle_sort(&mut self) {
+        if self.data.ncols == 0 {
+            return;
+        }
+        let col = self.selected_col;
+        let next = match self.sort {
+            Some(s) if s.col == col && s.dir == SortDir::Asc => Some(SortDir::Desc),
+            Some(s) if s.col == col && s.dir == SortDir::Desc => None,
+            _ => Some(SortDir::Asc),
+        };
+        self.sort = next.map(|dir| SortSpec { col, dir });
+        self.rebuild_rows();
+        self.status_msg = Some(match next {
+            Some(SortDir::Asc) => format!("sorted ↑ {}", self.data.column_names[col]),
+            Some(SortDir::Desc) => format!("sorted ↓ {}", self.data.column_names[col]),
+            None => "sort cleared".into(),
+        });
+    }
+
+    /// Pin columns `0..=selected` to the left, or unfreeze if already there.
+    fn toggle_freeze(&mut self) {
+        if self.data.ncols == 0 {
+            return;
+        }
+        let want = self.selected_col + 1;
+        if self.frozen_cols == want {
+            self.frozen_cols = 0;
+            self.status_msg = Some("columns unfrozen".into());
+        } else {
+            self.frozen_cols = want;
+            self.status_msg = Some(format!("froze {want} column(s)"));
+        }
+    }
+
+    /// Recompute `rows` from `base_rows` and the active sort, keeping the
+    /// cursor on the same underlying record when it survives.
+    fn rebuild_rows(&mut self) {
+        let keep = self.rows.get(self.selected_row).copied();
+        self.rows = match &self.sort {
+            Some(s) => match self.data.sort_indices(&self.base_rows, s.col, s.dir == SortDir::Desc)
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    self.status_msg = Some(format!("sort failed: {e}"));
+                    return;
+                }
+            },
+            None => self.base_rows.clone(),
+        };
+        self.selected_row = keep
+            .and_then(|orig| self.rows.iter().position(|&r| r == orig))
+            .unwrap_or(0)
+            .min(self.last_row());
+        self.row_offset = 0;
     }
 
     fn jump_match(&mut self, forward: bool) {

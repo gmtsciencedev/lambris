@@ -27,6 +27,8 @@ cargo run --release -- path/to/file.parquet
 | `/` | Search (regex, case-insensitive); jumps to the first match |
 | `n` / `N` | Jump to next / previous search match |
 | `&` | Filter rows to those with a cell matching a regex |
+| `s` | Sort by the selected column: cycles ascending → descending → unsorted |
+| `f` | Freeze columns `0..=selected` (pinned while scrolling); press again to unfreeze |
 | `i` | Toggle info mode — the bottom line shows the selected column's name, Arrow type, and the full (untruncated) cell value |
 | `Esc` | Clear search, then filter, then quit |
 | `q` / `Ctrl-c` | Quit |
@@ -39,8 +41,9 @@ empty query clears that search/filter.
 
 ## Scope
 
-Core viewer plus regex search and row filtering. Nulls are shown as a highlighted
-`NA`. Column freeze and sorting are not implemented yet.
+Core viewer plus regex search, row filtering, type-aware sorting, and column
+freeze. Nulls are shown as a highlighted `NA`. Sort composes with the active
+filter, and the cursor stays on the same record across a re-sort.
 
 ## How it works
 

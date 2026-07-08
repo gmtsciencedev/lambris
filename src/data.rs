@@ -2,7 +2,8 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use arrow::array::ArrayRef;
+use arrow::array::{make_comparator, ArrayRef};
+use arrow::compute::SortOptions;
 use arrow::record_batch::RecordBatch;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -67,6 +68,25 @@ impl Dataset {
 
     pub fn is_null(&self, col: usize, row: usize) -> bool {
         self.column(col).is_null(row)
+    }
+
+    /// Order `rows` (original indices) by the values in `col`, using Arrow's
+    /// type-aware comparator. Stable, so ties keep their prior order.
+    pub fn sort_indices(
+        &self,
+        rows: &[usize],
+        col: usize,
+        descending: bool,
+    ) -> Result<Vec<usize>> {
+        let array = self.column(col);
+        let cmp = make_comparator(array.as_ref(), array.as_ref(), SortOptions::default())
+            .with_context(|| format!("sorting column {}", self.column_names[col]))?;
+        let mut out = rows.to_vec();
+        out.sort_by(|&a, &b| {
+            let ord = cmp(a, b);
+            if descending { ord.reverse() } else { ord }
+        });
+        Ok(out)
     }
 
     /// The full (untruncated) display value of a single cell; `None` if null.

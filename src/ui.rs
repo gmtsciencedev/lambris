@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use crate::app::{App, InputKind, Mode};
+use crate::app::{App, InputKind, Mode, SortDir};
 
 const MAX_COL_WIDTH: u16 = 40;
 const MIN_COL_WIDTH: u16 = 3;
@@ -90,17 +90,34 @@ fn render_table(
     let available = area.width.saturating_sub(gutter + COL_SPACING);
 
     let mut cache: HashMap<usize, RenderedColumn> = HashMap::new();
-    let visible_cols = fit_columns(app, &visible_orig, available, &mut cache)?;
+    let (visible_cols, frozen) = fit_columns(app, &visible_orig, available, &mut cache)?;
+    // Draw a divider only when frozen columns sit beside a scrollable region.
+    let divider_at = (frozen > 0 && visible_cols.len() > frozen).then_some(frozen);
 
-    // Header row: gutter label + selected-aware column names.
+    let frozen_bg = Color::Rgb(30, 30, 45);
+    let sel_bg = Color::Rgb(40, 40, 55);
+
+    // Header row: gutter label + selected-aware column names with sort arrows.
     let mut header_cells = vec![Cell::from("#").style(Style::new().dim())];
-    for &col in &visible_cols {
-        let mut style = Style::new().bold().fg(Color::Cyan);
+    for (idx, &col) in visible_cols.iter().enumerate() {
+        if divider_at == Some(idx) {
+            header_cells.push(divider_cell());
+        }
+        let arrow = match app.sort {
+            Some(s) if s.col == col && s.dir == SortDir::Asc => " ↑",
+            Some(s) if s.col == col && s.dir == SortDir::Desc => " ↓",
+            _ => "",
+        };
+        let label = truncate(
+            &format!("{}{arrow}", app.data.column_names[col]),
+            cache[&col].width,
+        );
+        let base = if idx < frozen { Color::Magenta } else { Color::Cyan };
+        let mut style = Style::new().bold().fg(base);
         if col == app.selected_col {
             style = style.add_modifier(Modifier::REVERSED);
         }
-        let name = truncate(&app.data.column_names[col], cache[&col].width);
-        header_cells.push(Cell::from(name).style(style));
+        header_cells.push(Cell::from(label).style(style));
     }
     let header = Row::new(header_cells).style(Style::new().underlined());
 
@@ -111,7 +128,10 @@ fn render_table(
         let orig = app.rows[vi];
         let sel_row = vi == app.selected_row;
         let mut cells = vec![Cell::from(format!("{}", orig + 1)).style(Style::new().dim())];
-        for &col in &visible_cols {
+        for (idx, &col) in visible_cols.iter().enumerate() {
+            if divider_at == Some(idx) {
+                cells.push(divider_cell());
+            }
             let width = cache[&col].width;
             let sel_cell = sel_row && col == app.selected_col;
             let (text, mut style) = match &cache[&col].cells[i] {
@@ -120,8 +140,7 @@ fn render_table(
                     Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ),
                 Some(s) => {
-                    let is_match =
-                        search_re.map(|re| re.is_match(s)).unwrap_or(false);
+                    let is_match = search_re.map(|re| re.is_match(s)).unwrap_or(false);
                     let base = if is_match {
                         Style::new().bg(Color::Yellow).fg(Color::Black)
                     } else {
@@ -130,8 +149,11 @@ fn render_table(
                     (truncate(s, width), base)
                 }
             };
+            // Background priority: selected row > frozen tint.
             if sel_row && !sel_cell {
-                style = style.bg(Color::Rgb(40, 40, 55));
+                style = style.bg(sel_bg);
+            } else if idx < frozen && !sel_cell {
+                style = style.bg(frozen_bg);
             }
             if sel_cell {
                 style = style.add_modifier(Modifier::REVERSED);
@@ -142,7 +164,12 @@ fn render_table(
     }
 
     let mut widths = vec![Constraint::Length(gutter)];
-    widths.extend(visible_cols.iter().map(|c| Constraint::Length(cache[c].width)));
+    for (idx, &col) in visible_cols.iter().enumerate() {
+        if divider_at == Some(idx) {
+            widths.push(Constraint::Length(1));
+        }
+        widths.push(Constraint::Length(cache[&col].width));
+    }
 
     let table = Table::new(rows, widths)
         .header(header)
@@ -151,34 +178,62 @@ fn render_table(
     Ok(())
 }
 
-/// Decide which columns fit starting at `col_offset`, scrolling right if
-/// needed so the selected column stays visible. Populates `cache`.
+fn divider_cell() -> Cell<'static> {
+    Cell::from("│").style(Style::new().fg(Color::DarkGray))
+}
+
+/// Decide which columns fit: the frozen prefix `0..frozen` (always shown),
+/// then a scrollable region from `col_offset`, scrolling right so the selected
+/// column stays visible. Returns the visible columns and the frozen count.
 fn fit_columns(
     app: &mut App,
     visible_orig: &[usize],
     available: u16,
     cache: &mut HashMap<usize, RenderedColumn>,
-) -> Result<Vec<usize>> {
-    if app.selected_col < app.col_offset {
+) -> Result<(Vec<usize>, usize)> {
+    let frozen = app.frozen_cols.min(app.data.ncols);
+
+    // Frozen columns are always present and consume width up front.
+    let mut frozen_cols = Vec::with_capacity(frozen);
+    let mut frozen_width = 0u16;
+    for c in 0..frozen {
+        render_column(app, c, visible_orig, cache)?;
+        frozen_width += cache[&c].width + COL_SPACING;
+        frozen_cols.push(c);
+    }
+    // The divider between frozen and scrollable regions costs one column.
+    if frozen > 0 {
+        frozen_width += 1 + COL_SPACING;
+    }
+
+    // The scrollable region never starts before the frozen prefix.
+    if app.col_offset < frozen {
+        app.col_offset = frozen;
+    }
+    if app.selected_col >= frozen && app.selected_col < app.col_offset {
         app.col_offset = app.selected_col;
     }
+
     loop {
-        let mut cols = Vec::new();
-        let mut used = 0u16;
+        let mut scroll = Vec::new();
+        let mut used = frozen_width;
         let mut c = app.col_offset;
         while c < app.data.ncols {
             render_column(app, c, visible_orig, cache)?;
             let needed = cache[&c].width + COL_SPACING;
-            if !cols.is_empty() && used + needed > available {
+            if !scroll.is_empty() && used + needed > available {
                 break;
             }
             used += needed;
-            cols.push(c);
+            scroll.push(c);
             c += 1;
         }
-        let last_visible = *cols.last().unwrap_or(&app.col_offset);
-        if app.selected_col <= last_visible {
-            return Ok(cols);
+        let last_visible = *scroll.last().unwrap_or(&app.col_offset);
+        // Selected column is either frozen (always visible) or within the scroll.
+        if app.selected_col < frozen || app.selected_col <= last_visible {
+            let mut all = frozen_cols;
+            all.extend(scroll);
+            return Ok((all, frozen));
         }
         app.col_offset += 1;
     }
@@ -195,6 +250,10 @@ fn render_column(
     }
     let formatter = &app.data.formatters(&[col])?[0];
     let mut width = app.data.column_names[col].chars().count() as u16;
+    // Reserve room for the sort arrow shown next to a sorted column's header.
+    if app.sort.map(|s| s.col == col).unwrap_or(false) {
+        width += 2;
+    }
     let mut cells = Vec::with_capacity(visible_orig.len());
     for &r in visible_orig {
         if app.data.is_null(col, r) {
@@ -257,6 +316,19 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             Style::new().fg(Color::Green),
         ));
     }
+    if let Some(s) = app.sort {
+        let arrow = if s.dir == SortDir::Asc { "↑" } else { "↓" };
+        spans.push(Span::styled(
+            format!("  sort {arrow}{}", app.data.column_names[s.col]),
+            Style::new().fg(Color::Blue),
+        ));
+    }
+    if app.frozen_cols > 0 {
+        spans.push(Span::styled(
+            format!("  ❄{}", app.frozen_cols),
+            Style::new().fg(Color::Magenta),
+        ));
+    }
     if let Some(msg) = &app.status_msg {
         spans.push(Span::styled(format!("  {msg}"), Style::new().fg(Color::Magenta)));
     }
@@ -273,7 +345,7 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
         )),
         Mode::Normal if app.show_info => info_line(app, area.width),
         Mode::Normal => Line::from(Span::styled(
-            " j/k/h/l move · g/G top/bot · :goto · / search · n/N next · & filter · i info · q quit",
+            " j/k/h/l move · :goto · / search · & filter · s sort · f freeze · i info · q quit",
             Style::new().dim(),
         )),
     };

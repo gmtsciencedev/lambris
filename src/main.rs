@@ -91,8 +91,12 @@ mod tests {
         )
         .unwrap();
 
+        // Unique per call so parallel tests never read a half-written file.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let mut path = std::env::temp_dir();
-        path.push("lambris_test_fixture.parquet");
+        path.push(format!("lambris_test_fixture_{n}.parquet"));
         let file = std::fs::File::create(&path).unwrap();
         let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
         writer.write(&batch).unwrap();
@@ -241,6 +245,84 @@ mod tests {
         type_str(&mut app, "3");
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         assert!(app.status_msg.as_deref().unwrap().contains("not in current view"));
+    }
+
+    #[test]
+    fn sort_cycles_asc_desc_none() {
+        use crate::app::SortDir;
+        let mut app = App::new(Dataset::load(&fixture()).unwrap());
+        // Selected column 0 = id (already ascending).
+        app.handle_key(key('s'));
+        assert_eq!(app.sort.unwrap().dir, SortDir::Asc);
+        assert_eq!(app.rows[0], 0);
+
+        app.handle_key(key('s'));
+        assert_eq!(app.sort.unwrap().dir, SortDir::Desc);
+        assert_eq!(app.rows[0], 49, "descending puts the largest id first");
+
+        app.handle_key(key('s'));
+        assert!(app.sort.is_none(), "third press clears the sort");
+        assert_eq!(app.rows[0], 0, "natural order restored");
+    }
+
+    #[test]
+    fn sort_keeps_cursor_on_record_and_handles_nulls() {
+        let mut app = App::new(Dataset::load(&fixture()).unwrap());
+        // Park the cursor on original row 4 (line 5).
+        app.handle_key(key(':'));
+        type_str(&mut app, "5");
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.rows[app.selected_row], 4);
+
+        // Sort descending by id; the cursor should follow row 4.
+        app.handle_key(key('s'));
+        app.handle_key(key('s'));
+        assert_eq!(app.rows[app.selected_row], 4, "cursor tracks the record");
+
+        // Sorting the nullable `score` column must not panic.
+        app.handle_key(key('$')); // select score
+        app.handle_key(key('s'));
+        assert_eq!(app.rows.len(), 50);
+        assert!(app.sort.is_some());
+    }
+
+    #[test]
+    fn sort_composes_with_filter() {
+        let mut app = App::new(Dataset::load(&fixture()).unwrap());
+        app.handle_key(key('&'));
+        type_str(&mut app, "item_004"); // rows 40..49
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        app.handle_key(key('s')); // asc by id
+        app.handle_key(key('s')); // desc by id
+        assert_eq!(app.row_count(), 10);
+        assert_eq!(app.rows[0], 49, "sort applies within the filtered set");
+        // Clearing the filter keeps the sort applied over all rows.
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.row_count(), 50);
+        assert_eq!(app.rows[0], 49);
+    }
+
+    #[test]
+    fn freeze_toggles_at_selected_boundary() {
+        let mut app = App::new(Dataset::load(&fixture()).unwrap());
+        app.handle_key(key('f'));
+        assert_eq!(app.frozen_cols, 1);
+        app.handle_key(key('f'));
+        assert_eq!(app.frozen_cols, 0, "same boundary unfreezes");
+        app.handle_key(key('$')); // select last column (index 2)
+        app.handle_key(key('f'));
+        assert_eq!(app.frozen_cols, 3, "freezes through the selected column");
+    }
+
+    #[test]
+    fn frozen_column_stays_visible_when_scrolled() {
+        let mut app = App::new(Dataset::load(&fixture()).unwrap());
+        app.handle_key(key('f')); // freeze id
+        app.handle_key(key('$')); // jump to score, forcing a horizontal scroll
+        let text = buffer_text(&mut app, 24, 10);
+        assert!(text.contains("id"), "frozen column dropped: {text}");
+        assert!(text.contains("│"), "freeze divider missing: {text}");
+        assert!(text.contains("score"), "selected column not visible: {text}");
     }
 
     #[test]
