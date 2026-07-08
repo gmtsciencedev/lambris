@@ -33,6 +33,8 @@ cargo run --release -- path/to/file.parquet
 | `s` | Sort by the selected column: cycles ascending → descending → unsorted |
 | `f` | Freeze columns `0..=selected` (pinned while scrolling); press again to unfreeze |
 | `t` | Transpose — show columns as rows and rows as columns; `t`/`Esc` to exit |
+| `%` | Numeric column: toggle decimal-point alignment + colouring by log magnitude |
+| `<` / `>` | Decrease / increase displayed decimals (also aligns on the dot, no colouring) |
 | `#` | Show/hide the row-number gutter |
 | `i` | Toggle info mode — the bottom line shows the selected column's name, Arrow type, and the full (untruncated) cell value |
 | `Esc` | Cancel a running operation; otherwise clear search, then filter, then quit |
@@ -82,6 +84,14 @@ a re-sort.
 Transpose is **windowed**: only the records currently on screen become columns,
 so it stays cheap even on large files (it never materialises the whole file as
 columns). Use `h`/`l` to scroll through records, `j`/`k` through fields.
+
+### Numeric columns
+
+On a numeric column, `%` switches to a numeric display: values are aligned on
+the decimal point and coloured by the base-10 log of their magnitude (cool for
+small values, warm for large), which makes the shape of the data pop out. `<`
+and `>` set a fixed number of decimals (and turn on alignment without the
+colouring). The status bar shows the active style (e.g. `num.3 log`).
 
 ## Big files
 

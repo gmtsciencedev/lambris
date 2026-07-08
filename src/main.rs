@@ -574,6 +574,43 @@ mod tests {
     }
 
     #[test]
+    fn percent_enables_numeric_style_and_decimals() {
+        let csv = "id,name,val\n1,alpha,3.14\n2,beta,100.5\n3,gamma,0.007\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        app.handle_key(key('$')); // select `val` (col 2)
+        assert_eq!(app.selected_col, 2);
+
+        app.handle_key(key('%'));
+        let st = app.num_styles.get(&2).copied().expect("numeric style set");
+        assert!(st.align && st.log);
+
+        app.handle_key(key('>')); // fix to 3 decimals
+        assert_eq!(app.num_styles[&2].decimals, Some(3));
+        let text = buffer_text(&mut app, 50, 10);
+        assert!(text.contains("3.140"), "fixed decimals not applied: {text}");
+        assert!(text.contains("100.500"), "fixed decimals not applied: {text}");
+
+        // `%` is rejected on a non-numeric column.
+        app.handle_key(key('h')); // move to `name` (col 1)
+        assert_eq!(app.selected_col, 1);
+        app.handle_key(key('%'));
+        assert!(!app.num_styles.contains_key(&1));
+        assert!(app.status_msg.as_deref().unwrap().contains("not numeric"));
+    }
+
+    #[test]
+    fn decimals_align_without_log_colour() {
+        let csv = "v\n1.5\n22.25\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        // `>` alone turns on alignment and fixed decimals, but not colouring.
+        app.handle_key(key('>'));
+        let st = app.num_styles.get(&0).copied().expect("style set");
+        assert!(st.align);
+        assert!(!st.log, "`<`/`>` must not enable log colour");
+        assert_eq!(st.decimals, Some(3));
+    }
+
+    #[test]
     fn hash_toggles_line_number_gutter() {
         let mut app = App::new(Dataset::load(&fixture()).unwrap());
         assert!(app.show_line_numbers);

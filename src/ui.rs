@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use crate::app::{App, InputKind, Mode, SortDir};
+use crate::app::{App, InputKind, Mode, NumStyle, SortDir};
 
 const MAX_COL_WIDTH: u16 = 40;
 const MIN_COL_WIDTH: u16 = 3;
@@ -15,10 +15,12 @@ const COL_SPACING: u16 = 1;
 const NA: &str = "NA";
 
 /// Formatted cells for one column over the visible row window (`None` = null),
-/// plus the display width they imply.
+/// plus the display width they imply and, for log-coloured numeric columns, a
+/// per-cell foreground colour.
 struct RenderedColumn {
     width: u16,
     cells: Vec<Option<String>>,
+    colors: Option<Vec<Option<Color>>>,
 }
 
 pub fn render(frame: &mut Frame, app: &mut App) -> Result<()> {
@@ -176,6 +178,12 @@ fn render_table(
                         .unwrap_or(false);
                     let base = if is_match {
                         Style::new().bg(Color::Yellow).fg(Color::Black)
+                    } else if let Some(color) = cache[&col]
+                        .colors
+                        .as_ref()
+                        .and_then(|cs| cs.get(i).copied().flatten())
+                    {
+                        Style::new().fg(color)
                     } else {
                         Style::new()
                     };
@@ -449,7 +457,11 @@ fn render_column(
     if app.sort.map(|s| s.col == col).unwrap_or(false) {
         width += 2;
     }
-    let cells = app.data.cells(col, visible_orig)?;
+    let raw = app.data.cells(col, visible_orig)?;
+    let (cells, colors) = match app.num_styles.get(&col) {
+        Some(st) if st.align => build_numeric(&raw, *st),
+        _ => (raw, None),
+    };
     for cell in &cells {
         let cell_width = match cell {
             Some(s) => s.chars().count() as u16,
@@ -458,8 +470,91 @@ fn render_column(
         width = width.max(cell_width);
     }
     let width = width.clamp(MIN_COL_WIDTH, MAX_COL_WIDTH);
-    cache.insert(col, RenderedColumn { width, cells });
+    cache.insert(
+        col,
+        RenderedColumn {
+            width,
+            cells,
+            colors,
+        },
+    );
     Ok(())
+}
+
+/// Reformat numeric cells: apply fixed decimals if set, pad so decimal points
+/// line up, and (when `log`) compute a per-cell colour from the value's
+/// magnitude. Non-numeric or null cells are passed through untouched.
+fn build_numeric(
+    raw: &[Option<String>],
+    st: NumStyle,
+) -> (Vec<Option<String>>, Option<Vec<Option<Color>>>) {
+    let values: Vec<Option<f64>> = raw
+        .iter()
+        .map(|c| c.as_ref().and_then(|s| s.trim().parse::<f64>().ok()))
+        .collect();
+
+    // Text form of each numeric cell (fixed decimals, or natural), split into
+    // integer and fractional parts for alignment.
+    let mut max_int = 0usize;
+    let mut max_frac = 0usize;
+    let parts: Vec<Option<(String, String)>> = raw
+        .iter()
+        .zip(&values)
+        .map(|(cell, value)| {
+            let (cell, value) = (cell.as_ref()?, (*value)?);
+            let text = match st.decimals {
+                Some(n) => format!("{value:.*}", n as usize),
+                None => cell.trim().to_string(),
+            };
+            let (int, frac) = match text.split_once('.') {
+                Some((i, f)) => (i.to_string(), f.to_string()),
+                None => (text, String::new()),
+            };
+            max_int = max_int.max(int.chars().count());
+            max_frac = max_frac.max(frac.chars().count());
+            Some((int, frac))
+        })
+        .collect();
+
+    let cells: Vec<Option<String>> = raw
+        .iter()
+        .zip(&parts)
+        .map(|(orig, part)| match part {
+            Some((int, frac)) => Some(if max_frac > 0 {
+                let dot = if frac.is_empty() { ' ' } else { '.' };
+                format!("{int:>max_int$}{dot}{frac:<max_frac$}")
+            } else {
+                format!("{int:>max_int$}")
+            }),
+            // Null or unparseable: leave the original string (or None) as-is.
+            None => orig.clone(),
+        })
+        .collect();
+
+    let colors = st
+        .log
+        .then(|| values.iter().map(|v| v.map(log_color)).collect());
+    (cells, colors)
+}
+
+/// Colour a value by the base-10 log of its magnitude, cool (small) to warm
+/// (large). Zero and non-finite values are dimmed.
+fn log_color(v: f64) -> Color {
+    if v == 0.0 || !v.is_finite() {
+        return Color::DarkGray;
+    }
+    // Map exponent in [-6, 12] onto a blue → yellow → red gradient.
+    let t = ((v.abs().log10() + 6.0) / 18.0).clamp(0.0, 1.0);
+    let lerp = |a: (u8, u8, u8), b: (u8, u8, u8), u: f64| {
+        let f = |x: u8, y: u8| (x as f64 + (y as f64 - x as f64) * u).round() as u8;
+        (f(a.0, b.0), f(a.1, b.1), f(a.2, b.2))
+    };
+    let (r, g, b) = if t < 0.5 {
+        lerp((70, 130, 220), (200, 200, 90), t * 2.0)
+    } else {
+        lerp((200, 200, 90), (225, 80, 60), (t - 0.5) * 2.0)
+    };
+    Color::Rgb(r, g, b)
 }
 
 fn gutter_width(app: &App) -> u16 {
@@ -521,6 +616,14 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled(
             format!("  ❄{}", app.frozen_cols),
             Style::new().fg(Color::Magenta),
+        ));
+    }
+    if let Some(st) = app.num_styles.get(&app.selected_col) {
+        let dec = st.decimals.map(|n| format!(".{n}")).unwrap_or_default();
+        let log = if st.log { " log" } else { "" };
+        spans.push(Span::styled(
+            format!("  num{dec}{log}"),
+            Style::new().fg(Color::Green),
         ));
     }
     if let Some(msg) = &app.status_msg {

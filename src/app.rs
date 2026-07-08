@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -5,6 +6,17 @@ use regex::{Regex, RegexBuilder};
 
 use crate::data::Dataset;
 use crate::interrupt;
+
+/// How a numeric column is displayed (set with `%`, `<`, `>`).
+#[derive(Clone, Copy, Default)]
+pub struct NumStyle {
+    /// Align values on the decimal point.
+    pub align: bool,
+    /// Colour cells by the log magnitude of their value.
+    pub log: bool,
+    /// Fixed number of decimals; `None` keeps each value's natural form.
+    pub decimals: Option<u8>,
+}
 
 /// Consecutive same-direction move events landing within this window are
 /// treated as a held key and accelerate the scroll.
@@ -137,6 +149,8 @@ pub struct App {
     pub frozen_cols: usize,
     /// Active sort, if any.
     pub sort: Option<SortSpec>,
+    /// Per-column numeric display styles, keyed by column index.
+    pub num_styles: HashMap<usize, NumStyle>,
     /// State for held-key scroll acceleration.
     repeat: Option<Repeat>,
 }
@@ -169,6 +183,7 @@ impl App {
             t_field_page: 1,
             frozen_cols: 0,
             sort: None,
+            num_styles: HashMap::new(),
             repeat: None,
         }
     }
@@ -281,6 +296,9 @@ impl App {
             KeyCode::Char('i') => self.show_info = !self.show_info,
             KeyCode::Char('#') => self.show_line_numbers = !self.show_line_numbers,
             KeyCode::Char('t') => self.enter_transpose(),
+            KeyCode::Char('%') => self.toggle_numeric(),
+            KeyCode::Char('>') => self.adjust_decimals(1),
+            KeyCode::Char('<') => self.adjust_decimals(-1),
             KeyCode::Char('s') => self.cycle_sort(),
             KeyCode::Char('f') if !ctrl => self.toggle_freeze(),
             KeyCode::Char('/') => self.enter_input(InputKind::Search),
@@ -471,6 +489,47 @@ impl App {
             Some(SortDir::Desc) => format!("sorted ↓ {}", self.data.column_names[col]),
             None => "sort cleared".into(),
         });
+    }
+
+    /// Toggle decimal-aligned, log-coloured numeric display on the selected
+    /// column. Turning the colour off with no fixed decimals reverts to plain.
+    fn toggle_numeric(&mut self) {
+        let col = self.selected_col;
+        if !self.data.is_numeric(col) {
+            self.status_msg = Some("column is not numeric".into());
+            return;
+        }
+        let mut st = self.num_styles.get(&col).copied().unwrap_or_default();
+        st.log = !st.log;
+        st.align = st.log || st.decimals.is_some();
+        if st.align {
+            self.status_msg = Some(if st.log {
+                "numeric + log colour".into()
+            } else {
+                "numeric".into()
+            });
+            self.num_styles.insert(col, st);
+        } else {
+            self.num_styles.remove(&col);
+            self.status_msg = Some("plain".into());
+        }
+    }
+
+    /// Adjust the fixed decimal count on the selected column, enabling
+    /// decimal-point alignment (but not colouring).
+    fn adjust_decimals(&mut self, delta: isize) {
+        let col = self.selected_col;
+        if !self.data.is_numeric(col) {
+            self.status_msg = Some("column is not numeric".into());
+            return;
+        }
+        let mut st = self.num_styles.get(&col).copied().unwrap_or_default();
+        let current = st.decimals.unwrap_or(2) as isize;
+        let n = (current + delta).clamp(0, 10) as u8;
+        st.decimals = Some(n);
+        st.align = true;
+        self.num_styles.insert(col, st);
+        self.status_msg = Some(format!("{n} decimals"));
     }
 
     /// Pin columns `0..=selected` to the left, or unfreeze if already there.

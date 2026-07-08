@@ -152,6 +152,26 @@ impl Dataset {
         concat(&self.schema, &batches)
     }
 
+    /// Whether a column holds a numeric Arrow type (int, uint, float, decimal).
+    pub fn is_numeric(&self, col: usize) -> bool {
+        use DataType::*;
+        matches!(
+            self.schema.field(col).data_type(),
+            Int8 | Int16
+                | Int32
+                | Int64
+                | UInt8
+                | UInt16
+                | UInt32
+                | UInt64
+                | Float16
+                | Float32
+                | Float64
+                | Decimal128(_, _)
+                | Decimal256(_, _)
+        )
+    }
+
     // Exercised by tests as a public accessor; the UI now goes through `cells`.
     #[allow(dead_code)]
     pub fn is_null(&self, col: usize, row: usize) -> bool {
