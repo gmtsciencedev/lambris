@@ -69,6 +69,15 @@ impl Dataset {
         self.column(col).is_null(row)
     }
 
+    /// The full (untruncated) display value of a single cell; `None` if null.
+    pub fn cell_display(&self, col: usize, row: usize) -> Result<Option<String>> {
+        if self.is_null(col, row) {
+            return Ok(None);
+        }
+        let formatter = &self.formatters(&[col])?[0];
+        Ok(Some(formatter.value(row).to_string()))
+    }
+
     /// Build one formatter per requested column, valid for the whole dataset.
     /// Formatters borrow their arrays, so we hand them back to the caller
     /// rather than storing them (the struct would otherwise be self-referential).

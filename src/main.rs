@@ -169,6 +169,26 @@ mod tests {
     }
 
     #[test]
+    fn help_hints_shown_and_info_toggles() {
+        let mut app = App::new(Dataset::load(&fixture()).unwrap());
+        // Default: command hints on the bottom line, no column type on screen.
+        let text = buffer_text(&mut app, 100, 20);
+        assert!(text.contains("i info"), "command hints missing: {text}");
+        assert!(!text.contains("Int64"), "type shown outside info mode: {text}");
+
+        // Pressing `i` reveals the selected column's type and value.
+        app.handle_key(key('i'));
+        assert!(app.show_info);
+        let text = buffer_text(&mut app, 100, 20);
+        assert!(text.contains("id: Int64"), "info line missing type: {text}");
+        assert!(!text.contains("i info"), "hints should be replaced by info: {text}");
+
+        // `i` again toggles back to the hints.
+        app.handle_key(key('i'));
+        assert!(!app.show_info);
+    }
+
+    #[test]
     fn renders_null_as_na() {
         let mut app = App::new(Dataset::load(&fixture()).unwrap());
         // Row 0's score is null; "NA" must appear in the rendered buffer.

@@ -22,9 +22,10 @@ struct RenderedColumn {
 }
 
 pub fn render(frame: &mut Frame, app: &mut App) -> Result<()> {
-    let [title_area, body_area, status_area] = Layout::vertical([
+    let [title_area, body_area, status_area, help_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(frame.area());
@@ -35,6 +36,7 @@ pub fn render(frame: &mut Frame, app: &mut App) -> Result<()> {
 
     render_title(frame, title_area, app);
     render_status(frame, status_area, app);
+    render_help(frame, help_area, app);
 
     if app.row_count() == 0 {
         let msg = Paragraph::new("— no rows match the filter —")
@@ -237,22 +239,11 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         (app.selected_row + 1, app.row_count())
     };
-    let (name, ty) = if app.data.ncols > 0 {
-        (
-            app.data.column_names[app.selected_col].as_str(),
-            app.data.column_types[app.selected_col].as_str(),
-        )
-    } else {
-        ("", "")
-    };
 
-    let mut spans = vec![
-        Span::styled(
-            format!(" row {sel_row}/{count}  col {}/{} ", app.selected_col + 1, app.data.ncols),
-            Style::new().bg(Color::DarkGray).fg(Color::White),
-        ),
-        Span::styled(format!("  {name}: {ty}"), Style::new().fg(Color::Yellow)),
-    ];
+    let mut spans = vec![Span::styled(
+        format!(" row {sel_row}/{count}  col {}/{} ", app.selected_col + 1, app.data.ncols),
+        Style::new().bg(Color::DarkGray).fg(Color::White),
+    )];
     if let Some(search) = &app.search {
         spans.push(Span::styled(
             format!("  /{}", search.query),
@@ -269,6 +260,47 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled(format!("  {msg}"), Style::new().fg(Color::Magenta)));
     }
     frame.render_widget(Line::from(spans), area);
+}
+
+/// The bottom line: command hints normally, the input legend while typing, or
+/// the selected column's info when info mode (`i`) is on.
+fn render_help(frame: &mut Frame, area: Rect, app: &App) {
+    let line = match app.mode {
+        Mode::Input(_) => Line::from(Span::styled(
+            " Enter: apply · Esc: cancel",
+            Style::new().dim(),
+        )),
+        Mode::Normal if app.show_info => info_line(app, area.width),
+        Mode::Normal => Line::from(Span::styled(
+            " j/k/h/l move · g/G top/bot · / search · n/N next · & filter · i info · q quit",
+            Style::new().dim(),
+        )),
+    };
+    frame.render_widget(line, area);
+}
+
+/// Describe the selected column and the full value of the selected cell.
+fn info_line(app: &App, width: u16) -> Line<'static> {
+    if app.data.ncols == 0 || app.row_count() == 0 {
+        return Line::from(Span::styled(" (no data)", Style::new().dim()));
+    }
+    let col = app.selected_col;
+    let name = &app.data.column_names[col];
+    let ty = &app.data.column_types[col];
+    let orig = app.rows[app.selected_row];
+    let value = match app.data.cell_display(col, orig) {
+        Ok(Some(v)) => v,
+        Ok(None) => "NA".to_string(),
+        Err(_) => "<error>".to_string(),
+    };
+    let head = format!(" {name}: {ty}  = ");
+    // Keep the whole line within the terminal width.
+    let budget = (width as usize).saturating_sub(head.chars().count() + 1);
+    let value = truncate(&value, budget as u16);
+    Line::from(vec![
+        Span::styled(head, Style::new().fg(Color::Yellow).bold()),
+        Span::styled(value, Style::new().fg(Color::White)),
+    ])
 }
 
 /// Clip `s` to `width` display columns, adding an ellipsis when truncated.

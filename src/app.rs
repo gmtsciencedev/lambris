@@ -45,6 +45,9 @@ pub struct App {
     pub filter_query: Option<String>,
     /// Transient message shown in the status bar (errors, match info).
     pub status_msg: Option<String>,
+    /// When set, the bottom line shows the selected column's info instead of
+    /// the command hints (toggled with `i`).
+    pub show_info: bool,
 }
 
 impl App {
@@ -65,6 +68,7 @@ impl App {
             search: None,
             filter_query: None,
             status_msg: None,
+            show_info: false,
         }
     }
 
@@ -105,6 +109,7 @@ impl App {
                 }
             }
 
+            KeyCode::Char('i') => self.show_info = !self.show_info,
             KeyCode::Char('/') => self.enter_input(InputKind::Search),
             KeyCode::Char('&') => self.enter_input(InputKind::Filter),
             KeyCode::Char('n') => self.jump_match(true),

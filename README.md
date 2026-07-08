@@ -26,8 +26,12 @@ cargo run --release -- path/to/file.parquet
 | `/` | Search (regex, case-insensitive); jumps to the first match |
 | `n` / `N` | Jump to next / previous search match |
 | `&` | Filter rows to those with a cell matching a regex |
+| `i` | Toggle info mode — the bottom line shows the selected column's name, Arrow type, and the full (untruncated) cell value |
 | `Esc` | Clear search, then filter, then quit |
 | `q` / `Ctrl-c` | Quit |
+
+The bottom line shows the main commands by default; `i` swaps it for the column
+info view.
 
 While typing a search or filter, `Enter` commits and `Esc` cancels. Submitting an
 empty query clears that search/filter.
