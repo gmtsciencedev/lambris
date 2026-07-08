@@ -20,23 +20,30 @@ struct Args {
     file: PathBuf,
 }
 
+/// Largest number of records turned into columns when transposing, so a huge
+/// file can't produce an unbounded number of columns.
+const TRANSPOSE_MAX_RECORDS: usize = 4096;
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let dataset = Dataset::load(&args.file)?;
-    let mut app = App::new(dataset);
+    let app = App::new(dataset);
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, &mut app);
+    let result = run(&mut terminal, app);
     ratatui::restore();
     result
 }
 
-fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
-    while !app.should_quit {
+/// Drive a stack of views: the base table plus any transposed views pushed on
+/// top. Transpose builds an in-memory transposed table and runs the very same
+/// render/input path on it, so every command works unchanged.
+fn run(terminal: &mut ratatui::DefaultTerminal, base: App) -> Result<()> {
+    let mut stack = vec![base];
+
+    while let Some(app) = stack.last_mut() {
         terminal
             .draw(|frame| {
-                // Rendering only fails on formatter construction, which is a
-                // hard error worth surfacing after we restore the terminal.
                 if let Err(e) = ui::render(frame, app) {
                     app.render_error = Some(e.to_string());
                     app.should_quit = true;
@@ -49,11 +56,47 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                 app.handle_key(key);
             }
         }
-    }
-    if let Some(e) = app.render_error.take() {
-        anyhow::bail!("render error: {e}");
+
+        if let Some(e) = app.render_error.take() {
+            anyhow::bail!("render error: {e}");
+        }
+        if app.should_quit {
+            break; // quit the whole program from any level
+        }
+        if app.exit_transpose {
+            app.exit_transpose = false;
+            if stack.len() > 1 {
+                stack.pop();
+            }
+            continue;
+        }
+        if app.transpose_request {
+            app.transpose_request = false;
+            match transposed_view(app) {
+                Ok(view) => stack.push(view),
+                Err(e) => app.status_msg = Some(format!("transpose failed: {e}")),
+            }
+        }
     }
     Ok(())
+}
+
+/// Build a transposed view from the current app's view, capped in width.
+fn transposed_view(app: &App) -> Result<App> {
+    if app.data.ncols < 2 || app.row_count() == 0 {
+        anyhow::bail!("needs at least 2 columns and 1 row");
+    }
+    let rows = app.view_rows(TRANSPOSE_MAX_RECORDS);
+    let dataset = app.data.transpose(&rows)?;
+    let mut view = App::new(dataset);
+    view.is_transposed = true;
+    if app.row_count() > TRANSPOSE_MAX_RECORDS {
+        view.status_msg = Some(format!(
+            "showing first {TRANSPOSE_MAX_RECORDS} of {} records",
+            app.row_count()
+        ));
+    }
+    Ok(view)
 }
 
 #[cfg(test)]
@@ -539,77 +582,61 @@ mod tests {
     }
 
     #[test]
-    fn transpose_swaps_axes_and_navigates() {
-        let mut app = App::new(Dataset::load(&fixture()).unwrap());
-        app.handle_key(key('t'));
-        assert!(app.transpose);
-        // Column 0 (id) is the title/index, so the first field is column 1.
-        assert_eq!((app.t_field, app.t_record), (1, 0));
+    fn transpose_builds_a_real_table() {
+        // A features × samples matrix: first column labels, rest numeric.
+        let csv = "gene,s1,s2\ng1,10,20\ng2,3,4\n";
+        let ds = Dataset::load(&write_text_fixture("csv", csv)).unwrap();
+        let t = ds.transpose(&[0, 1]).unwrap();
 
-        let text = buffer_text(&mut app, 80, 20);
-        // The title column's name labels the corner; other columns are fields.
-        assert!(text.contains("id"), "title column label missing: {text}");
-        assert!(text.contains("score"), "field label missing: {text}");
-        // Record 0's `name` value shows in the name field row.
-        assert!(text.contains("item_0000"), "record value missing: {text}");
-
-        app.handle_key(key('j')); // next field (name -> score)
-        assert_eq!(app.t_field, 2);
-        app.handle_key(key('l')); // next record
-        assert_eq!(app.t_record, 1);
-
-        // Exiting carries the cursor back to the main view.
-        app.handle_key(key('t'));
-        assert!(!app.transpose);
-        assert_eq!((app.selected_col, app.selected_row), (2, 1));
+        // Columns become the field column + one per record (titled by gene).
+        assert_eq!(t.column_names, vec!["field", "g1", "g2"]);
+        assert_eq!(t.nrows, 2); // s1, s2
+        assert_eq!(t.ncols, 3);
+        assert_eq!(t.column_types[0], "Utf8"); // field-name column
+        assert_eq!(t.cell_display(0, 0).unwrap().as_deref(), Some("s1"));
+        assert_eq!(t.cell_display(0, 1).unwrap().as_deref(), Some("s2"));
+        // Record columns get a real (numeric) type inferred from their values.
+        assert_eq!(t.column_types[1], "Int64");
+        assert_eq!(t.column_types[2], "Int64");
+        assert_eq!(t.cell_display(1, 0).unwrap().as_deref(), Some("10")); // g1 / s1
+        assert_eq!(t.cell_display(1, 1).unwrap().as_deref(), Some("20")); // g1 / s2
+        assert_eq!(t.cell_display(2, 0).unwrap().as_deref(), Some("3")); // g2 / s1
+        assert_eq!(t.cell_display(2, 1).unwrap().as_deref(), Some("4")); // g2 / s2
     }
 
     #[test]
-    fn transpose_supports_sort_and_numeric() {
-        // 12 rows so ordering by `val` is unambiguous.
-        let mut csv = String::from("id,val\n");
-        for i in 0..12 {
-            csv.push_str(&format!("r{i},{}\n", (i * 7) % 13));
-        }
-        let mut app = App::new(Dataset::load(&write_text_fixture("csv", &csv)).unwrap());
+    fn transposed_view_behaves_like_a_normal_table() {
+        let csv = "gene,s1,s2\ng1,10,5\ng2,3,20\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
         app.handle_key(key('t'));
-        assert_eq!(app.t_field, 1, "first field is `val` (col 0 is the title)");
+        assert!(app.transpose_request, "`t` requests a transposed view");
 
-        // Sort the records by the selected field (`val`).
-        app.handle_key(key('s')); // ascending
-        app.handle_key(key('s')); // descending
-        assert_eq!(app.sort.unwrap().col, 1);
-        assert_eq!(app.sort.unwrap().dir, crate::app::SortDir::Desc);
-        // Descending: the first record column is the one with the max `val`.
-        let max_row = (0..12).max_by_key(|i| (i * 7) % 13).unwrap();
-        assert_eq!(app.orig_row(0), max_row);
+        // Build the view as the main loop would.
+        let view_app = transposed_view(&app).unwrap();
+        let mut tv = view_app;
+        assert!(tv.is_transposed);
 
-        // Numeric style applies to the selected field's row.
-        app.handle_key(key('%'));
-        assert!(app.num_styles.get(&1).unwrap().log);
-        app.handle_key(key('>'));
-        assert_eq!(app.num_styles[&1].decimals, Some(3));
-        let text = buffer_text(&mut app, 60, 12);
-        assert!(text.contains(".000"), "fixed decimals not applied: {text}");
+        // All the usual commands act on the transposed columns directly.
+        tv.handle_key(key('l')); // select record column `g1`
+        assert_eq!(tv.selected_col, 1);
+        tv.handle_key(key('s')); // sort by it
+        assert_eq!(tv.sort.unwrap().col, 1);
+        tv.handle_key(key('%')); // numeric-style it
+        assert!(tv.num_styles.contains_key(&1));
+
+        // `t` (or Esc) requests leaving the transposed view.
+        tv.handle_key(key('t'));
+        assert!(tv.exit_transpose);
     }
 
     #[test]
     fn transpose_needs_at_least_two_columns() {
         let csv = "only\n1\n2\n3\n";
-        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
-        app.handle_key(key('t'));
-        assert!(!app.transpose, "single-column transpose is meaningless");
-        assert!(app.status_msg.as_deref().unwrap().contains("2 columns"));
-    }
-
-    #[test]
-    fn transpose_is_windowed_on_big_files() {
-        // Transposing a 20k-row file only reads the on-screen records.
-        let mut app = App::new(Dataset::load(&big_parquet(BIG)).unwrap());
-        app.handle_key(key('t'));
-        let text = buffer_text(&mut app, 80, 20);
-        assert!(text.contains("id"), "field label missing: {text}");
-        assert!(text.contains("name"), "field label missing: {text}");
+        let app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        assert!(
+            transposed_view(&app).is_err(),
+            "single-column transpose is meaningless"
+        );
     }
 
     #[test]

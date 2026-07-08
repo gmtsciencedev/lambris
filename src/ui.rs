@@ -32,20 +32,6 @@ pub fn render(frame: &mut Frame, app: &mut App) -> Result<()> {
     ])
     .areas(frame.area());
 
-    if app.transpose {
-        render_title(frame, title_area, app);
-        render_transpose(frame, body_area, app)?;
-        render_transpose_status(frame, status_area, app);
-        frame.render_widget(
-            Line::from(Span::styled(
-                " j/k field · h/l record · s sort · %/</> numeric · t exit · q quit",
-                Style::new().dim(),
-            )),
-            help_area,
-        );
-        return Ok(());
-    }
-
     // Body has one header row; the rest is scrollable data.
     let viewport_rows = body_area.height.saturating_sub(1) as usize;
     app.viewport_rows = viewport_rows.max(1);
@@ -77,15 +63,9 @@ pub fn render(frame: &mut Frame, app: &mut App) -> Result<()> {
 }
 
 fn render_title(frame: &mut Frame, area: Rect, app: &App) {
-    let name = app
-        .data
-        .path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| app.data.path.display().to_string());
     let line = Line::from(vec![
         Span::styled(
-            format!(" {name} "),
+            format!(" {} ", app.data.label),
             Style::new().bold().bg(Color::Blue).fg(Color::White),
         ),
         Span::raw(format!("  {} rows × {} cols", app.data.nrows, app.data.ncols)),
@@ -226,203 +206,6 @@ fn divider_cell() -> Cell<'static> {
     Cell::from("│").style(Style::new().fg(Color::DarkGray))
 }
 
-const NAME_COL_MAX: u16 = 30;
-
-/// The column whose values title the records in the transposed view.
-const TITLE_COL: usize = 0;
-
-/// Render the transposed view: original columns run down the left as a field
-/// column, and a horizontally-scrollable window of records runs across the top,
-/// titled by the first column's values. Only the on-screen records are read, so
-/// this stays cheap on big files.
-fn render_transpose(frame: &mut Frame, area: Rect, app: &mut App) -> Result<()> {
-    let data = &app.data;
-    let ncols = data.ncols;
-    let row_count = app.row_count();
-
-    // One header row (record titles); the rest lists fields (columns 1..ncols).
-    let field_rows = area.height.saturating_sub(1).max(1) as usize;
-
-    // Vertical scroll over fields, which start at column 1 (0 is the title).
-    let mut field_off = app.t_field_offset.max(1);
-    if app.t_field < field_off {
-        field_off = app.t_field;
-    } else if app.t_field >= field_off + field_rows {
-        field_off = app.t_field + 1 - field_rows;
-    }
-    field_off = field_off.max(1);
-    let field_end = (field_off + field_rows).min(ncols);
-    let fields: Vec<usize> = (field_off..field_end).collect();
-
-    // The name column must also fit the title column's name (the corner label).
-    let name_w = std::iter::once(data.column_names[TITLE_COL].chars().count())
-        .chain(fields.iter().map(|&c| data.column_names[c].chars().count()))
-        .max()
-        .unwrap_or(MIN_COL_WIDTH as usize)
-        .clamp(MIN_COL_WIDTH as usize, NAME_COL_MAX as usize) as u16;
-
-    // Cache cell strings fetched while measuring so rendering reuses them.
-    let mut cache: HashMap<(usize, usize), Option<String>> = HashMap::new();
-    let mut cell = |c: usize, orig: usize, data: &crate::data::Dataset| -> Option<String> {
-        cache
-            .entry((c, orig))
-            .or_insert_with(|| data.cell_display(c, orig).ok().flatten())
-            .clone()
-    };
-    let title_of = |c: Option<String>| c.unwrap_or_else(|| NA.to_string());
-
-    // Horizontal fit: which records fit across, scrolling to keep t_record in view.
-    let mut record_off = app.t_record_offset.min(app.t_record);
-    let avail = area.width;
-    let (records, widths): (Vec<usize>, Vec<u16>) = loop {
-        let mut recs = Vec::new();
-        let mut ws = Vec::new();
-        let mut used = name_w + COL_SPACING;
-        let mut r = record_off;
-        while r < row_count {
-            let orig = app.orig_row(r);
-            // Column width covers the title and every visible field value.
-            let mut w = title_of(cell(TITLE_COL, orig, data)).chars().count() as u16;
-            for &c in &fields {
-                let (disp, _) = style_value(cell(c, orig, data), app.num_styles.get(&c).copied());
-                let vw = match disp {
-                    Some(s) => s.chars().count() as u16,
-                    None => NA.len() as u16,
-                };
-                w = w.max(vw);
-            }
-            let w = w.clamp(MIN_COL_WIDTH, MAX_COL_WIDTH);
-            if !recs.is_empty() && used + w + COL_SPACING > avail {
-                break;
-            }
-            used += w + COL_SPACING;
-            recs.push(r);
-            ws.push(w);
-            r += 1;
-        }
-        if app.t_record <= *recs.last().unwrap_or(&record_off) {
-            break (recs, ws);
-        }
-        record_off += 1;
-    };
-
-    let sel_bg = Color::Rgb(40, 40, 55);
-
-    // Header: the title column's name in the corner, then each record's title.
-    let mut header_cells = vec![
-        Cell::from(truncate(&data.column_names[TITLE_COL], name_w))
-            .style(Style::new().bold().fg(Color::Magenta)),
-    ];
-    for (j, &r) in records.iter().enumerate() {
-        let orig = app.orig_row(r);
-        let title = title_of(cell(TITLE_COL, orig, data));
-        let mut style = Style::new().bold().fg(Color::Cyan);
-        if r == app.t_record {
-            style = style.add_modifier(Modifier::REVERSED);
-        }
-        header_cells.push(Cell::from(truncate(&title, widths[j])).style(style));
-    }
-    let header = Row::new(header_cells).style(Style::new().underlined());
-
-    let mut rows = Vec::with_capacity(fields.len());
-    for &c in &fields {
-        let sel_field = c == app.t_field;
-        let name_style = {
-            let mut s = Style::new().bold().fg(Color::Cyan);
-            if sel_field {
-                s = s.add_modifier(Modifier::REVERSED);
-            }
-            s
-        };
-        let mut cells = vec![Cell::from(truncate(&data.column_names[c], name_w)).style(name_style)];
-        for (j, &r) in records.iter().enumerate() {
-            let orig = app.orig_row(r);
-            let sel_cell = sel_field && r == app.t_record;
-            let (disp, color) = style_value(cell(c, orig, data), app.num_styles.get(&c).copied());
-            let (text, mut style) = match disp {
-                None => (
-                    NA.to_string(),
-                    Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ),
-                Some(s) => {
-                    let base = match color {
-                        Some(col) => Style::new().fg(col),
-                        None => Style::new(),
-                    };
-                    (truncate(&s, widths[j]), base)
-                }
-            };
-            if !sel_cell && (sel_field || r == app.t_record) {
-                style = style.bg(sel_bg);
-            }
-            if sel_cell {
-                style = style.add_modifier(Modifier::REVERSED);
-            }
-            cells.push(Cell::from(text).style(style));
-        }
-        rows.push(Row::new(cells));
-    }
-
-    let mut constraints = vec![Constraint::Length(name_w)];
-    constraints.extend(widths.iter().map(|&w| Constraint::Length(w)));
-    let table = Table::new(rows, constraints)
-        .header(header)
-        .column_spacing(COL_SPACING);
-    frame.render_widget(table, area);
-
-    app.t_field_offset = field_off;
-    app.t_record_offset = record_off;
-    app.t_field_page = field_rows;
-    Ok(())
-}
-
-fn render_transpose_status(frame: &mut Frame, area: Rect, app: &App) {
-    let name = app
-        .data
-        .column_names
-        .get(app.t_field)
-        .map(String::as_str)
-        .unwrap_or("");
-    let ty = app
-        .data
-        .column_types
-        .get(app.t_field)
-        .map(String::as_str)
-        .unwrap_or("");
-    // Fields are columns 1..ncols (column 0 titles the records).
-    let mut spans = vec![
-        Span::styled(
-            format!(
-                " ⇄ transpose  field {}/{}  record {}/{} ",
-                app.t_field,
-                app.data.ncols.saturating_sub(1),
-                app.t_record + 1,
-                app.row_count(),
-            ),
-            Style::new().bg(Color::DarkGray).fg(Color::White),
-        ),
-        Span::styled(
-            format!("  {} · {name}: {ty}", app.data.column_names[TITLE_COL]),
-            Style::new().fg(Color::Yellow),
-        ),
-    ];
-    if let Some(s) = app.sort {
-        let arrow = if s.dir == SortDir::Asc { "↑" } else { "↓" };
-        spans.push(Span::styled(
-            format!("  sort {arrow}{}", app.data.column_names[s.col]),
-            Style::new().fg(Color::Blue),
-        ));
-    }
-    if let Some(st) = app.num_styles.get(&app.t_field) {
-        let dec = st.decimals.map(|n| format!(".{n}")).unwrap_or_default();
-        let log = if st.log { " log" } else { "" };
-        spans.push(Span::styled(
-            format!("  num{dec}{log}"),
-            Style::new().fg(Color::Green),
-        ));
-    }
-    frame.render_widget(Line::from(spans), area);
-}
 
 /// Decide which columns fit: the frozen prefix `0..frozen` (always shown),
 /// then a scrollable region from `col_offset`, scrolling right so the selected
@@ -575,24 +358,6 @@ fn build_numeric(
     (cells, colors)
 }
 
-/// Apply a numeric style to a single value without decimal-point alignment
-/// (used by the transposed view, where a field's values are laid out
-/// horizontally). Returns the display text and an optional log colour.
-fn style_value(raw: Option<String>, st: Option<NumStyle>) -> (Option<String>, Option<Color>) {
-    match (raw, st) {
-        (Some(s), Some(st)) if st.decimals.is_some() || st.log => {
-            let value = s.trim().parse::<f64>().ok();
-            let text = match (st.decimals, value) {
-                (Some(n), Some(v)) => format!("{v:.*}", n as usize),
-                _ => s,
-            };
-            let color = st.log.then(|| value.map(log_color)).flatten();
-            (Some(text), color)
-        }
-        (raw, _) => (raw, None),
-    }
-}
-
 /// Colour a value by the base-10 log of its magnitude, cool (small) to warm
 /// (large). Zero and non-finite values are dimmed.
 fn log_color(v: f64) -> Color {
@@ -697,8 +462,12 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
             Style::new().dim(),
         )),
         Mode::Normal if app.show_info => info_line(app, area.width),
+        Mode::Normal if app.is_transposed => Line::from(Span::styled(
+            " transposed · j/k/h/l move · s sort · % numeric · & filter · t/Esc back · q quit",
+            Style::new().dim(),
+        )),
         Mode::Normal => Line::from(Span::styled(
-            " j/k/h/l move · / search · - col-search · n/N next · & filter · s sort · f freeze · q quit",
+            " j/k/h/l move · / search · & filter · s sort · f freeze · t transpose · q quit",
             Style::new().dim(),
         )),
     };

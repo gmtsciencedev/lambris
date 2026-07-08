@@ -32,7 +32,7 @@ cargo run --release -- path/to/file.parquet
 | `&` | Filter rows to those with a cell matching a regex |
 | `s` | Sort by the selected column: cycles ascending → descending → unsorted |
 | `f` | Freeze columns `0..=selected` (pinned while scrolling); press again to unfreeze |
-| `t` | Transpose — show columns as rows and rows as columns; `t`/`Esc` to exit |
+| `t` | Transpose the table (first column becomes the headers); `t`/`Esc` to return |
 | `%` | Numeric column: toggle decimal-point alignment + colouring by log magnitude |
 | `<` / `>` | Decrease / increase displayed decimals (also aligns on the dot, no colouring) |
 | `#` | Show/hide the row-number gutter |
@@ -81,17 +81,14 @@ freeze, and a transposed view. Nulls are shown as a highlighted `NA`. Sort
 composes with the active filter, and the cursor stays on the same record across
 a re-sort.
 
-The **first column titles the records** (it's used as the index rather than
-shown as a field), so transposed columns are labelled meaningfully instead of
-by line number. Transpose is **windowed**: only the records currently on screen
-become columns, so it stays cheap even on large files (it never materialises the
-whole file as columns). Use `h`/`l` to scroll through records, `j`/`k` through
-fields. Requires at least two columns.
-
-Sorting and numeric display work while transposed, acting on the selected
-field: `s` reorders the record columns by that field's values, and `%`/`<`/`>`
-format and colour that field's row (decimal-point alignment is skipped, since
-the values run horizontally).
+Transpose builds the actual transposed table and shows it as a normal table, so
+**every command works exactly as usual** — `s` sorts the selected (now-transposed)
+column, `%`/`<`/`>` format it, and filter/search/freeze all apply. The first
+column's values become the column headers (its name labels the leading `field`
+column), and each transposed column's type is inferred from its values, so
+sorting and numeric styling behave correctly. Requires at least two columns, and
+is capped at the first few thousand records so a huge file can't create an
+unbounded number of columns (a note shows when truncated).
 
 ### Numeric columns
 

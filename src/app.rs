@@ -134,17 +134,12 @@ pub struct App {
     pub show_info: bool,
     /// Whether the row-number gutter is shown (toggled with `#`).
     pub show_line_numbers: bool,
-    /// Transpose mode: original columns shown as rows, rows as columns.
-    pub transpose: bool,
-    /// Selected field (original column) while transposed.
-    pub t_field: usize,
-    /// Selected record (view row, shown as a column) while transposed.
-    pub t_record: usize,
-    /// Scroll offsets for the transposed axes.
-    pub t_field_offset: usize,
-    pub t_record_offset: usize,
-    /// Fields the last transposed render could fit; used for paging.
-    pub t_field_page: usize,
+    /// This app is a transposed view (built on an in-memory transposed table).
+    pub is_transposed: bool,
+    /// Set when the user asks to transpose (handled by the main loop).
+    pub transpose_request: bool,
+    /// Set when a transposed view should be dismissed (handled by the loop).
+    pub exit_transpose: bool,
     /// Number of leftmost columns pinned in place while scrolling horizontally.
     pub frozen_cols: usize,
     /// Active sort, if any.
@@ -175,12 +170,9 @@ impl App {
             status_msg: None,
             show_info: false,
             show_line_numbers: true,
-            transpose: false,
-            t_field: 0,
-            t_record: 0,
-            t_field_offset: 0,
-            t_record_offset: 0,
-            t_field_page: 1,
+            is_transposed: false,
+            transpose_request: false,
+            exit_transpose: false,
             frozen_cols: 0,
             sort: None,
             num_styles: HashMap::new(),
@@ -217,87 +209,15 @@ impl App {
     /// `now` is injected so held-key acceleration can be tested deterministically.
     pub fn handle_key_at(&mut self, key: KeyEvent, now: Instant) {
         match self.mode {
-            Mode::Normal if self.transpose => self.handle_transpose(key),
             Mode::Normal => self.handle_normal(key, now),
             Mode::Input(kind) => self.handle_input(key, kind),
         }
     }
 
-    fn enter_transpose(&mut self) {
-        // The first column becomes the record titles, so there must be at
-        // least one further column to show as a field.
-        if self.data.ncols < 2 || self.row_count() == 0 {
-            self.status_msg = Some("transpose needs at least 2 columns".into());
-            return;
-        }
-        self.transpose = true;
-        self.t_field = self.selected_col.max(1); // never the title column
-        self.t_record = self.selected_row;
-        self.t_field_offset = 1;
-        self.t_record_offset = self.row_offset;
-    }
-
-    /// Navigation while transposed: `j`/`k` move through fields (the vertical
-    /// axis), `h`/`l` through records (the horizontal axis). Column 0 is the
-    /// title/index, so fields run over `1..ncols`.
-    fn handle_transpose(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let page = self.t_field_page.max(1) as isize;
-        let first_field = 1;
-        let last_field = self.data.ncols.saturating_sub(1) as isize;
-        let last_record = self.row_count().saturating_sub(1) as isize;
-        self.status_msg = None;
-        let clamp = |v: isize, lo: isize, hi: isize| v.clamp(lo, hi) as usize;
-        match key.code {
-            KeyCode::Char('t') | KeyCode::Esc => {
-                self.transpose = false;
-                self.selected_col = self.t_field;
-                self.selected_row = self.t_record;
-            }
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('c') if ctrl => self.should_quit = true,
-
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.t_field = clamp(self.t_field as isize + 1, first_field, last_field)
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.t_field = clamp(self.t_field as isize - 1, first_field, last_field)
-            }
-            KeyCode::Char('l') | KeyCode::Right => {
-                self.t_record = clamp(self.t_record as isize + 1, 0, last_record)
-            }
-            KeyCode::Char('h') | KeyCode::Left => {
-                self.t_record = clamp(self.t_record as isize - 1, 0, last_record)
-            }
-            KeyCode::Char('d') if ctrl => {
-                self.t_field = clamp(self.t_field as isize + page, first_field, last_field)
-            }
-            KeyCode::Char('u') if ctrl => {
-                self.t_field = clamp(self.t_field as isize - page, first_field, last_field)
-            }
-            KeyCode::PageDown => {
-                self.t_field = clamp(self.t_field as isize + page, first_field, last_field)
-            }
-            KeyCode::PageUp => {
-                self.t_field = clamp(self.t_field as isize - page, first_field, last_field)
-            }
-            KeyCode::Char('g') | KeyCode::Home => self.t_field = first_field as usize,
-            KeyCode::Char('G') | KeyCode::End => self.t_field = last_field.max(1) as usize,
-
-            // Sort the records (columns) by the selected field, keeping the
-            // record cursor on the same underlying row.
-            KeyCode::Char('s') => {
-                self.selected_row = self.t_record;
-                self.cycle_sort_col(self.t_field);
-                self.t_record = self.selected_row;
-                self.t_record_offset = 0;
-            }
-            // Numeric display of the selected field's values.
-            KeyCode::Char('%') => self.toggle_numeric_col(self.t_field),
-            KeyCode::Char('>') => self.adjust_decimals_col(self.t_field, 1),
-            KeyCode::Char('<') => self.adjust_decimals_col(self.t_field, -1),
-            _ => {}
-        }
+    /// Original row indices of the current view, capped at `max` (used to build
+    /// the transposed table without unbounded width on large files).
+    pub fn view_rows(&self, max: usize) -> Vec<usize> {
+        (0..self.row_count().min(max)).map(|i| self.orig_row(i)).collect()
     }
 
     fn handle_normal(&mut self, key: KeyEvent, now: Instant) {
@@ -307,12 +227,15 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('c') if ctrl => self.should_quit = true,
-            // Esc peels away search, then filter, then quits.
+            // Esc peels away search, then filter, then leaves a transposed
+            // view (or quits at the top level).
             KeyCode::Esc => {
                 if self.search.take().is_some() {
                     self.status_msg = Some("search cleared".into());
                 } else if self.filter_query.is_some() {
                     self.clear_filter();
+                } else if self.is_transposed {
+                    self.exit_transpose = true;
                 } else {
                     self.should_quit = true;
                 }
@@ -320,7 +243,14 @@ impl App {
 
             KeyCode::Char('i') => self.show_info = !self.show_info,
             KeyCode::Char('#') => self.show_line_numbers = !self.show_line_numbers,
-            KeyCode::Char('t') => self.enter_transpose(),
+            // `t` transposes; in a transposed view it returns to the original.
+            KeyCode::Char('t') => {
+                if self.is_transposed {
+                    self.exit_transpose = true;
+                } else {
+                    self.transpose_request = true;
+                }
+            }
             KeyCode::Char('%') => self.toggle_numeric(),
             KeyCode::Char('>') => self.adjust_decimals(1),
             KeyCode::Char('<') => self.adjust_decimals(-1),

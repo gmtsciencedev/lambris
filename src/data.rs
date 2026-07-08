@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use arrow::array::{make_comparator, Array, ArrayRef};
+use arrow::array::{make_comparator, Array, ArrayRef, Float64Array, Int64Array, StringArray};
 use arrow::compute::SortOptions;
 use arrow::csv::reader::Format as CsvFormat;
 use arrow::csv::ReaderBuilder as CsvReaderBuilder;
@@ -33,6 +33,8 @@ enum Backend {
         delimiter: u8,
         chunk_offsets: Vec<u64>,
     },
+    /// A fully-resident batch (e.g. a transposed view), served in chunks.
+    Memory(Arc<RecordBatch>),
 }
 
 /// A lazily-loaded view of a parquet or CSV/TSV file. Only the schema, some
@@ -40,6 +42,8 @@ enum Backend {
 /// are fetched on demand. Everything above this layer is format-agnostic.
 pub struct Dataset {
     pub path: PathBuf,
+    /// Name shown in the title bar (the file name, or a transposed label).
+    pub label: String,
     backend: Backend,
     schema: SchemaRef,
     pub column_names: Vec<String>,
@@ -64,8 +68,13 @@ impl Dataset {
             .map(|f| f.data_type().to_string())
             .collect();
         let ncols = schema.fields().len();
+        let label = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
         Ok(Self {
             path: path.to_path_buf(),
+            label,
             backend,
             schema,
             column_names,
@@ -74,6 +83,79 @@ impl Dataset {
             ncols,
             cache: Mutex::new(ChunkCache::new(CACHE_CHUNKS)),
         })
+    }
+
+    /// Build a dataset from an already-materialised batch (used for transpose).
+    fn in_memory(batch: RecordBatch, path: PathBuf, label: String) -> Self {
+        let schema = batch.schema();
+        let column_names = schema.fields().iter().map(|f| f.name().clone()).collect();
+        let column_types = schema
+            .fields()
+            .iter()
+            .map(|f| f.data_type().to_string())
+            .collect();
+        let nrows = batch.num_rows();
+        let ncols = batch.num_columns();
+        Self {
+            path,
+            label,
+            backend: Backend::Memory(Arc::new(batch)),
+            schema,
+            column_names,
+            column_types,
+            nrows,
+            ncols,
+            cache: Mutex::new(ChunkCache::new(CACHE_CHUNKS)),
+        }
+    }
+
+    /// Build the transpose of `orig_rows` (in view order): the first column's
+    /// values become the column headers, and the remaining columns become rows
+    /// labelled by their name in a leading `field` column. Each record column's
+    /// type is inferred from its values, so the result behaves like any table.
+    pub fn transpose(&self, orig_rows: &[usize]) -> Result<Dataset> {
+        // Original columns 1.. become rows; column 0 titles the records.
+        let field_cols: Vec<usize> = (1..self.ncols).collect();
+        let field_values: Vec<Vec<Option<String>>> = field_cols
+            .iter()
+            .map(|&c| self.cells(c, orig_rows))
+            .collect::<Result<_>>()?;
+        let titles = self.cells(0, orig_rows)?;
+
+        let mut names = Vec::with_capacity(orig_rows.len() + 1);
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(orig_rows.len() + 1);
+
+        // Leading column: the original column names.
+        names.push("field".to_string());
+        let field_names: StringArray = field_cols
+            .iter()
+            .map(|&c| Some(self.column_names[c].as_str()))
+            .collect();
+        columns.push(Arc::new(field_names));
+
+        // One column per record, titled by the first column's value.
+        for (r, title) in titles.iter().enumerate() {
+            let name = title
+                .clone()
+                .unwrap_or_else(|| format!("row{}", orig_rows[r] + 1));
+            let values: Vec<Option<String>> =
+                (0..field_cols.len()).map(|f| field_values[f][r].clone()).collect();
+            names.push(name);
+            columns.push(infer_array(&values));
+        }
+
+        let fields: Vec<Field> = names
+            .iter()
+            .zip(&columns)
+            .map(|(n, a)| Field::new(n, a.data_type().clone(), true))
+            .collect();
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .context("building transposed batch")?;
+        Ok(Dataset::in_memory(
+            batch,
+            self.path.clone(),
+            format!("{} ⇄ transposed", self.label),
+        ))
     }
 
     fn num_chunks(&self) -> usize {
@@ -97,6 +179,14 @@ impl Dataset {
                 delimiter,
                 chunk_offsets,
             } => self.load_csv_chunk(k, *delimiter, chunk_offsets),
+            Backend::Memory(batch) => {
+                let start = k * CHUNK;
+                if start >= batch.num_rows() {
+                    return Ok(RecordBatch::new_empty(self.schema.clone()));
+                }
+                let len = CHUNK.min(batch.num_rows() - start);
+                Ok(batch.slice(start, len))
+            }
         }
     }
 
@@ -653,6 +743,39 @@ fn build_index_from(path: &Path, data_start: u64) -> Result<(Vec<u64>, usize)> {
         rows += 1;
     }
     Ok((offsets, rows))
+}
+
+/// Build a typed array from string values, inferring Int64 → Float64 → Utf8
+/// from what parses. Blank/whitespace values become nulls. This gives each
+/// transposed record column a real type so sorting and numeric styling work.
+fn infer_array(values: &[Option<String>]) -> ArrayRef {
+    let cleaned: Vec<Option<String>> = values
+        .iter()
+        .map(|v| {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .collect();
+    let present: Vec<&String> = cleaned.iter().filter_map(|v| v.as_ref()).collect();
+
+    if !present.is_empty() && present.iter().all(|s| s.parse::<i64>().is_ok()) {
+        let a: Int64Array = cleaned
+            .iter()
+            .map(|v| v.as_ref().map(|s| s.parse::<i64>().unwrap()))
+            .collect();
+        return Arc::new(a);
+    }
+    if !present.is_empty() && present.iter().all(|s| s.parse::<f64>().is_ok()) {
+        let a: Float64Array = cleaned
+            .iter()
+            .map(|v| v.as_ref().map(|s| s.parse::<f64>().unwrap()))
+            .collect();
+        return Arc::new(a);
+    }
+    let a: StringArray = cleaned.iter().map(|v| v.as_deref()).collect();
+    Arc::new(a)
 }
 
 /// Concatenate batches, yielding an empty batch (with the schema) if there are
