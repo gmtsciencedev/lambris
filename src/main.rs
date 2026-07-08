@@ -177,7 +177,7 @@ mod tests {
         let mut app = App::new(Dataset::load(&fixture()).unwrap());
         // Default: command hints on the bottom line, no column type on screen.
         let text = buffer_text(&mut app, 100, 20);
-        assert!(text.contains("i info"), "command hints missing: {text}");
+        assert!(text.contains("q quit"), "command hints missing: {text}");
         assert!(!text.contains("Int64"), "type shown outside info mode: {text}");
 
         // Pressing `i` reveals the selected column's type and value.
@@ -185,7 +185,7 @@ mod tests {
         assert!(app.show_info);
         let text = buffer_text(&mut app, 100, 20);
         assert!(text.contains("id: Int64"), "info line missing type: {text}");
-        assert!(!text.contains("i info"), "hints should be replaced by info: {text}");
+        assert!(!text.contains("q quit"), "hints should be replaced by info: {text}");
 
         // `i` again toggles back to the hints.
         app.handle_key(key('i'));
@@ -341,7 +341,36 @@ mod tests {
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         assert_eq!(app.rows[app.selected_row], 42);
         assert_eq!(app.selected_col, 1, "should land on the name column");
-        assert!(app.search.is_some());
+        assert_eq!(app.search.as_ref().unwrap().scope, None, "global search is unscoped");
+    }
+
+    #[test]
+    fn column_search_scoped_and_cycles_within_column() {
+        let mut app = App::new(Dataset::load(&fixture()).unwrap());
+        app.handle_key(KeyEvent::from(KeyCode::Right)); // select `name` (col 1)
+        app.handle_key(key('-'));
+        type_str(&mut app, "item_004"); // matches name in rows 40..49
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+
+        assert_eq!(app.search.as_ref().unwrap().scope, Some(1));
+        assert_eq!(app.selected_col, 1);
+        assert_eq!(app.rows[app.selected_row], 40, "lands on first in-column match");
+
+        app.handle_key(key('n'));
+        assert_eq!(app.selected_col, 1, "next match stays in the searched column");
+        assert_eq!(app.rows[app.selected_row], 41);
+    }
+
+    #[test]
+    fn column_search_ignores_other_columns() {
+        let mut app = App::new(Dataset::load(&fixture()).unwrap());
+        // "item" only appears in `name`, but we search the `id` column (col 0),
+        // so there should be no match.
+        app.handle_key(key('-'));
+        type_str(&mut app, "item");
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.search.as_ref().unwrap().scope, Some(0));
+        assert_eq!(app.status_msg.as_deref(), Some("no match"));
     }
 
     #[test]

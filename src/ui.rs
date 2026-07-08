@@ -122,7 +122,7 @@ fn render_table(
     let header = Row::new(header_cells).style(Style::new().underlined());
 
     // Body rows.
-    let search_re = app.search.as_ref().map(|s| &s.re);
+    let search = app.search.as_ref();
     let mut rows = Vec::with_capacity(visible_view.len());
     for (i, &vi) in visible_view.iter().enumerate() {
         let orig = app.rows[vi];
@@ -140,7 +140,12 @@ fn render_table(
                     Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ),
                 Some(s) => {
-                    let is_match = search_re.map(|re| re.is_match(s)).unwrap_or(false);
+                    // Only highlight in-scope columns for a column search.
+                    let is_match = search
+                        .map(|se| {
+                            se.scope.map(|sc| sc == col).unwrap_or(true) && se.re.is_match(s)
+                        })
+                        .unwrap_or(false);
                     let base = if is_match {
                         Style::new().bg(Color::Yellow).fg(Color::Black)
                     } else {
@@ -280,6 +285,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     if let Mode::Input(kind) = app.mode {
         let sigil = match kind {
             InputKind::Search => '/',
+            InputKind::ColumnSearch => '-',
             InputKind::Filter => '&',
             InputKind::Goto => ':',
         };
@@ -305,10 +311,11 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         Style::new().bg(Color::DarkGray).fg(Color::White),
     )];
     if let Some(search) = &app.search {
-        spans.push(Span::styled(
-            format!("  /{}", search.query),
-            Style::new().fg(Color::Cyan),
-        ));
+        let label = match search.scope {
+            Some(col) => format!("  -{} @{}", search.query, app.data.column_names[col]),
+            None => format!("  /{}", search.query),
+        };
+        spans.push(Span::styled(label, Style::new().fg(Color::Cyan)));
     }
     if let Some(q) = &app.filter_query {
         spans.push(Span::styled(
@@ -345,7 +352,7 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
         )),
         Mode::Normal if app.show_info => info_line(app, area.width),
         Mode::Normal => Line::from(Span::styled(
-            " j/k/h/l move · :goto · / search · & filter · s sort · f freeze · i info · q quit",
+            " j/k/h/l move · / search · - col-search · n/N next · & filter · s sort · f freeze · q quit",
             Style::new().dim(),
         )),
     };

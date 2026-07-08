@@ -26,16 +26,21 @@ pub enum Mode {
 
 #[derive(Clone, Copy)]
 pub enum InputKind {
+    /// Search across every column.
     Search,
+    /// Search within the column selected when the prompt was opened.
+    ColumnSearch,
     Filter,
     /// Jump to a (1-based, original) row number.
     Goto,
 }
 
-/// An active search: the raw query plus its compiled regex.
+/// An active search: the raw query, its compiled regex, and its scope.
 pub struct Search {
     pub query: String,
     pub re: Regex,
+    /// `Some(col)` confines the search to one column; `None` searches all.
+    pub scope: Option<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -161,6 +166,9 @@ impl App {
             KeyCode::Char('s') => self.cycle_sort(),
             KeyCode::Char('f') if !ctrl => self.toggle_freeze(),
             KeyCode::Char('/') => self.enter_input(InputKind::Search),
+            // Column-scoped search. `-` is a direct, unshifted key on AZERTY;
+            // change this char to rebind.
+            KeyCode::Char('-') => self.enter_input(InputKind::ColumnSearch),
             KeyCode::Char('&') => self.enter_input(InputKind::Filter),
             KeyCode::Char(':') => self.enter_input(InputKind::Goto),
             KeyCode::Char('n') => self.jump_match(true),
@@ -213,7 +221,9 @@ impl App {
         self.mode = Mode::Input(kind);
         self.status_msg = None;
         self.input = match kind {
-            InputKind::Search => self.search.as_ref().map(|s| s.query.clone()),
+            InputKind::Search | InputKind::ColumnSearch => {
+                self.search.as_ref().map(|s| s.query.clone())
+            }
             InputKind::Filter => self.filter_query.clone(),
             InputKind::Goto => None,
         }
@@ -229,7 +239,7 @@ impl App {
         }
         if query.is_empty() {
             match kind {
-                InputKind::Search => self.search = None,
+                InputKind::Search | InputKind::ColumnSearch => self.search = None,
                 InputKind::Filter => self.clear_filter(),
                 InputKind::Goto => unreachable!(),
             }
@@ -243,7 +253,8 @@ impl App {
             }
         };
         match kind {
-            InputKind::Search => self.apply_search(query, re),
+            InputKind::Search => self.apply_search(query, re, None),
+            InputKind::ColumnSearch => self.apply_search(query, re, Some(self.selected_col)),
             InputKind::Filter => self.apply_filter(query, re),
             InputKind::Goto => unreachable!(),
         }
@@ -268,8 +279,8 @@ impl App {
         }
     }
 
-    fn apply_search(&mut self, query: String, re: Regex) {
-        self.search = Some(Search { query, re });
+    fn apply_search(&mut self, query: String, re: Regex, scope: Option<usize>) {
+        self.search = Some(Search { query, re, scope });
         // Land on the first match from the current position (inclusive-ish).
         self.jump_match(true);
     }
@@ -355,10 +366,14 @@ impl App {
 
     fn jump_match(&mut self, forward: bool) {
         let Some(search) = &self.search else { return };
-        match self
-            .data
-            .find_match(&search.re, &self.rows, self.selected_row, self.selected_col, forward)
-        {
+        match self.data.find_match(
+            &search.re,
+            &self.rows,
+            self.selected_row,
+            self.selected_col,
+            forward,
+            search.scope,
+        ) {
             Some((row, col)) => {
                 self.selected_row = row;
                 self.selected_col = col;

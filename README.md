@@ -5,7 +5,8 @@ A terminal parquet file viewer, in the manner of [csvlens](https://github.com/YS
 Opens a `.parquet` file and lets you scroll around it in a TUI — a header row with
 column names, a row-number gutter, a status bar showing the selected cell's column
 name and Arrow type, and truncation of wide values. Null values render as a
-highlighted `NA`. Supports regex search (`/`) and row filtering (`&`).
+highlighted `NA`. Supports global regex search (`/`), column-scoped search
+(`-`), and row filtering (`&`).
 
 ## Usage
 
@@ -24,8 +25,9 @@ cargo run --release -- path/to/file.parquet
 | `g` / `G` | Jump to first / last row |
 | `0` / `$` | Jump to first / last column |
 | `:` | Go to a row number (1-based, uses original row numbers under a filter) |
-| `/` | Search (regex, case-insensitive); jumps to the first match |
-| `n` / `N` | Jump to next / previous search match |
+| `/` | Global search across all columns (regex, case-insensitive); jumps to the first match |
+| `-` | Column search — same as `/` but confined to the selected column |
+| `n` / `N` | Jump to next / previous search match (within scope) |
 | `&` | Filter rows to those with a cell matching a regex |
 | `s` | Sort by the selected column: cycles ascending → descending → unsorted |
 | `f` | Freeze columns `0..=selected` (pinned while scrolling); press again to unfreeze |

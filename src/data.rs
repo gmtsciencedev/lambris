@@ -127,9 +127,11 @@ impl Dataset {
         Ok(out)
     }
 
-    /// Find the next cell matching `re`, scanning the view `rows` in row-major
-    /// order starting just after `(start_row, start_col)` and wrapping around.
-    /// Returns a `(view_row, col)` position, where `view_row` indexes `rows`.
+    /// Find the next cell matching `re`, scanning the view `rows` starting just
+    /// after `(start_row, start_col)` and wrapping around. When `scope` is
+    /// `Some(col)` the search is confined to that single column; otherwise it
+    /// sweeps every column in row-major order. Returns a `(view_row, col)`
+    /// position, where `view_row` indexes `rows`.
     pub fn find_match(
         &self,
         re: &Regex,
@@ -137,8 +139,25 @@ impl Dataset {
         start_row: usize,
         start_col: usize,
         forward: bool,
+        scope: Option<usize>,
     ) -> Option<(usize, usize)> {
         if rows.is_empty() || self.ncols == 0 {
+            return None;
+        }
+        if let Some(col) = scope {
+            let fmt = &self.formatters(&[col]).ok()?[0];
+            let n = rows.len();
+            for i in 1..=n {
+                let vr = if forward {
+                    (start_row + i) % n
+                } else {
+                    (start_row + n - i) % n
+                };
+                let orig = rows[vr];
+                if !self.is_null(col, orig) && re.is_match(&fmt.value(orig).to_string()) {
+                    return Some((vr, col));
+                }
+            }
             return None;
         }
         let cols: Vec<usize> = (0..self.ncols).collect();
