@@ -88,6 +88,11 @@ become columns, so it stays cheap even on large files (it never materialises the
 whole file as columns). Use `h`/`l` to scroll through records, `j`/`k` through
 fields. Requires at least two columns.
 
+Sorting and numeric display work while transposed, acting on the selected
+field: `s` reorders the record columns by that field's values, and `%`/`<`/`>`
+format and colour that field's row (decimal-point alignment is skipped, since
+the values run horizontally).
+
 ### Numeric columns
 
 On a numeric column, `%` switches to a numeric display: values are aligned on

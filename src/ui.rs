@@ -38,7 +38,7 @@ pub fn render(frame: &mut Frame, app: &mut App) -> Result<()> {
         render_transpose_status(frame, status_area, app);
         frame.render_widget(
             Line::from(Span::styled(
-                " j/k field · h/l record · g/G first/last field · t exit · q quit",
+                " j/k field · h/l record · s sort · %/</> numeric · t exit · q quit",
                 Style::new().dim(),
             )),
             help_area,
@@ -284,7 +284,8 @@ fn render_transpose(frame: &mut Frame, area: Rect, app: &mut App) -> Result<()> 
             // Column width covers the title and every visible field value.
             let mut w = title_of(cell(TITLE_COL, orig, data)).chars().count() as u16;
             for &c in &fields {
-                let vw = match cell(c, orig, data) {
+                let (disp, _) = style_value(cell(c, orig, data), app.num_styles.get(&c).copied());
+                let vw = match disp {
                     Some(s) => s.chars().count() as u16,
                     None => NA.len() as u16,
                 };
@@ -337,12 +338,19 @@ fn render_transpose(frame: &mut Frame, area: Rect, app: &mut App) -> Result<()> 
         for (j, &r) in records.iter().enumerate() {
             let orig = app.orig_row(r);
             let sel_cell = sel_field && r == app.t_record;
-            let (text, mut style) = match cell(c, orig, data) {
+            let (disp, color) = style_value(cell(c, orig, data), app.num_styles.get(&c).copied());
+            let (text, mut style) = match disp {
                 None => (
                     NA.to_string(),
                     Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ),
-                Some(s) => (truncate(&s, widths[j]), Style::new()),
+                Some(s) => {
+                    let base = match color {
+                        Some(col) => Style::new().fg(col),
+                        None => Style::new(),
+                    };
+                    (truncate(&s, widths[j]), base)
+                }
             };
             if !sel_cell && (sel_field || r == app.t_record) {
                 style = style.bg(sel_bg);
@@ -382,7 +390,7 @@ fn render_transpose_status(frame: &mut Frame, area: Rect, app: &App) {
         .map(String::as_str)
         .unwrap_or("");
     // Fields are columns 1..ncols (column 0 titles the records).
-    let spans = vec![
+    let mut spans = vec![
         Span::styled(
             format!(
                 " ⇄ transpose  field {}/{}  record {}/{} ",
@@ -398,6 +406,21 @@ fn render_transpose_status(frame: &mut Frame, area: Rect, app: &App) {
             Style::new().fg(Color::Yellow),
         ),
     ];
+    if let Some(s) = app.sort {
+        let arrow = if s.dir == SortDir::Asc { "↑" } else { "↓" };
+        spans.push(Span::styled(
+            format!("  sort {arrow}{}", app.data.column_names[s.col]),
+            Style::new().fg(Color::Blue),
+        ));
+    }
+    if let Some(st) = app.num_styles.get(&app.t_field) {
+        let dec = st.decimals.map(|n| format!(".{n}")).unwrap_or_default();
+        let log = if st.log { " log" } else { "" };
+        spans.push(Span::styled(
+            format!("  num{dec}{log}"),
+            Style::new().fg(Color::Green),
+        ));
+    }
     frame.render_widget(Line::from(spans), area);
 }
 
@@ -550,6 +573,24 @@ fn build_numeric(
         .log
         .then(|| values.iter().map(|v| v.map(log_color)).collect());
     (cells, colors)
+}
+
+/// Apply a numeric style to a single value without decimal-point alignment
+/// (used by the transposed view, where a field's values are laid out
+/// horizontally). Returns the display text and an optional log colour.
+fn style_value(raw: Option<String>, st: Option<NumStyle>) -> (Option<String>, Option<Color>) {
+    match (raw, st) {
+        (Some(s), Some(st)) if st.decimals.is_some() || st.log => {
+            let value = s.trim().parse::<f64>().ok();
+            let text = match (st.decimals, value) {
+                (Some(n), Some(v)) => format!("{v:.*}", n as usize),
+                _ => s,
+            };
+            let color = st.log.then(|| value.map(log_color)).flatten();
+            (Some(text), color)
+        }
+        (raw, _) => (raw, None),
+    }
 }
 
 /// Colour a value by the base-10 log of its magnitude, cool (small) to warm

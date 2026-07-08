@@ -565,6 +565,35 @@ mod tests {
     }
 
     #[test]
+    fn transpose_supports_sort_and_numeric() {
+        // 12 rows so ordering by `val` is unambiguous.
+        let mut csv = String::from("id,val\n");
+        for i in 0..12 {
+            csv.push_str(&format!("r{i},{}\n", (i * 7) % 13));
+        }
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", &csv)).unwrap());
+        app.handle_key(key('t'));
+        assert_eq!(app.t_field, 1, "first field is `val` (col 0 is the title)");
+
+        // Sort the records by the selected field (`val`).
+        app.handle_key(key('s')); // ascending
+        app.handle_key(key('s')); // descending
+        assert_eq!(app.sort.unwrap().col, 1);
+        assert_eq!(app.sort.unwrap().dir, crate::app::SortDir::Desc);
+        // Descending: the first record column is the one with the max `val`.
+        let max_row = (0..12).max_by_key(|i| (i * 7) % 13).unwrap();
+        assert_eq!(app.orig_row(0), max_row);
+
+        // Numeric style applies to the selected field's row.
+        app.handle_key(key('%'));
+        assert!(app.num_styles.get(&1).unwrap().log);
+        app.handle_key(key('>'));
+        assert_eq!(app.num_styles[&1].decimals, Some(3));
+        let text = buffer_text(&mut app, 60, 12);
+        assert!(text.contains(".000"), "fixed decimals not applied: {text}");
+    }
+
+    #[test]
     fn transpose_needs_at_least_two_columns() {
         let csv = "only\n1\n2\n3\n";
         let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());

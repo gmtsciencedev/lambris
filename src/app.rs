@@ -283,6 +283,19 @@ impl App {
             }
             KeyCode::Char('g') | KeyCode::Home => self.t_field = first_field as usize,
             KeyCode::Char('G') | KeyCode::End => self.t_field = last_field.max(1) as usize,
+
+            // Sort the records (columns) by the selected field, keeping the
+            // record cursor on the same underlying row.
+            KeyCode::Char('s') => {
+                self.selected_row = self.t_record;
+                self.cycle_sort_col(self.t_field);
+                self.t_record = self.selected_row;
+                self.t_record_offset = 0;
+            }
+            // Numeric display of the selected field's values.
+            KeyCode::Char('%') => self.toggle_numeric_col(self.t_field),
+            KeyCode::Char('>') => self.adjust_decimals_col(self.t_field, 1),
+            KeyCode::Char('<') => self.adjust_decimals_col(self.t_field, -1),
             _ => {}
         }
     }
@@ -476,12 +489,15 @@ impl App {
         self.rebuild_view();
     }
 
-    /// Cycle the selected column through none → ascending → descending → none.
     fn cycle_sort(&mut self) {
+        self.cycle_sort_col(self.selected_col);
+    }
+
+    /// Cycle `col` through none → ascending → descending → none.
+    fn cycle_sort_col(&mut self, col: usize) {
         if self.data.ncols == 0 {
             return;
         }
-        let col = self.selected_col;
         let prev = self.sort;
         let next = match self.sort {
             Some(s) if s.col == col && s.dir == SortDir::Asc => Some(SortDir::Desc),
@@ -503,10 +519,13 @@ impl App {
         });
     }
 
-    /// Toggle decimal-aligned, log-coloured numeric display on the selected
-    /// column. Turning the colour off with no fixed decimals reverts to plain.
     fn toggle_numeric(&mut self) {
-        let col = self.selected_col;
+        self.toggle_numeric_col(self.selected_col);
+    }
+
+    /// Toggle decimal-aligned, log-coloured numeric display on `col`. Turning
+    /// the colour off with no fixed decimals reverts to plain.
+    fn toggle_numeric_col(&mut self, col: usize) {
         if !self.data.is_numeric(col) {
             self.status_msg = Some("column is not numeric".into());
             return;
@@ -527,10 +546,13 @@ impl App {
         }
     }
 
-    /// Adjust the fixed decimal count on the selected column, enabling
-    /// decimal-point alignment (but not colouring).
     fn adjust_decimals(&mut self, delta: isize) {
-        let col = self.selected_col;
+        self.adjust_decimals_col(self.selected_col, delta);
+    }
+
+    /// Adjust the fixed decimal count on `col`, enabling decimal alignment
+    /// (but not colouring).
+    fn adjust_decimals_col(&mut self, col: usize, delta: isize) {
         if !self.data.is_numeric(col) {
             self.status_msg = Some("column is not numeric".into());
             return;
