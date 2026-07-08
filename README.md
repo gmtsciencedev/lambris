@@ -52,8 +52,23 @@ The format is autodetected:
 - **Parquet** — recognised by its `PAR1` magic number.
 - **CSV / TSV** — anything else is read as delimited text. The delimiter comes
   from the extension (`.tsv`/`.tab` → tab, `.csv` → comma) or, for unknown
-  extensions, is sniffed from the header line. The first row is treated as a
-  header, and column types are inferred from a sample of the data.
+  extensions, is sniffed from the first non-comment line. The first row is
+  treated as a header, and column types are inferred from a sample of the data.
+
+### Comment lines
+
+Files that begin with `#` comment lines (MetaPhlAn and other bioinformatics
+tools) are handled automatically:
+
+- A leading block of `#` lines is skipped.
+- If the **last** `#` line has the same number of columns as the data (e.g.
+  MetaPhlAn's `#clade_name<TAB>…`), it is used as the header. Otherwise the
+  comment block is treated as pure preamble and the first non-`#` line is the
+  header.
+
+The detection is most reliable for TSV, where comment/command lines rarely
+contain tabs; a CSV comment that happens to have the same comma count as the
+data could be misread as a header.
 
 ## Scope
 

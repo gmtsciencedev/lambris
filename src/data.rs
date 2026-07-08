@@ -9,7 +9,7 @@ use arrow::array::{make_comparator, Array, ArrayRef};
 use arrow::compute::SortOptions;
 use arrow::csv::reader::Format as CsvFormat;
 use arrow::csv::ReaderBuilder as CsvReaderBuilder;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -398,17 +398,25 @@ fn detect_source(path: &Path) -> Result<Source> {
     Ok(Source::Delimited(delimiter))
 }
 
-/// Guess the delimiter of an unknown text file from its header line: tab if
-/// tabs outnumber commas, else comma.
+/// Guess the delimiter of an unknown text file from its first non-comment
+/// line: tab if tabs outnumber commas, else comma.
 fn sniff_delimiter(path: &Path) -> Result<u8> {
-    let file = File::open(path)?;
-    let mut header = String::new();
-    BufReader::new(file)
-        .read_line(&mut header)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let tabs = header.matches('\t').count();
-    let commas = header.matches(',').count();
-    Ok(if tabs > commas { b'\t' } else { b',' })
+    let mut reader = BufReader::new(File::open(path)?);
+    loop {
+        let mut line = String::new();
+        let n = reader
+            .read_line(&mut line)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if n == 0 {
+            return Ok(b','); // empty or all-comment file; harmless default
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+        let tabs = line.matches('\t').count();
+        let commas = line.matches(',').count();
+        return Ok(if tabs > commas { b'\t' } else { b',' });
+    }
 }
 
 /// Read parquet schema and row count from the footer, without decoding data.
@@ -422,8 +430,12 @@ fn load_parquet_meta(path: &Path) -> Result<(Backend, SchemaRef, usize)> {
 }
 
 /// Infer a CSV/TSV schema from a sample, then scan the file to build the
-/// chunk byte-offset index and count rows.
+/// chunk byte-offset index and count rows. Files that begin with `#` comment
+/// lines take a dedicated path (see [`load_csv_meta_commented`]).
 fn load_csv_meta(path: &Path, delimiter: u8) -> Result<(Backend, SchemaRef, usize)> {
+    if starts_with_comment(path)? {
+        return load_csv_meta_commented(path, delimiter);
+    }
     let format = CsvFormat::default()
         .with_header(true)
         .with_delimiter(delimiter);
@@ -442,19 +454,155 @@ fn load_csv_meta(path: &Path, delimiter: u8) -> Result<(Backend, SchemaRef, usiz
     ))
 }
 
-/// Scan a delimited file once, recording the byte offset of every chunk
-/// boundary (each `CHUNK`-th data row) and the total data-row count. The scan
-/// is quote-aware: a `"` toggles quoting (so a `""` escape flips back), and
-/// only newlines outside quotes end a record — matching RFC 4180.
+/// Handle files with a leading `#` comment block (MetaPhlAn and friends).
+/// Works out where the real header and data start, then infers column types
+/// from the data alone — the comment lines never reach the chunk reader.
+fn load_csv_meta_commented(path: &Path, delimiter: u8) -> Result<(Backend, SchemaRef, usize)> {
+    let (data_start, names) = analyze_comment_header(path, delimiter)?;
+    let (chunk_offsets, nrows) = build_index_from(path, data_start)?;
+
+    // Types come from the data rows only (header, if any, is already excluded).
+    let types = if nrows == 0 {
+        vec![DataType::Utf8; names.len()]
+    } else {
+        infer_types_from(path, delimiter, data_start)?
+    };
+    // The inferred column count is authoritative; pad/truncate names to match.
+    let fields: Vec<Field> = types
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| {
+            let name = names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("column_{}", i + 1));
+            Field::new(name, ty.clone(), true)
+        })
+        .collect();
+    let schema = Arc::new(Schema::new(fields));
+    Ok((
+        Backend::Csv {
+            delimiter,
+            chunk_offsets,
+        },
+        schema,
+        nrows,
+    ))
+}
+
+fn starts_with_comment(path: &Path) -> Result<bool> {
+    let mut byte = [0u8; 1];
+    let n = File::open(path)?.read(&mut byte).unwrap_or(0);
+    Ok(n == 1 && byte[0] == b'#')
+}
+
+/// Find where the data begins in a commented file and what the column names
+/// are. Two conventions are supported: the header is either the last `#` line
+/// (when, stripped of `#`, its field count matches the first data row — the
+/// MetaPhlAn style) or the first non-`#` line (a pure comment preamble).
+fn analyze_comment_header(path: &Path, delimiter: u8) -> Result<(u64, Vec<String>)> {
+    let delim = delimiter as char;
+    let count_fields = |s: &str| s.split(delim).count();
+    let split_header = |s: &str| -> Vec<String> {
+        s.split(delim)
+            .map(|f| f.trim().trim_matches('"').to_string())
+            .collect()
+    };
+
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut offset: u64 = 0;
+    let mut last_comment: Option<String> = None;
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            // No data line at all: fall back to the last comment as header.
+            let names = last_comment
+                .as_deref()
+                .map(|c| split_header(c.strip_prefix('#').unwrap_or(c)))
+                .unwrap_or_default();
+            return Ok((offset, names));
+        }
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if trimmed.starts_with('#') {
+            last_comment = Some(trimmed.to_string());
+            offset += n as u64;
+            continue;
+        }
+        // First non-comment line: header or first data row?
+        if let Some(comment) = &last_comment {
+            let stripped = comment.strip_prefix('#').unwrap_or(comment);
+            if count_fields(stripped) > 1 && count_fields(stripped) == count_fields(trimmed) {
+                // MetaPhlAn style: this line is data, the header was the comment.
+                return Ok((offset, split_header(stripped)));
+            }
+        }
+        // Pure preamble: this line is the header; data starts after it.
+        return Ok((offset + n as u64, split_header(trimmed)));
+    }
+}
+
+/// Infer column data types from the data rows starting at `data_start`.
+fn infer_types_from(path: &Path, delimiter: u8, data_start: u64) -> Result<Vec<DataType>> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(data_start))?;
+    let format = CsvFormat::default()
+        .with_header(false)
+        .with_delimiter(delimiter);
+    let (schema, _) = format
+        .infer_schema(BufReader::new(file), Some(CSV_INFER_ROWS))
+        .with_context(|| format!("inferring types from {}", path.display()))?;
+    Ok(schema
+        .fields()
+        .iter()
+        .map(|f| f.data_type().clone())
+        .collect())
+}
+
+/// Build the chunk byte-offset index for a headed file: skip the header row,
+/// then index the data rows that follow.
 fn build_csv_index(path: &Path) -> Result<(Vec<u64>, usize)> {
+    let data_start = first_record_end(path)?;
+    build_index_from(path, data_start)
+}
+
+/// Byte offset just past the first record (quote-aware), i.e. the start of the
+/// second line — or EOF if the file has no line break.
+fn first_record_end(path: &Path) -> Result<u64> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut buf = [0u8; 64 * 1024];
     let mut pos: u64 = 0;
     let mut in_quotes = false;
-    let mut header_pending = true;
-    let mut data_rows: usize = 0;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Ok(pos);
+        }
+        for &b in &buf[..n] {
+            pos += 1;
+            match b {
+                b'"' => in_quotes = !in_quotes,
+                b'\n' if !in_quotes => return Ok(pos),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Scan data rows starting at `data_start`, recording the byte offset of every
+/// chunk boundary (each `CHUNK`-th row) and the total row count. The scan is
+/// quote-aware: a `"` toggles quoting (so a `""` escape flips back), and only
+/// newlines outside quotes end a record — matching RFC 4180.
+fn build_index_from(path: &Path, data_start: u64) -> Result<(Vec<u64>, usize)> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(data_start))?;
+    let mut reader = BufReader::new(file);
+    let mut buf = [0u8; 64 * 1024];
+    let mut pos = data_start;
+    let mut in_quotes = false;
+    let mut rows: usize = 0;
     let mut record_has_content = false;
-    let mut offsets = Vec::new();
+    let mut offsets = vec![data_start]; // offsets[0] = start of row 0
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {
@@ -468,15 +616,10 @@ fn build_csv_index(path: &Path) -> Result<(Vec<u64>, usize)> {
                     record_has_content = true;
                 }
                 b'\n' if !in_quotes => {
-                    if header_pending {
-                        header_pending = false;
-                        offsets.push(pos); // byte offset of data row 0
-                    } else {
-                        data_rows += 1;
-                        // `pos` is now the start of the next data row.
-                        if data_rows % CHUNK == 0 {
-                            offsets.push(pos);
-                        }
+                    rows += 1;
+                    // `pos` is now the start of the next row.
+                    if rows % CHUNK == 0 {
+                        offsets.push(pos);
                     }
                     record_has_content = false;
                 }
@@ -486,10 +629,10 @@ fn build_csv_index(path: &Path) -> Result<(Vec<u64>, usize)> {
         }
     }
     // A final record with no trailing newline still counts.
-    if !header_pending && record_has_content {
-        data_rows += 1;
+    if record_has_content {
+        rows += 1;
     }
-    Ok((offsets, data_rows))
+    Ok((offsets, rows))
 }
 
 /// Concatenate batches, yielding an empty batch (with the schema) if there are
