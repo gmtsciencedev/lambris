@@ -14,6 +14,8 @@ pub enum Mode {
 pub enum InputKind {
     Search,
     Filter,
+    /// Jump to a (1-based, original) row number.
+    Goto,
 }
 
 /// An active search: the raw query plus its compiled regex.
@@ -112,6 +114,7 @@ impl App {
             KeyCode::Char('i') => self.show_info = !self.show_info,
             KeyCode::Char('/') => self.enter_input(InputKind::Search),
             KeyCode::Char('&') => self.enter_input(InputKind::Filter),
+            KeyCode::Char(':') => self.enter_input(InputKind::Goto),
             KeyCode::Char('n') => self.jump_match(true),
             KeyCode::Char('N') => self.jump_match(false),
 
@@ -148,7 +151,12 @@ impl App {
             KeyCode::Backspace => {
                 self.input.pop();
             }
-            KeyCode::Char(c) => self.input.push(c),
+            // Goto only accepts digits; search/filter take any character.
+            KeyCode::Char(c) => {
+                if !matches!(kind, InputKind::Goto) || c.is_ascii_digit() {
+                    self.input.push(c);
+                }
+            }
             _ => {}
         }
     }
@@ -159,6 +167,7 @@ impl App {
         self.input = match kind {
             InputKind::Search => self.search.as_ref().map(|s| s.query.clone()),
             InputKind::Filter => self.filter_query.clone(),
+            InputKind::Goto => None,
         }
         .unwrap_or_default();
     }
@@ -166,10 +175,15 @@ impl App {
     fn commit_input(&mut self, kind: InputKind) {
         let query = std::mem::take(&mut self.input);
         self.mode = Mode::Normal;
+        if let InputKind::Goto = kind {
+            self.goto_line(&query);
+            return;
+        }
         if query.is_empty() {
             match kind {
                 InputKind::Search => self.search = None,
                 InputKind::Filter => self.clear_filter(),
+                InputKind::Goto => unreachable!(),
             }
             return;
         }
@@ -183,6 +197,26 @@ impl App {
         match kind {
             InputKind::Search => self.apply_search(query, re),
             InputKind::Filter => self.apply_filter(query, re),
+            InputKind::Goto => unreachable!(),
+        }
+    }
+
+    /// Jump to a 1-based original row number, honouring the active filter.
+    fn goto_line(&mut self, text: &str) {
+        if text.is_empty() || self.data.nrows == 0 {
+            return;
+        }
+        let Ok(n) = text.parse::<usize>() else {
+            self.status_msg = Some("invalid line number".into());
+            return;
+        };
+        let target = n.saturating_sub(1).min(self.data.nrows - 1);
+        match self.rows.iter().position(|&r| r == target) {
+            Some(pos) => {
+                self.selected_row = pos;
+                self.status_msg = Some(format!("→ line {}", target + 1));
+            }
+            None => self.status_msg = Some(format!("line {n} not in current view")),
         }
     }
 

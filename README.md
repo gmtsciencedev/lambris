@@ -23,6 +23,7 @@ cargo run --release -- path/to/file.parquet
 | `Ctrl-f` / `Ctrl-b` / `PgDn` / `PgUp` | Page down / up |
 | `g` / `G` | Jump to first / last row |
 | `0` / `$` | Jump to first / last column |
+| `:` | Go to a row number (1-based, uses original row numbers under a filter) |
 | `/` | Search (regex, case-insensitive); jumps to the first match |
 | `n` / `N` | Jump to next / previous search match |
 | `&` | Filter rows to those with a cell matching a regex |

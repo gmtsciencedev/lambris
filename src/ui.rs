@@ -222,6 +222,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         let sigil = match kind {
             InputKind::Search => '/',
             InputKind::Filter => '&',
+            InputKind::Goto => ':',
         };
         let line = Line::from(vec![
             Span::styled(
@@ -272,7 +273,7 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
         )),
         Mode::Normal if app.show_info => info_line(app, area.width),
         Mode::Normal => Line::from(Span::styled(
-            " j/k/h/l move · g/G top/bot · / search · n/N next · & filter · i info · q quit",
+            " j/k/h/l move · g/G top/bot · :goto · / search · n/N next · & filter · i info · q quit",
             Style::new().dim(),
         )),
     };

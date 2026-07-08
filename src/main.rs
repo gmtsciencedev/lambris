@@ -189,6 +189,35 @@ mod tests {
     }
 
     #[test]
+    fn goto_line_jumps_to_row() {
+        let mut app = App::new(Dataset::load(&fixture()).unwrap());
+        app.handle_key(key(':'));
+        type_str(&mut app, "27");
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.rows[app.selected_row], 26, "line 27 is original row 26");
+
+        // Non-digits are rejected at the prompt, so this stays empty and no-ops.
+        app.handle_key(key(':'));
+        type_str(&mut app, "abc");
+        assert_eq!(app.input, "");
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.rows[app.selected_row], 26, "selection unchanged");
+    }
+
+    #[test]
+    fn goto_line_out_of_view_reports() {
+        let mut app = App::new(Dataset::load(&fixture()).unwrap());
+        // Filter to item_004x, then ask for a line that was filtered out.
+        app.handle_key(key('&'));
+        type_str(&mut app, "item_004");
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        app.handle_key(key(':'));
+        type_str(&mut app, "3");
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.status_msg.as_deref().unwrap().contains("not in current view"));
+    }
+
+    #[test]
     fn renders_null_as_na() {
         let mut app = App::new(Dataset::load(&fixture()).unwrap());
         // Row 0's score is null; "NA" must appear in the rendered buffer.
