@@ -30,6 +30,20 @@ pub fn render(frame: &mut Frame, app: &mut App) -> Result<()> {
     ])
     .areas(frame.area());
 
+    if app.transpose {
+        render_title(frame, title_area, app);
+        render_transpose(frame, body_area, app)?;
+        render_transpose_status(frame, status_area, app);
+        frame.render_widget(
+            Line::from(Span::styled(
+                " j/k field · h/l record · g/G first/last field · t exit · q quit",
+                Style::new().dim(),
+            )),
+            help_area,
+        );
+        return Ok(());
+    }
+
     // Body has one header row; the rest is scrollable data.
     let viewport_rows = body_area.height.saturating_sub(1) as usize;
     app.viewport_rows = viewport_rows.max(1);
@@ -202,6 +216,166 @@ fn render_table(
 
 fn divider_cell() -> Cell<'static> {
     Cell::from("│").style(Style::new().fg(Color::DarkGray))
+}
+
+const NAME_COL_MAX: u16 = 30;
+
+/// Render the transposed view: original columns run down the left as a field
+/// column, and a horizontally-scrollable window of records runs across the top.
+/// Only the on-screen records are read, so this stays cheap on big files.
+fn render_transpose(frame: &mut Frame, area: Rect, app: &mut App) -> Result<()> {
+    let data = &app.data;
+    let ncols = data.ncols;
+    let row_count = app.row_count();
+
+    // One header row (record numbers); the rest lists fields.
+    let field_rows = area.height.saturating_sub(1).max(1) as usize;
+
+    // Vertical scroll: keep the selected field visible.
+    let mut field_off = app.t_field_offset;
+    if app.t_field < field_off {
+        field_off = app.t_field;
+    } else if app.t_field >= field_off + field_rows {
+        field_off = app.t_field + 1 - field_rows;
+    }
+    let field_end = (field_off + field_rows).min(ncols);
+    let fields: Vec<usize> = (field_off..field_end).collect();
+
+    let name_w = fields
+        .iter()
+        .map(|&c| data.column_names[c].chars().count())
+        .max()
+        .unwrap_or(MIN_COL_WIDTH as usize)
+        .clamp(MIN_COL_WIDTH as usize, NAME_COL_MAX as usize) as u16;
+
+    // Cache cell strings fetched while measuring so rendering reuses them.
+    let mut cache: HashMap<(usize, usize), Option<String>> = HashMap::new();
+    let mut cell = |c: usize, orig: usize, data: &crate::data::Dataset| -> Option<String> {
+        cache
+            .entry((c, orig))
+            .or_insert_with(|| data.cell_display(c, orig).ok().flatten())
+            .clone()
+    };
+
+    // Horizontal fit: which records fit across, scrolling to keep t_record in view.
+    let mut record_off = app.t_record_offset.min(app.t_record);
+    let avail = area.width;
+    let (records, widths): (Vec<usize>, Vec<u16>) = loop {
+        let mut recs = Vec::new();
+        let mut ws = Vec::new();
+        let mut used = name_w + COL_SPACING;
+        let mut r = record_off;
+        while r < row_count {
+            let orig = app.orig_row(r);
+            let mut w = (orig + 1).to_string().len() as u16;
+            for &c in &fields {
+                let vw = match cell(c, orig, data) {
+                    Some(s) => s.chars().count() as u16,
+                    None => NA.len() as u16,
+                };
+                w = w.max(vw);
+            }
+            let w = w.clamp(MIN_COL_WIDTH, MAX_COL_WIDTH);
+            if !recs.is_empty() && used + w + COL_SPACING > avail {
+                break;
+            }
+            used += w + COL_SPACING;
+            recs.push(r);
+            ws.push(w);
+            r += 1;
+        }
+        if app.t_record <= *recs.last().unwrap_or(&record_off) {
+            break (recs, ws);
+        }
+        record_off += 1;
+    };
+
+    let sel_bg = Color::Rgb(40, 40, 55);
+
+    // Header: an empty corner, then record (row) numbers.
+    let mut header_cells = vec![Cell::from("").style(Style::new().dim())];
+    for (j, &r) in records.iter().enumerate() {
+        let orig = app.orig_row(r);
+        let mut style = Style::new().bold().fg(Color::Cyan);
+        if r == app.t_record {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        header_cells.push(Cell::from(truncate(&format!("{}", orig + 1), widths[j])).style(style));
+    }
+    let header = Row::new(header_cells).style(Style::new().underlined());
+
+    let mut rows = Vec::with_capacity(fields.len());
+    for &c in &fields {
+        let sel_field = c == app.t_field;
+        let name_style = {
+            let mut s = Style::new().bold().fg(Color::Cyan);
+            if sel_field {
+                s = s.add_modifier(Modifier::REVERSED);
+            }
+            s
+        };
+        let mut cells = vec![Cell::from(truncate(&data.column_names[c], name_w)).style(name_style)];
+        for (j, &r) in records.iter().enumerate() {
+            let orig = app.orig_row(r);
+            let sel_cell = sel_field && r == app.t_record;
+            let (text, mut style) = match cell(c, orig, data) {
+                None => (
+                    NA.to_string(),
+                    Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Some(s) => (truncate(&s, widths[j]), Style::new()),
+            };
+            if !sel_cell && (sel_field || r == app.t_record) {
+                style = style.bg(sel_bg);
+            }
+            if sel_cell {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            cells.push(Cell::from(text).style(style));
+        }
+        rows.push(Row::new(cells));
+    }
+
+    let mut constraints = vec![Constraint::Length(name_w)];
+    constraints.extend(widths.iter().map(|&w| Constraint::Length(w)));
+    let table = Table::new(rows, constraints)
+        .header(header)
+        .column_spacing(COL_SPACING);
+    frame.render_widget(table, area);
+
+    app.t_field_offset = field_off;
+    app.t_record_offset = record_off;
+    app.t_field_page = field_rows;
+    Ok(())
+}
+
+fn render_transpose_status(frame: &mut Frame, area: Rect, app: &App) {
+    let name = app
+        .data
+        .column_names
+        .get(app.t_field)
+        .map(String::as_str)
+        .unwrap_or("");
+    let ty = app
+        .data
+        .column_types
+        .get(app.t_field)
+        .map(String::as_str)
+        .unwrap_or("");
+    let spans = vec![
+        Span::styled(
+            format!(
+                " ⇄ transpose  field {}/{}  record {}/{} ",
+                app.t_field + 1,
+                app.data.ncols,
+                app.t_record + 1,
+                app.row_count(),
+            ),
+            Style::new().bg(Color::DarkGray).fg(Color::White),
+        ),
+        Span::styled(format!("  {name}: {ty}"), Style::new().fg(Color::Yellow)),
+    ];
+    frame.render_widget(Line::from(spans), area);
 }
 
 /// Decide which columns fit: the frozen prefix `0..frozen` (always shown),

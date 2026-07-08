@@ -539,6 +539,41 @@ mod tests {
     }
 
     #[test]
+    fn transpose_swaps_axes_and_navigates() {
+        let mut app = App::new(Dataset::load(&fixture()).unwrap());
+        app.handle_key(key('t'));
+        assert!(app.transpose);
+        assert_eq!((app.t_field, app.t_record), (0, 0));
+
+        let text = buffer_text(&mut app, 80, 20);
+        // Field names run down the left as row labels.
+        assert!(text.contains("id"), "field label missing: {text}");
+        assert!(text.contains("score"), "field label missing: {text}");
+        // Record 0's value appears (name = item_0000).
+        assert!(text.contains("item_0000"), "record value missing: {text}");
+
+        app.handle_key(key('j')); // next field
+        assert_eq!(app.t_field, 1);
+        app.handle_key(key('l')); // next record
+        assert_eq!(app.t_record, 1);
+
+        // Exiting carries the cursor back to the main view.
+        app.handle_key(key('t'));
+        assert!(!app.transpose);
+        assert_eq!((app.selected_col, app.selected_row), (1, 1));
+    }
+
+    #[test]
+    fn transpose_is_windowed_on_big_files() {
+        // Transposing a 20k-row file only reads the on-screen records.
+        let mut app = App::new(Dataset::load(&big_parquet(BIG)).unwrap());
+        app.handle_key(key('t'));
+        let text = buffer_text(&mut app, 80, 20);
+        assert!(text.contains("id"), "field label missing: {text}");
+        assert!(text.contains("name"), "field label missing: {text}");
+    }
+
+    #[test]
     fn hash_toggles_line_number_gutter() {
         let mut app = App::new(Dataset::load(&fixture()).unwrap());
         assert!(app.show_line_numbers);

@@ -122,6 +122,17 @@ pub struct App {
     pub show_info: bool,
     /// Whether the row-number gutter is shown (toggled with `#`).
     pub show_line_numbers: bool,
+    /// Transpose mode: original columns shown as rows, rows as columns.
+    pub transpose: bool,
+    /// Selected field (original column) while transposed.
+    pub t_field: usize,
+    /// Selected record (view row, shown as a column) while transposed.
+    pub t_record: usize,
+    /// Scroll offsets for the transposed axes.
+    pub t_field_offset: usize,
+    pub t_record_offset: usize,
+    /// Fields the last transposed render could fit; used for paging.
+    pub t_field_page: usize,
     /// Number of leftmost columns pinned in place while scrolling horizontally.
     pub frozen_cols: usize,
     /// Active sort, if any.
@@ -150,6 +161,12 @@ impl App {
             status_msg: None,
             show_info: false,
             show_line_numbers: true,
+            transpose: false,
+            t_field: 0,
+            t_record: 0,
+            t_field_offset: 0,
+            t_record_offset: 0,
+            t_field_page: 1,
             frozen_cols: 0,
             sort: None,
             repeat: None,
@@ -185,8 +202,61 @@ impl App {
     /// `now` is injected so held-key acceleration can be tested deterministically.
     pub fn handle_key_at(&mut self, key: KeyEvent, now: Instant) {
         match self.mode {
+            Mode::Normal if self.transpose => self.handle_transpose(key),
             Mode::Normal => self.handle_normal(key, now),
             Mode::Input(kind) => self.handle_input(key, kind),
+        }
+    }
+
+    fn enter_transpose(&mut self) {
+        if self.data.ncols == 0 || self.row_count() == 0 {
+            self.status_msg = Some("nothing to transpose".into());
+            return;
+        }
+        self.transpose = true;
+        self.t_field = self.selected_col;
+        self.t_record = self.selected_row;
+        self.t_field_offset = 0;
+        self.t_record_offset = self.row_offset;
+    }
+
+    /// Navigation while transposed: `j`/`k` move through fields (the vertical
+    /// axis), `h`/`l` through records (the horizontal axis).
+    fn handle_transpose(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let page = self.t_field_page.max(1) as isize;
+        let last_field = self.data.ncols.saturating_sub(1) as isize;
+        let last_record = self.row_count().saturating_sub(1) as isize;
+        self.status_msg = None;
+        let clamp = |v: isize, hi: isize| v.clamp(0, hi) as usize;
+        match key.code {
+            KeyCode::Char('t') | KeyCode::Esc => {
+                self.transpose = false;
+                self.selected_col = self.t_field;
+                self.selected_row = self.t_record;
+            }
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('c') if ctrl => self.should_quit = true,
+
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.t_field = clamp(self.t_field as isize + 1, last_field)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.t_field = clamp(self.t_field as isize - 1, last_field)
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                self.t_record = clamp(self.t_record as isize + 1, last_record)
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                self.t_record = clamp(self.t_record as isize - 1, last_record)
+            }
+            KeyCode::Char('d') if ctrl => self.t_field = clamp(self.t_field as isize + page, last_field),
+            KeyCode::Char('u') if ctrl => self.t_field = clamp(self.t_field as isize - page, last_field),
+            KeyCode::PageDown => self.t_field = clamp(self.t_field as isize + page, last_field),
+            KeyCode::PageUp => self.t_field = clamp(self.t_field as isize - page, last_field),
+            KeyCode::Char('g') | KeyCode::Home => self.t_field = 0,
+            KeyCode::Char('G') | KeyCode::End => self.t_field = last_field.max(0) as usize,
+            _ => {}
         }
     }
 
@@ -210,6 +280,7 @@ impl App {
 
             KeyCode::Char('i') => self.show_info = !self.show_info,
             KeyCode::Char('#') => self.show_line_numbers = !self.show_line_numbers,
+            KeyCode::Char('t') => self.enter_transpose(),
             KeyCode::Char('s') => self.cycle_sort(),
             KeyCode::Char('f') if !ctrl => self.toggle_freeze(),
             KeyCode::Char('/') => self.enter_input(InputKind::Search),
