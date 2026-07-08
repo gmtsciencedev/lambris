@@ -87,3 +87,7 @@ for the visible window using Arrow's `ArrayFormatter`.
 cargo test    # headless render + navigation tests (build their own fixture)
 cargo build
 ```
+
+## License
+
+Licensed under the [MIT License](LICENSE).
