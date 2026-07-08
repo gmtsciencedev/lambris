@@ -543,24 +543,34 @@ mod tests {
         let mut app = App::new(Dataset::load(&fixture()).unwrap());
         app.handle_key(key('t'));
         assert!(app.transpose);
-        assert_eq!((app.t_field, app.t_record), (0, 0));
+        // Column 0 (id) is the title/index, so the first field is column 1.
+        assert_eq!((app.t_field, app.t_record), (1, 0));
 
         let text = buffer_text(&mut app, 80, 20);
-        // Field names run down the left as row labels.
-        assert!(text.contains("id"), "field label missing: {text}");
+        // The title column's name labels the corner; other columns are fields.
+        assert!(text.contains("id"), "title column label missing: {text}");
         assert!(text.contains("score"), "field label missing: {text}");
-        // Record 0's value appears (name = item_0000).
+        // Record 0's `name` value shows in the name field row.
         assert!(text.contains("item_0000"), "record value missing: {text}");
 
-        app.handle_key(key('j')); // next field
-        assert_eq!(app.t_field, 1);
+        app.handle_key(key('j')); // next field (name -> score)
+        assert_eq!(app.t_field, 2);
         app.handle_key(key('l')); // next record
         assert_eq!(app.t_record, 1);
 
         // Exiting carries the cursor back to the main view.
         app.handle_key(key('t'));
         assert!(!app.transpose);
-        assert_eq!((app.selected_col, app.selected_row), (1, 1));
+        assert_eq!((app.selected_col, app.selected_row), (2, 1));
+    }
+
+    #[test]
+    fn transpose_needs_at_least_two_columns() {
+        let csv = "only\n1\n2\n3\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        app.handle_key(key('t'));
+        assert!(!app.transpose, "single-column transpose is meaningless");
+        assert!(app.status_msg.as_deref().unwrap().contains("2 columns"));
     }
 
     #[test]

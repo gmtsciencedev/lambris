@@ -224,26 +224,30 @@ impl App {
     }
 
     fn enter_transpose(&mut self) {
-        if self.data.ncols == 0 || self.row_count() == 0 {
-            self.status_msg = Some("nothing to transpose".into());
+        // The first column becomes the record titles, so there must be at
+        // least one further column to show as a field.
+        if self.data.ncols < 2 || self.row_count() == 0 {
+            self.status_msg = Some("transpose needs at least 2 columns".into());
             return;
         }
         self.transpose = true;
-        self.t_field = self.selected_col;
+        self.t_field = self.selected_col.max(1); // never the title column
         self.t_record = self.selected_row;
-        self.t_field_offset = 0;
+        self.t_field_offset = 1;
         self.t_record_offset = self.row_offset;
     }
 
     /// Navigation while transposed: `j`/`k` move through fields (the vertical
-    /// axis), `h`/`l` through records (the horizontal axis).
+    /// axis), `h`/`l` through records (the horizontal axis). Column 0 is the
+    /// title/index, so fields run over `1..ncols`.
     fn handle_transpose(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let page = self.t_field_page.max(1) as isize;
+        let first_field = 1;
         let last_field = self.data.ncols.saturating_sub(1) as isize;
         let last_record = self.row_count().saturating_sub(1) as isize;
         self.status_msg = None;
-        let clamp = |v: isize, hi: isize| v.clamp(0, hi) as usize;
+        let clamp = |v: isize, lo: isize, hi: isize| v.clamp(lo, hi) as usize;
         match key.code {
             KeyCode::Char('t') | KeyCode::Esc => {
                 self.transpose = false;
@@ -254,23 +258,31 @@ impl App {
             KeyCode::Char('c') if ctrl => self.should_quit = true,
 
             KeyCode::Char('j') | KeyCode::Down => {
-                self.t_field = clamp(self.t_field as isize + 1, last_field)
+                self.t_field = clamp(self.t_field as isize + 1, first_field, last_field)
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.t_field = clamp(self.t_field as isize - 1, last_field)
+                self.t_field = clamp(self.t_field as isize - 1, first_field, last_field)
             }
             KeyCode::Char('l') | KeyCode::Right => {
-                self.t_record = clamp(self.t_record as isize + 1, last_record)
+                self.t_record = clamp(self.t_record as isize + 1, 0, last_record)
             }
             KeyCode::Char('h') | KeyCode::Left => {
-                self.t_record = clamp(self.t_record as isize - 1, last_record)
+                self.t_record = clamp(self.t_record as isize - 1, 0, last_record)
             }
-            KeyCode::Char('d') if ctrl => self.t_field = clamp(self.t_field as isize + page, last_field),
-            KeyCode::Char('u') if ctrl => self.t_field = clamp(self.t_field as isize - page, last_field),
-            KeyCode::PageDown => self.t_field = clamp(self.t_field as isize + page, last_field),
-            KeyCode::PageUp => self.t_field = clamp(self.t_field as isize - page, last_field),
-            KeyCode::Char('g') | KeyCode::Home => self.t_field = 0,
-            KeyCode::Char('G') | KeyCode::End => self.t_field = last_field.max(0) as usize,
+            KeyCode::Char('d') if ctrl => {
+                self.t_field = clamp(self.t_field as isize + page, first_field, last_field)
+            }
+            KeyCode::Char('u') if ctrl => {
+                self.t_field = clamp(self.t_field as isize - page, first_field, last_field)
+            }
+            KeyCode::PageDown => {
+                self.t_field = clamp(self.t_field as isize + page, first_field, last_field)
+            }
+            KeyCode::PageUp => {
+                self.t_field = clamp(self.t_field as isize - page, first_field, last_field)
+            }
+            KeyCode::Char('g') | KeyCode::Home => self.t_field = first_field as usize,
+            KeyCode::Char('G') | KeyCode::End => self.t_field = last_field.max(1) as usize,
             _ => {}
         }
     }

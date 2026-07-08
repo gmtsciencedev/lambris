@@ -228,30 +228,35 @@ fn divider_cell() -> Cell<'static> {
 
 const NAME_COL_MAX: u16 = 30;
 
+/// The column whose values title the records in the transposed view.
+const TITLE_COL: usize = 0;
+
 /// Render the transposed view: original columns run down the left as a field
-/// column, and a horizontally-scrollable window of records runs across the top.
-/// Only the on-screen records are read, so this stays cheap on big files.
+/// column, and a horizontally-scrollable window of records runs across the top,
+/// titled by the first column's values. Only the on-screen records are read, so
+/// this stays cheap on big files.
 fn render_transpose(frame: &mut Frame, area: Rect, app: &mut App) -> Result<()> {
     let data = &app.data;
     let ncols = data.ncols;
     let row_count = app.row_count();
 
-    // One header row (record numbers); the rest lists fields.
+    // One header row (record titles); the rest lists fields (columns 1..ncols).
     let field_rows = area.height.saturating_sub(1).max(1) as usize;
 
-    // Vertical scroll: keep the selected field visible.
-    let mut field_off = app.t_field_offset;
+    // Vertical scroll over fields, which start at column 1 (0 is the title).
+    let mut field_off = app.t_field_offset.max(1);
     if app.t_field < field_off {
         field_off = app.t_field;
     } else if app.t_field >= field_off + field_rows {
         field_off = app.t_field + 1 - field_rows;
     }
+    field_off = field_off.max(1);
     let field_end = (field_off + field_rows).min(ncols);
     let fields: Vec<usize> = (field_off..field_end).collect();
 
-    let name_w = fields
-        .iter()
-        .map(|&c| data.column_names[c].chars().count())
+    // The name column must also fit the title column's name (the corner label).
+    let name_w = std::iter::once(data.column_names[TITLE_COL].chars().count())
+        .chain(fields.iter().map(|&c| data.column_names[c].chars().count()))
         .max()
         .unwrap_or(MIN_COL_WIDTH as usize)
         .clamp(MIN_COL_WIDTH as usize, NAME_COL_MAX as usize) as u16;
@@ -264,6 +269,7 @@ fn render_transpose(frame: &mut Frame, area: Rect, app: &mut App) -> Result<()> 
             .or_insert_with(|| data.cell_display(c, orig).ok().flatten())
             .clone()
     };
+    let title_of = |c: Option<String>| c.unwrap_or_else(|| NA.to_string());
 
     // Horizontal fit: which records fit across, scrolling to keep t_record in view.
     let mut record_off = app.t_record_offset.min(app.t_record);
@@ -275,7 +281,8 @@ fn render_transpose(frame: &mut Frame, area: Rect, app: &mut App) -> Result<()> 
         let mut r = record_off;
         while r < row_count {
             let orig = app.orig_row(r);
-            let mut w = (orig + 1).to_string().len() as u16;
+            // Column width covers the title and every visible field value.
+            let mut w = title_of(cell(TITLE_COL, orig, data)).chars().count() as u16;
             for &c in &fields {
                 let vw = match cell(c, orig, data) {
                     Some(s) => s.chars().count() as u16,
@@ -300,15 +307,19 @@ fn render_transpose(frame: &mut Frame, area: Rect, app: &mut App) -> Result<()> 
 
     let sel_bg = Color::Rgb(40, 40, 55);
 
-    // Header: an empty corner, then record (row) numbers.
-    let mut header_cells = vec![Cell::from("").style(Style::new().dim())];
+    // Header: the title column's name in the corner, then each record's title.
+    let mut header_cells = vec![
+        Cell::from(truncate(&data.column_names[TITLE_COL], name_w))
+            .style(Style::new().bold().fg(Color::Magenta)),
+    ];
     for (j, &r) in records.iter().enumerate() {
         let orig = app.orig_row(r);
+        let title = title_of(cell(TITLE_COL, orig, data));
         let mut style = Style::new().bold().fg(Color::Cyan);
         if r == app.t_record {
             style = style.add_modifier(Modifier::REVERSED);
         }
-        header_cells.push(Cell::from(truncate(&format!("{}", orig + 1), widths[j])).style(style));
+        header_cells.push(Cell::from(truncate(&title, widths[j])).style(style));
     }
     let header = Row::new(header_cells).style(Style::new().underlined());
 
@@ -370,18 +381,22 @@ fn render_transpose_status(frame: &mut Frame, area: Rect, app: &App) {
         .get(app.t_field)
         .map(String::as_str)
         .unwrap_or("");
+    // Fields are columns 1..ncols (column 0 titles the records).
     let spans = vec![
         Span::styled(
             format!(
                 " ⇄ transpose  field {}/{}  record {}/{} ",
-                app.t_field + 1,
-                app.data.ncols,
+                app.t_field,
+                app.data.ncols.saturating_sub(1),
                 app.t_record + 1,
                 app.row_count(),
             ),
             Style::new().bg(Color::DarkGray).fg(Color::White),
         ),
-        Span::styled(format!("  {name}: {ty}"), Style::new().fg(Color::Yellow)),
+        Span::styled(
+            format!("  {} · {name}: {ty}", app.data.column_names[TITLE_COL]),
+            Style::new().fg(Color::Yellow),
+        ),
     ];
     frame.render_widget(Line::from(spans), area);
 }

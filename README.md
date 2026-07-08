@@ -81,9 +81,12 @@ freeze, and a transposed view. Nulls are shown as a highlighted `NA`. Sort
 composes with the active filter, and the cursor stays on the same record across
 a re-sort.
 
-Transpose is **windowed**: only the records currently on screen become columns,
-so it stays cheap even on large files (it never materialises the whole file as
-columns). Use `h`/`l` to scroll through records, `j`/`k` through fields.
+The **first column titles the records** (it's used as the index rather than
+shown as a field), so transposed columns are labelled meaningfully instead of
+by line number. Transpose is **windowed**: only the records currently on screen
+become columns, so it stays cheap even on large files (it never materialises the
+whole file as columns). Use `h`/`l` to scroll through records, `j`/`k` through
+fields. Requires at least two columns.
 
 ### Numeric columns
 
