@@ -69,18 +69,25 @@ mod tests {
     use ratatui::Terminal;
 
     /// Write a small parquet fixture to a temp path and return it.
+    /// Column `score` is nullable with every 3rd value null.
     fn fixture() -> PathBuf {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, false),
+            Field::new("score", DataType::Int64, true),
         ]));
         let ids = Int64Array::from((0..50).collect::<Vec<_>>());
         let names = StringArray::from(
             (0..50).map(|i| format!("item_{i:04}")).collect::<Vec<_>>(),
         );
+        let scores = Int64Array::from(
+            (0..50)
+                .map(|i| if i % 3 == 0 { None } else { Some(i * 2) })
+                .collect::<Vec<_>>(),
+        );
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(ids), Arc::new(names)],
+            vec![Arc::new(ids), Arc::new(names), Arc::new(scores)],
         )
         .unwrap();
 
@@ -107,13 +114,25 @@ mod tests {
             .collect()
     }
 
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::from(KeyCode::Char(c))
+    }
+
+    fn type_str(app: &mut App, s: &str) {
+        for c in s.chars() {
+            app.handle_key(key(c));
+        }
+    }
+
     #[test]
     fn loads_metadata() {
         let ds = Dataset::load(&fixture()).unwrap();
         assert_eq!(ds.nrows, 50);
-        assert_eq!(ds.ncols, 2);
-        assert_eq!(ds.column_names, vec!["id", "name"]);
-        assert_eq!(ds.column_types, vec!["Int64", "Utf8"]);
+        assert_eq!(ds.ncols, 3);
+        assert_eq!(ds.column_names, vec!["id", "name", "score"]);
+        assert_eq!(ds.column_types, vec!["Int64", "Utf8", "Int64"]);
+        assert!(ds.is_null(2, 0), "row 0 score should be null");
+        assert!(!ds.is_null(2, 1), "row 1 score should be present");
     }
 
     #[test]
@@ -144,8 +163,51 @@ mod tests {
         app.handle_key(KeyEvent::from(KeyCode::Left)); // left of col 0
         assert_eq!(app.selected_col, 0);
         app.handle_key(KeyEvent::from(KeyCode::Char('$')));
-        assert_eq!(app.selected_col, 1);
+        assert_eq!(app.selected_col, 2);
         app.handle_key(KeyEvent::from(KeyCode::Right)); // past last col
-        assert_eq!(app.selected_col, 1);
+        assert_eq!(app.selected_col, 2);
+    }
+
+    #[test]
+    fn renders_null_as_na() {
+        let mut app = App::new(Dataset::load(&fixture()).unwrap());
+        // Row 0's score is null; "NA" must appear in the rendered buffer.
+        let text = buffer_text(&mut app, 80, 20);
+        assert!(text.contains("NA"), "null cell not rendered as NA: {text}");
+    }
+
+    #[test]
+    fn search_jumps_to_match() {
+        let mut app = App::new(Dataset::load(&fixture()).unwrap());
+        app.handle_key(key('/'));
+        type_str(&mut app, "item_0042");
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.rows[app.selected_row], 42);
+        assert_eq!(app.selected_col, 1, "should land on the name column");
+        assert!(app.search.is_some());
+    }
+
+    #[test]
+    fn filter_restricts_rows() {
+        let mut app = App::new(Dataset::load(&fixture()).unwrap());
+        app.handle_key(key('&'));
+        type_str(&mut app, "item_004"); // matches item_0040..item_0049
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.row_count(), 10);
+        assert_eq!(app.rows[0], 40);
+        // Clearing the filter restores the full view.
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.row_count(), 50);
+        assert!(app.filter_query.is_none());
+    }
+
+    #[test]
+    fn bad_regex_reports_error_without_applying() {
+        let mut app = App::new(Dataset::load(&fixture()).unwrap());
+        app.handle_key(key('/'));
+        type_str(&mut app, "([");
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.search.is_none());
+        assert!(app.status_msg.as_deref().unwrap().contains("bad pattern"));
     }
 }

@@ -6,6 +6,7 @@ use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use regex::Regex;
 
 /// A parquet file loaded fully into memory as a single record batch, plus the
 /// metadata lambris needs to render it (column names, types, dimensions).
@@ -64,6 +65,10 @@ impl Dataset {
         self.batch.column(col)
     }
 
+    pub fn is_null(&self, col: usize, row: usize) -> bool {
+        self.column(col).is_null(row)
+    }
+
     /// Build one formatter per requested column, valid for the whole dataset.
     /// Formatters borrow their arrays, so we hand them back to the caller
     /// rather than storing them (the struct would otherwise be self-referential).
@@ -75,5 +80,55 @@ impl Dataset {
                     .with_context(|| format!("formatting column {}", self.column_names[c]))
             })
             .collect()
+    }
+
+    /// Return the original row indices where any (non-null) cell matches `re`.
+    pub fn filter_rows(&self, re: &Regex) -> Result<Vec<usize>> {
+        let cols: Vec<usize> = (0..self.ncols).collect();
+        let fmts = self.formatters(&cols)?;
+        let mut out = Vec::new();
+        for r in 0..self.nrows {
+            let hit = (0..self.ncols).any(|c| {
+                !self.is_null(c, r) && re.is_match(&fmts[c].value(r).to_string())
+            });
+            if hit {
+                out.push(r);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Find the next cell matching `re`, scanning the view `rows` in row-major
+    /// order starting just after `(start_row, start_col)` and wrapping around.
+    /// Returns a `(view_row, col)` position, where `view_row` indexes `rows`.
+    pub fn find_match(
+        &self,
+        re: &Regex,
+        rows: &[usize],
+        start_row: usize,
+        start_col: usize,
+        forward: bool,
+    ) -> Option<(usize, usize)> {
+        if rows.is_empty() || self.ncols == 0 {
+            return None;
+        }
+        let cols: Vec<usize> = (0..self.ncols).collect();
+        let fmts = self.formatters(&cols).ok()?;
+        let total = rows.len() * self.ncols;
+        let start = start_row * self.ncols + start_col;
+        for i in 1..=total {
+            let p = if forward {
+                (start + i) % total
+            } else {
+                (start + total - i) % total
+            };
+            let vr = p / self.ncols;
+            let c = p % self.ncols;
+            let orig = rows[vr];
+            if !self.is_null(c, orig) && re.is_match(&fmts[c].value(orig).to_string()) {
+                return Some((vr, c));
+            }
+        }
+        None
     }
 }

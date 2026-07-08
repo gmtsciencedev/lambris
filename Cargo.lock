@@ -1121,6 +1121,7 @@ dependencies = [
  "crossterm",
  "parquet",
  "ratatui",
+ "regex",
 ]
 
 [[package]]
