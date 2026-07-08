@@ -1,5 +1,6 @@
 mod app;
 mod data;
+mod interrupt;
 mod ui;
 
 use std::path::PathBuf;
@@ -115,6 +116,37 @@ mod tests {
         path
     }
 
+    /// Write an `n`-row parquet fixture (`id`, `name`) to a unique temp path.
+    fn big_parquet(n: i64) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let ids = Int64Array::from((0..n).collect::<Vec<_>>());
+        let names = StringArray::from((0..n).map(|i| format!("r{i}")).collect::<Vec<_>>());
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(names)]).unwrap();
+        let k = SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!("lambris_test_big_{k}.parquet"));
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        path
+    }
+
+    /// Write an `n`-row CSV fixture (`id,name`) to a unique temp path.
+    fn big_csv(n: usize) -> PathBuf {
+        let mut s = String::from("id,name\n");
+        for i in 0..n {
+            s.push_str(&format!("{i},r{i}\n"));
+        }
+        write_text_fixture("csv", &s)
+    }
+
     fn buffer_text(app: &mut App, w: u16, h: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal
@@ -148,6 +180,105 @@ mod tests {
         assert_eq!(ds.column_types, vec!["Int64", "Utf8", "Int64"]);
         assert!(ds.is_null(2, 0), "row 0 score should be null");
         assert!(!ds.is_null(2, 1), "row 1 score should be present");
+    }
+
+    // 20_000 rows spans three 8_192-row chunks, exercising chunk boundaries,
+    // the LRU cache, and the last partial chunk.
+    const BIG: i64 = 20_000;
+
+    #[test]
+    fn large_parquet_spans_chunks() {
+        let ds = Dataset::load(&big_parquet(BIG)).unwrap();
+        assert_eq!(ds.nrows, BIG as usize);
+        // Cells across every chunk, including boundaries and the last row.
+        for row in [0usize, 8191, 8192, 8193, 16384, 19999] {
+            assert_eq!(
+                ds.cell_display(0, row).unwrap().as_deref(),
+                Some(row.to_string().as_str())
+            );
+        }
+        // A window straddling a chunk boundary.
+        let vals = ds.cells(0, &[8191, 8192, 8193]).unwrap();
+        assert_eq!(
+            vals,
+            vec![Some("8191".into()), Some("8192".into()), Some("8193".into())]
+        );
+        // Sorting reads the full column across all chunks.
+        let all: Vec<usize> = (0..BIG as usize).collect();
+        let sorted = ds.sort_indices(&all, 0, true, || false).unwrap().unwrap();
+        assert_eq!(sorted[0], 19999);
+        assert_eq!(*sorted.last().unwrap(), 0);
+    }
+
+    #[test]
+    fn identity_view_needs_no_materialised_index() {
+        // With no filter/sort the view maps positions to rows directly, so a
+        // huge file costs nothing for row bookkeeping.
+        let mut app = App::new(Dataset::load(&big_parquet(BIG)).unwrap());
+        assert_eq!(app.row_count(), BIG as usize);
+        assert_eq!(app.orig_row(12_345), 12_345);
+        // Filtering materialises a subset; clearing returns to the identity view.
+        app.handle_key(key('&'));
+        type_str(&mut app, "^100$");
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.row_count(), 1);
+        assert_eq!(app.selected_orig(), 100);
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.row_count(), BIG as usize);
+        assert_eq!(app.orig_row(777), 777);
+    }
+
+    #[test]
+    fn large_csv_spans_chunks_and_filters() {
+        let ds = Dataset::load(&big_csv(BIG as usize)).unwrap();
+        assert_eq!(ds.nrows, BIG as usize, "row count from the offset index");
+        assert_eq!(ds.cell_display(0, 8192).unwrap().as_deref(), Some("8192"));
+        assert_eq!(ds.cell_display(0, 19999).unwrap().as_deref(), Some("19999"));
+        // Filtering streams every chunk; the match lives in the third one.
+        let hits = ds
+            .filter_rows(&regex::Regex::new("^18000$").unwrap(), || false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(hits, vec![18000]);
+    }
+
+    #[test]
+    fn cancellation_aborts_heavy_ops() {
+        let ds = Dataset::load(&big_parquet(BIG)).unwrap();
+        let never = || false;
+        let always = || true;
+
+        // A firing cancel aborts sort and filter before they finish.
+        let all: Vec<usize> = (0..BIG as usize).collect();
+        assert!(ds.sort_indices(&all, 0, true, always).unwrap().is_none());
+        assert!(ds
+            .filter_rows(&regex::Regex::new("x").unwrap(), always)
+            .unwrap()
+            .is_none());
+
+        // Search for a value that exists near the end: found normally, but a
+        // firing cancel aborts before reaching it.
+        let re = regex::Regex::new("^19999$").unwrap();
+        assert_eq!(
+            ds.find_match(&re, BIG as usize, |i| i, 0, 0, true, Some(0), never),
+            Some((19999, 0)),
+        );
+        assert!(ds
+            .find_match(&re, BIG as usize, |i| i, 0, 0, true, Some(0), always)
+            .is_none());
+    }
+
+    #[test]
+    fn csv_index_handles_quoted_newlines() {
+        // A quoted field spanning a newline must stay a single record.
+        let csv = "id,note\n1,\"line one\nline two\"\n2,plain\n";
+        let ds = Dataset::load(&write_text_fixture("csv", csv)).unwrap();
+        assert_eq!(ds.nrows, 2, "embedded newline must not split the record");
+        assert_eq!(
+            ds.cell_display(1, 0).unwrap().as_deref(),
+            Some("line one\nline two")
+        );
+        assert_eq!(ds.cell_display(0, 1).unwrap().as_deref(), Some("2"));
     }
 
     #[test]
@@ -273,14 +404,14 @@ mod tests {
         app.handle_key(key(':'));
         type_str(&mut app, "27");
         app.handle_key(KeyEvent::from(KeyCode::Enter));
-        assert_eq!(app.rows[app.selected_row], 26, "line 27 is original row 26");
+        assert_eq!(app.selected_orig(), 26, "line 27 is original row 26");
 
         // Non-digits are rejected at the prompt, so this stays empty and no-ops.
         app.handle_key(key(':'));
         type_str(&mut app, "abc");
         assert_eq!(app.input, "");
         app.handle_key(KeyEvent::from(KeyCode::Enter));
-        assert_eq!(app.rows[app.selected_row], 26, "selection unchanged");
+        assert_eq!(app.selected_orig(), 26, "selection unchanged");
     }
 
     #[test]
@@ -303,15 +434,15 @@ mod tests {
         // Selected column 0 = id (already ascending).
         app.handle_key(key('s'));
         assert_eq!(app.sort.unwrap().dir, SortDir::Asc);
-        assert_eq!(app.rows[0], 0);
+        assert_eq!(app.orig_row(0), 0);
 
         app.handle_key(key('s'));
         assert_eq!(app.sort.unwrap().dir, SortDir::Desc);
-        assert_eq!(app.rows[0], 49, "descending puts the largest id first");
+        assert_eq!(app.orig_row(0), 49, "descending puts the largest id first");
 
         app.handle_key(key('s'));
         assert!(app.sort.is_none(), "third press clears the sort");
-        assert_eq!(app.rows[0], 0, "natural order restored");
+        assert_eq!(app.orig_row(0), 0, "natural order restored");
     }
 
     #[test]
@@ -321,17 +452,17 @@ mod tests {
         app.handle_key(key(':'));
         type_str(&mut app, "5");
         app.handle_key(KeyEvent::from(KeyCode::Enter));
-        assert_eq!(app.rows[app.selected_row], 4);
+        assert_eq!(app.selected_orig(), 4);
 
         // Sort descending by id; the cursor should follow row 4.
         app.handle_key(key('s'));
         app.handle_key(key('s'));
-        assert_eq!(app.rows[app.selected_row], 4, "cursor tracks the record");
+        assert_eq!(app.selected_orig(), 4, "cursor tracks the record");
 
         // Sorting the nullable `score` column must not panic.
         app.handle_key(key('$')); // select score
         app.handle_key(key('s'));
-        assert_eq!(app.rows.len(), 50);
+        assert_eq!(app.row_count(), 50);
         assert!(app.sort.is_some());
     }
 
@@ -344,11 +475,11 @@ mod tests {
         app.handle_key(key('s')); // asc by id
         app.handle_key(key('s')); // desc by id
         assert_eq!(app.row_count(), 10);
-        assert_eq!(app.rows[0], 49, "sort applies within the filtered set");
+        assert_eq!(app.orig_row(0), 49, "sort applies within the filtered set");
         // Clearing the filter keeps the sort applied over all rows.
         app.handle_key(KeyEvent::from(KeyCode::Esc));
         assert_eq!(app.row_count(), 50);
-        assert_eq!(app.rows[0], 49);
+        assert_eq!(app.orig_row(0), 49);
     }
 
     #[test]
@@ -388,7 +519,7 @@ mod tests {
         app.handle_key(key('/'));
         type_str(&mut app, "item_0042");
         app.handle_key(KeyEvent::from(KeyCode::Enter));
-        assert_eq!(app.rows[app.selected_row], 42);
+        assert_eq!(app.selected_orig(), 42);
         assert_eq!(app.selected_col, 1, "should land on the name column");
         assert_eq!(app.search.as_ref().unwrap().scope, None, "global search is unscoped");
     }
@@ -403,11 +534,11 @@ mod tests {
 
         assert_eq!(app.search.as_ref().unwrap().scope, Some(1));
         assert_eq!(app.selected_col, 1);
-        assert_eq!(app.rows[app.selected_row], 40, "lands on first in-column match");
+        assert_eq!(app.selected_orig(), 40, "lands on first in-column match");
 
         app.handle_key(key('n'));
         assert_eq!(app.selected_col, 1, "next match stays in the searched column");
-        assert_eq!(app.rows[app.selected_row], 41);
+        assert_eq!(app.selected_orig(), 41);
     }
 
     #[test]
@@ -429,7 +560,7 @@ mod tests {
         type_str(&mut app, "item_004"); // matches item_0040..item_0049
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         assert_eq!(app.row_count(), 10);
-        assert_eq!(app.rows[0], 40);
+        assert_eq!(app.orig_row(0), 40);
         // Clearing the filter restores the full view.
         app.handle_key(KeyEvent::from(KeyCode::Esc));
         assert_eq!(app.row_count(), 50);

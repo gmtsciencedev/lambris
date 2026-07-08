@@ -4,6 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use regex::{Regex, RegexBuilder};
 
 use crate::data::Dataset;
+use crate::interrupt;
 
 /// Consecutive same-direction move events landing within this window are
 /// treated as a held key and accelerate the scroll.
@@ -56,14 +57,48 @@ pub struct SortSpec {
     pub dir: SortDir,
 }
 
+/// The ordered set of original rows currently on display.
+///
+/// `All` is the identity view over `0..nrows` and stores nothing, so an
+/// unfiltered, unsorted view of a billion-row file costs no memory. Only a
+/// filter or sort materialises an explicit `Rows` permutation.
+enum View {
+    All,
+    Rows(Vec<usize>),
+}
+
+impl View {
+    fn len(&self, total: usize) -> usize {
+        match self {
+            View::All => total,
+            View::Rows(v) => v.len(),
+        }
+    }
+
+    /// The original row index shown at view position `i` (caller ensures range).
+    fn orig(&self, i: usize) -> usize {
+        match self {
+            View::All => i,
+            View::Rows(v) => v[i],
+        }
+    }
+
+    /// The view position currently showing original row `orig`, if any.
+    fn position(&self, orig: usize, total: usize) -> Option<usize> {
+        match self {
+            View::All => (orig < total).then_some(orig),
+            View::Rows(v) => v.iter().position(|&r| r == orig),
+        }
+    }
+}
+
 /// UI state: selection, viewport, the current row view, and search/filter.
 pub struct App {
     pub data: Dataset,
-    /// Original row indices matching the current filter, in natural order.
-    /// `rows` is derived from this by applying the active sort.
-    base_rows: Vec<usize>,
-    /// Original row indices currently shown (filter applied, then sorted).
-    pub rows: Vec<usize>,
+    /// Original row indices matching the active filter (`None` = all rows).
+    filter: Option<Vec<usize>>,
+    /// The current display order, derived from `filter` and `sort`.
+    view: View,
     pub row_offset: usize,
     pub col_offset: usize,
     /// Selection is expressed against `rows`, not the underlying dataset.
@@ -95,12 +130,10 @@ pub struct App {
 
 impl App {
     pub fn new(data: Dataset) -> Self {
-        let base_rows: Vec<usize> = (0..data.nrows).collect();
-        let rows = base_rows.clone();
         Self {
             data,
-            base_rows,
-            rows,
+            filter: None,
+            view: View::All,
             row_offset: 0,
             col_offset: 0,
             selected_row: 0,
@@ -121,7 +154,17 @@ impl App {
     }
 
     pub fn row_count(&self) -> usize {
-        self.rows.len()
+        self.view.len(self.data.nrows)
+    }
+
+    /// Original dataset row index shown at view position `i`.
+    pub fn orig_row(&self, i: usize) -> usize {
+        self.view.orig(i)
+    }
+
+    /// Original dataset row index under the cursor.
+    pub fn selected_orig(&self) -> usize {
+        self.view.orig(self.selected_row)
     }
 
     fn last_row(&self) -> usize {
@@ -270,7 +313,7 @@ impl App {
             return;
         };
         let target = n.saturating_sub(1).min(self.data.nrows - 1);
-        match self.rows.iter().position(|&r| r == target) {
+        match self.view.position(target, self.data.nrows) {
             Some(pos) => {
                 self.selected_row = pos;
                 self.status_msg = Some(format!("→ line {}", target + 1));
@@ -286,15 +329,24 @@ impl App {
     }
 
     fn apply_filter(&mut self, query: String, re: Regex) {
-        match self.data.filter_rows(&re) {
-            Ok(rows) => {
+        match self.data.filter_rows(&re, interrupt::requested) {
+            Ok(Some(rows)) => {
                 let n = rows.len();
-                self.base_rows = rows;
+                self.filter = Some(rows);
                 self.filter_query = Some(query);
-                self.rebuild_rows();
                 self.selected_row = 0;
                 self.row_offset = 0;
-                self.status_msg = Some(format!("{n} rows matched"));
+                if self.rebuild_view() {
+                    self.status_msg = Some(format!("{n} rows matched"));
+                } else {
+                    // Filtering succeeded but re-sorting the subset was aborted.
+                    self.drop_sort_after_cancel();
+                    self.status_msg = Some(format!("{n} rows matched; sort cancelled"));
+                }
+            }
+            Ok(None) => {
+                interrupt::take();
+                self.status_msg = Some("filter cancelled".into());
             }
             Err(e) => self.status_msg = Some(format!("filter failed: {e}")),
         }
@@ -302,9 +354,21 @@ impl App {
 
     fn clear_filter(&mut self) {
         self.filter_query = None;
-        self.base_rows = (0..self.data.nrows).collect();
-        self.rebuild_rows();
-        self.status_msg = Some("filter cleared".into());
+        self.filter = None;
+        if self.rebuild_view() {
+            self.status_msg = Some("filter cleared".into());
+        } else {
+            self.drop_sort_after_cancel();
+            self.status_msg = Some("filter cleared; sort cancelled".into());
+        }
+    }
+
+    /// Recover after a cancelled sort: drop the sort and rebuild the (now
+    /// cheap, sort-free) view so state stays consistent.
+    fn drop_sort_after_cancel(&mut self) {
+        interrupt::take();
+        self.sort = None;
+        self.rebuild_view();
     }
 
     /// Cycle the selected column through none → ascending → descending → none.
@@ -313,13 +377,20 @@ impl App {
             return;
         }
         let col = self.selected_col;
+        let prev = self.sort;
         let next = match self.sort {
             Some(s) if s.col == col && s.dir == SortDir::Asc => Some(SortDir::Desc),
             Some(s) if s.col == col && s.dir == SortDir::Desc => None,
             _ => Some(SortDir::Asc),
         };
         self.sort = next.map(|dir| SortSpec { col, dir });
-        self.rebuild_rows();
+        if !self.rebuild_view() {
+            // Sort aborted; restore the previous ordering (the view is untouched).
+            interrupt::take();
+            self.sort = prev;
+            self.status_msg = Some("sort cancelled".into());
+            return;
+        }
         self.status_msg = Some(match next {
             Some(SortDir::Asc) => format!("sorted ↑ {}", self.data.column_names[col]),
             Some(SortDir::Desc) => format!("sorted ↓ {}", self.data.column_names[col]),
@@ -342,42 +413,67 @@ impl App {
         }
     }
 
-    /// Recompute `rows` from `base_rows` and the active sort, keeping the
-    /// cursor on the same underlying record when it survives.
-    fn rebuild_rows(&mut self) {
-        let keep = self.rows.get(self.selected_row).copied();
-        self.rows = match &self.sort {
-            Some(s) => match self.data.sort_indices(&self.base_rows, s.col, s.dir == SortDir::Desc)
-            {
-                Ok(rows) => rows,
-                Err(e) => {
-                    self.status_msg = Some(format!("sort failed: {e}"));
-                    return;
+    /// Recompute the view from the active filter and sort, keeping the cursor
+    /// on the same underlying record when it survives. Returns `false` if a
+    /// sort was cancelled — in which case the view is left untouched, so the
+    /// caller can revert whatever state it changed.
+    ///
+    /// With no filter and no sort the view is `All` (no allocation). A sort
+    /// materialises a permutation — over the filtered subset, or over all rows
+    /// when unfiltered (unavoidable: the result *is* an explicit ordering).
+    fn rebuild_view(&mut self) -> bool {
+        let keep = (self.row_count() > 0).then(|| self.selected_orig());
+        let new_view = match (&self.filter, self.sort) {
+            (None, None) => View::All,
+            (Some(f), None) => View::Rows(f.clone()),
+            (filter, Some(s)) => {
+                let base: Vec<usize> = match filter {
+                    Some(f) => f.clone(),
+                    None => (0..self.data.nrows).collect(),
+                };
+                match self.data.sort_indices(&base, s.col, s.dir == SortDir::Desc, interrupt::requested)
+                {
+                    Ok(Some(rows)) => View::Rows(rows),
+                    Ok(None) => return false, // cancelled; leave the view as it was
+                    Err(e) => {
+                        // Rare (e.g. incomparable type): drop the sort, show why.
+                        self.status_msg = Some(format!("sort failed: {e}"));
+                        self.sort = None;
+                        match &self.filter {
+                            Some(f) => View::Rows(f.clone()),
+                            None => View::All,
+                        }
+                    }
                 }
-            },
-            None => self.base_rows.clone(),
+            }
         };
+        self.view = new_view;
         self.selected_row = keep
-            .and_then(|orig| self.rows.iter().position(|&r| r == orig))
+            .and_then(|orig| self.view.position(orig, self.data.nrows))
             .unwrap_or(0)
             .min(self.last_row());
         self.row_offset = 0;
+        true
     }
 
     fn jump_match(&mut self, forward: bool) {
         let Some(search) = &self.search else { return };
-        match self.data.find_match(
+        let found = self.data.find_match(
             &search.re,
-            &self.rows,
+            self.row_count(),
+            |i| self.view.orig(i),
             self.selected_row,
             self.selected_col,
             forward,
             search.scope,
-        ) {
+            interrupt::requested,
+        );
+        match found {
             Some((row, col)) => {
                 self.selected_row = row;
                 self.selected_col = col;
             }
+            None if interrupt::take() => self.status_msg = Some("search cancelled".into()),
             None => self.status_msg = Some("no match".into()),
         }
     }
@@ -398,7 +494,7 @@ impl App {
     }
 
     fn move_row(&mut self, delta: isize) {
-        if self.rows.is_empty() {
+        if self.row_count() == 0 {
             return;
         }
         self.selected_row =

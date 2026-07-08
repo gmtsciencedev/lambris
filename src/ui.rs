@@ -84,7 +84,7 @@ fn render_table(
     visible_view: &[usize],
 ) -> Result<()> {
     // Original dataset row indices behind the visible view rows.
-    let visible_orig: Vec<usize> = visible_view.iter().map(|&v| app.rows[v]).collect();
+    let visible_orig: Vec<usize> = visible_view.iter().map(|&v| app.orig_row(v)).collect();
 
     let gutter = gutter_width(app);
     let available = area.width.saturating_sub(gutter + COL_SPACING);
@@ -125,7 +125,7 @@ fn render_table(
     let search = app.search.as_ref();
     let mut rows = Vec::with_capacity(visible_view.len());
     for (i, &vi) in visible_view.iter().enumerate() {
-        let orig = app.rows[vi];
+        let orig = app.orig_row(vi);
         let sel_row = vi == app.selected_row;
         let mut cells = vec![Cell::from(format!("{}", orig + 1)).style(Style::new().dim())];
         for (idx, &col) in visible_cols.iter().enumerate() {
@@ -253,22 +253,18 @@ fn render_column(
     if cache.contains_key(&col) {
         return Ok(());
     }
-    let formatter = &app.data.formatters(&[col])?[0];
     let mut width = app.data.column_names[col].chars().count() as u16;
     // Reserve room for the sort arrow shown next to a sorted column's header.
     if app.sort.map(|s| s.col == col).unwrap_or(false) {
         width += 2;
     }
-    let mut cells = Vec::with_capacity(visible_orig.len());
-    for &r in visible_orig {
-        if app.data.is_null(col, r) {
-            width = width.max(NA.len() as u16);
-            cells.push(None);
-        } else {
-            let s = formatter.value(r).to_string();
-            width = width.max(s.chars().count() as u16);
-            cells.push(Some(s));
-        }
+    let cells = app.data.cells(col, visible_orig)?;
+    for cell in &cells {
+        let cell_width = match cell {
+            Some(s) => s.chars().count() as u16,
+            None => NA.len() as u16,
+        };
+        width = width.max(cell_width);
     }
     let width = width.clamp(MIN_COL_WIDTH, MAX_COL_WIDTH);
     cache.insert(col, RenderedColumn { width, cells });
@@ -367,7 +363,7 @@ fn info_line(app: &App, width: u16) -> Line<'static> {
     let col = app.selected_col;
     let name = &app.data.column_names[col];
     let ty = &app.data.column_types[col];
-    let orig = app.rows[app.selected_row];
+    let orig = app.selected_orig();
     let value = match app.data.cell_display(col, orig) {
         Ok(Some(v)) => v,
         Ok(None) => "NA".to_string(),

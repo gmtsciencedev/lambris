@@ -33,8 +33,11 @@ cargo run --release -- path/to/file.parquet
 | `s` | Sort by the selected column: cycles ascending → descending → unsorted |
 | `f` | Freeze columns `0..=selected` (pinned while scrolling); press again to unfreeze |
 | `i` | Toggle info mode — the bottom line shows the selected column's name, Arrow type, and the full (untruncated) cell value |
-| `Esc` | Clear search, then filter, then quit |
-| `q` / `Ctrl-c` | Quit |
+| `Esc` | Cancel a running operation; otherwise clear search, then filter, then quit |
+| `q` / `Ctrl-c` | Cancel a running operation; otherwise quit |
+
+While a heavy operation is running (sorting, filtering, or searching a large
+file), `Esc` or `Ctrl-C` aborts it and leaves the previous state untouched.
 
 The bottom line shows the main commands by default; `i` swaps it for the column
 info view.
@@ -58,14 +61,25 @@ Core viewer plus regex search, row filtering, type-aware sorting, and column
 freeze. Nulls are shown as a highlighted `NA`. Sort composes with the active
 filter, and the cursor stays on the same record across a re-sort.
 
-## How it works
+## Big files
 
-Every format is read fully into memory and concatenated into a single Arrow
-`RecordBatch`, so cell access is an O(1) index into one array per column — and
-everything above the loader (sorting, filtering, search, null handling) is
-format-agnostic. Cells are formatted on demand for the visible window using
-Arrow's `ArrayFormatter`, and column widths are computed from the visible rows
-each frame.
+Data is loaded lazily so memory stays bounded regardless of file size:
+
+- The file is read in **chunks** of 8192 rows, decoded on demand and kept in a
+  small **LRU cache** — only the rows you're near are resident.
+- Parquet chunks are read directly by row range (skipping row groups); CSV/TSV
+  chunks are read by seeking into a compact byte-offset index built at open.
+- The unfiltered, unsorted view stores **no** per-row index (it's the identity
+  `0..n`), so scrolling a billion-row file allocates nothing for bookkeeping.
+- Filtering and search **stream** the file a chunk at a time. Sorting reads the
+  one sort column into memory (unavoidable — the result is a full ordering).
+
+Everything above the loader (sorting, filtering, search, freeze, null handling)
+operates on Arrow arrays and is format-agnostic. Cells are formatted on demand
+for the visible window using Arrow's `ArrayFormatter`.
+
+> Note: CSV/TSV are indexed with a single fast scan when the file is opened, so
+> there's a brief pause on very large text files before the viewer appears.
 
 ## Development
 
