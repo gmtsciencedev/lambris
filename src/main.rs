@@ -189,6 +189,32 @@ mod tests {
     }
 
     #[test]
+    fn held_key_accelerates_scroll() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+
+        // Ten rapid `j` presses (10ms apart) — inside the repeat window.
+        let mut fast = App::new(Dataset::load(&fixture()).unwrap());
+        for i in 0..10 {
+            fast.handle_key_at(key('j'), t0 + Duration::from_millis(i * 10));
+        }
+
+        // Ten slow presses (1s apart) — never treated as held.
+        let mut slow = App::new(Dataset::load(&fixture()).unwrap());
+        for i in 0..10 {
+            slow.handle_key_at(key('j'), t0 + Duration::from_secs(i));
+        }
+
+        assert_eq!(slow.selected_row, 10, "slow presses move exactly one row each");
+        assert!(
+            fast.selected_row > slow.selected_row,
+            "held key should scroll further: fast={} slow={}",
+            fast.selected_row,
+            slow.selected_row,
+        );
+    }
+
+    #[test]
     fn goto_line_jumps_to_row() {
         let mut app = App::new(Dataset::load(&fixture()).unwrap());
         app.handle_key(key(':'));

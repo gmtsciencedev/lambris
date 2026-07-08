@@ -1,7 +1,21 @@
+use std::time::{Duration, Instant};
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use regex::{Regex, RegexBuilder};
 
 use crate::data::Dataset;
+
+/// Consecutive same-direction move events landing within this window are
+/// treated as a held key and accelerate the scroll.
+const REPEAT_WINDOW: Duration = Duration::from_millis(150);
+
+/// Tracks a run of held-key repeats for one movement direction.
+struct Repeat {
+    /// Identifies the movement action, so reversing direction resets the run.
+    id: u8,
+    last: Instant,
+    count: usize,
+}
 
 /// What the keyboard is currently driving.
 pub enum Mode {
@@ -50,6 +64,8 @@ pub struct App {
     /// When set, the bottom line shows the selected column's info instead of
     /// the command hints (toggled with `i`).
     pub show_info: bool,
+    /// State for held-key scroll acceleration.
+    repeat: Option<Repeat>,
 }
 
 impl App {
@@ -71,6 +87,7 @@ impl App {
             filter_query: None,
             status_msg: None,
             show_info: false,
+            repeat: None,
         }
     }
 
@@ -87,15 +104,20 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        self.handle_key_at(key, Instant::now());
+    }
+
+    /// `now` is injected so held-key acceleration can be tested deterministically.
+    pub fn handle_key_at(&mut self, key: KeyEvent, now: Instant) {
         match self.mode {
-            Mode::Normal => self.handle_normal(key),
+            Mode::Normal => self.handle_normal(key, now),
             Mode::Input(kind) => self.handle_input(key, kind),
         }
     }
 
-    fn handle_normal(&mut self, key: KeyEvent) {
+    fn handle_normal(&mut self, key: KeyEvent, now: Instant) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let page = self.viewport_rows.max(1);
+        let page = self.viewport_rows.max(1) as isize;
         self.status_msg = None;
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
@@ -118,17 +140,17 @@ impl App {
             KeyCode::Char('n') => self.jump_match(true),
             KeyCode::Char('N') => self.jump_match(false),
 
-            KeyCode::Char('j') | KeyCode::Down => self.move_row(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_row(-1),
+            KeyCode::Char('j') | KeyCode::Down => self.move_row_accel(1, 1, now),
+            KeyCode::Char('k') | KeyCode::Up => self.move_row_accel(2, -1, now),
             KeyCode::Char('h') | KeyCode::Left => self.move_col(-1),
             KeyCode::Char('l') | KeyCode::Right => self.move_col(1),
 
-            KeyCode::Char('d') if ctrl => self.move_row(page as isize / 2),
-            KeyCode::Char('u') if ctrl => self.move_row(-(page as isize / 2)),
-            KeyCode::Char('f') if ctrl => self.move_row(page as isize),
-            KeyCode::Char('b') if ctrl => self.move_row(-(page as isize)),
-            KeyCode::PageDown => self.move_row(page as isize),
-            KeyCode::PageUp => self.move_row(-(page as isize)),
+            KeyCode::Char('d') if ctrl => self.move_row_accel(3, page / 2, now),
+            KeyCode::Char('u') if ctrl => self.move_row_accel(4, -(page / 2), now),
+            KeyCode::Char('f') if ctrl => self.move_row_accel(5, page, now),
+            KeyCode::Char('b') if ctrl => self.move_row_accel(6, -page, now),
+            KeyCode::PageDown => self.move_row_accel(5, page, now),
+            KeyCode::PageUp => self.move_row_accel(6, -page, now),
 
             KeyCode::Char('g') | KeyCode::Home => self.selected_row = 0,
             KeyCode::Char('G') | KeyCode::End => self.selected_row = self.last_row(),
@@ -260,6 +282,21 @@ impl App {
             }
             None => self.status_msg = Some("no match".into()),
         }
+    }
+
+    /// Move by `base` rows, scaled up while the same key is held down.
+    /// `id` distinguishes movement directions so reversing resets acceleration.
+    fn move_row_accel(&mut self, id: u8, base: isize, now: Instant) {
+        let count = match &self.repeat {
+            Some(r) if r.id == id && now.saturating_duration_since(r.last) <= REPEAT_WINDOW => {
+                r.count + 1
+            }
+            _ => 0,
+        };
+        self.repeat = Some(Repeat { id, last: now, count });
+        // Ramp: 1× for the first few presses, growing to a cap of 8×.
+        let accel = 1 + (count / 3).min(7) as isize;
+        self.move_row(base * accel);
     }
 
     fn move_row(&mut self, delta: isize) {
