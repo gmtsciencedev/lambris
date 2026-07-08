@@ -86,8 +86,16 @@ fn render_table(
     // Original dataset row indices behind the visible view rows.
     let visible_orig: Vec<usize> = visible_view.iter().map(|&v| app.orig_row(v)).collect();
 
-    let gutter = gutter_width(app);
-    let available = area.width.saturating_sub(gutter + COL_SPACING);
+    let gutter = if app.show_line_numbers {
+        gutter_width(app)
+    } else {
+        0
+    };
+    let available = if app.show_line_numbers {
+        area.width.saturating_sub(gutter + COL_SPACING)
+    } else {
+        area.width
+    };
 
     let mut cache: HashMap<usize, RenderedColumn> = HashMap::new();
     let (visible_cols, frozen) = fit_columns(app, &visible_orig, available, &mut cache)?;
@@ -98,7 +106,10 @@ fn render_table(
     let sel_bg = Color::Rgb(40, 40, 55);
 
     // Header row: gutter label + selected-aware column names with sort arrows.
-    let mut header_cells = vec![Cell::from("#").style(Style::new().dim())];
+    let mut header_cells = Vec::new();
+    if app.show_line_numbers {
+        header_cells.push(Cell::from("#").style(Style::new().dim()));
+    }
     for (idx, &col) in visible_cols.iter().enumerate() {
         if divider_at == Some(idx) {
             header_cells.push(divider_cell());
@@ -127,7 +138,10 @@ fn render_table(
     for (i, &vi) in visible_view.iter().enumerate() {
         let orig = app.orig_row(vi);
         let sel_row = vi == app.selected_row;
-        let mut cells = vec![Cell::from(format!("{}", orig + 1)).style(Style::new().dim())];
+        let mut cells = Vec::new();
+        if app.show_line_numbers {
+            cells.push(Cell::from(format!("{}", orig + 1)).style(Style::new().dim()));
+        }
         for (idx, &col) in visible_cols.iter().enumerate() {
             if divider_at == Some(idx) {
                 cells.push(divider_cell());
@@ -168,7 +182,10 @@ fn render_table(
         rows.push(Row::new(cells));
     }
 
-    let mut widths = vec![Constraint::Length(gutter)];
+    let mut widths = Vec::new();
+    if app.show_line_numbers {
+        widths.push(Constraint::Length(gutter));
+    }
     for (idx, &col) in visible_cols.iter().enumerate() {
         if divider_at == Some(idx) {
             widths.push(Constraint::Length(1));

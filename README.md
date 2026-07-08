@@ -32,6 +32,7 @@ cargo run --release -- path/to/file.parquet
 | `&` | Filter rows to those with a cell matching a regex |
 | `s` | Sort by the selected column: cycles ascending → descending → unsorted |
 | `f` | Freeze columns `0..=selected` (pinned while scrolling); press again to unfreeze |
+| `#` | Show/hide the row-number gutter |
 | `i` | Toggle info mode — the bottom line shows the selected column's name, Arrow type, and the full (untruncated) cell value |
 | `Esc` | Cancel a running operation; otherwise clear search, then filter, then quit |
 | `q` / `Ctrl-c` | Cancel a running operation; otherwise quit |

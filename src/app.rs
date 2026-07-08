@@ -120,6 +120,8 @@ pub struct App {
     /// When set, the bottom line shows the selected column's info instead of
     /// the command hints (toggled with `i`).
     pub show_info: bool,
+    /// Whether the row-number gutter is shown (toggled with `#`).
+    pub show_line_numbers: bool,
     /// Number of leftmost columns pinned in place while scrolling horizontally.
     pub frozen_cols: usize,
     /// Active sort, if any.
@@ -147,6 +149,7 @@ impl App {
             filter_query: None,
             status_msg: None,
             show_info: false,
+            show_line_numbers: true,
             frozen_cols: 0,
             sort: None,
             repeat: None,
@@ -206,6 +209,7 @@ impl App {
             }
 
             KeyCode::Char('i') => self.show_info = !self.show_info,
+            KeyCode::Char('#') => self.show_line_numbers = !self.show_line_numbers,
             KeyCode::Char('s') => self.cycle_sort(),
             KeyCode::Char('f') if !ctrl => self.toggle_freeze(),
             KeyCode::Char('/') => self.enter_input(InputKind::Search),

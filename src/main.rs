@@ -539,6 +539,24 @@ mod tests {
     }
 
     #[test]
+    fn hash_toggles_line_number_gutter() {
+        let mut app = App::new(Dataset::load(&fixture()).unwrap());
+        assert!(app.show_line_numbers);
+        // The gutter header "#" is the only source of '#' on screen.
+        let shown = buffer_text(&mut app, 40, 10);
+        assert!(shown.contains('#'), "gutter header missing: {shown}");
+
+        app.handle_key(key('#'));
+        assert!(!app.show_line_numbers);
+        let hidden = buffer_text(&mut app, 40, 10);
+        assert!(!hidden.contains('#'), "gutter still present: {hidden}");
+        assert_ne!(shown, hidden);
+
+        app.handle_key(key('#'));
+        assert!(app.show_line_numbers);
+    }
+
+    #[test]
     fn renders_null_as_na() {
         let mut app = App::new(Dataset::load(&fixture()).unwrap());
         // Row 0's score is null; "NA" must appear in the rendered buffer.
