@@ -46,6 +46,8 @@ pub enum InputKind {
     Filter,
     /// Jump to a (1-based, original) row number.
     Goto,
+    /// Open a file path in a new tab.
+    Open,
 }
 
 /// An active search: the raw query, its compiled regex, and its scope.
@@ -140,6 +142,13 @@ pub struct App {
     pub transpose_request: bool,
     /// Set when a transposed view should be dismissed (handled by the loop).
     pub exit_transpose: bool,
+    /// Set when the user asks for another tab: `+1` next, `-1` previous
+    /// (handled by the main loop, which owns the set of tabs).
+    pub switch_tab: Option<isize>,
+    /// Set when the current tab should be closed (handled by the loop).
+    pub close_tab: bool,
+    /// A path typed at the `o` prompt, to be opened in a new tab by the loop.
+    pub open_request: Option<String>,
     /// Number of leftmost columns pinned in place while scrolling horizontally.
     pub frozen_cols: usize,
     /// Active sort, if any.
@@ -173,6 +182,9 @@ impl App {
             is_transposed: false,
             transpose_request: false,
             exit_transpose: false,
+            switch_tab: None,
+            close_tab: false,
+            open_request: None,
             frozen_cols: 0,
             sort: None,
             num_styles: HashMap::new(),
@@ -251,6 +263,11 @@ impl App {
                     self.transpose_request = true;
                 }
             }
+            // Tabs: cycle through the open files, close one, or open another.
+            KeyCode::Tab => self.switch_tab = Some(1),
+            KeyCode::BackTab => self.switch_tab = Some(-1),
+            KeyCode::Char('w') if ctrl => self.close_tab = true,
+            KeyCode::Char('o') => self.enter_input(InputKind::Open),
             KeyCode::Char('%') => self.toggle_numeric(),
             KeyCode::Char('>') => self.adjust_decimals(1),
             KeyCode::Char('<') => self.adjust_decimals(-1),
@@ -316,7 +333,7 @@ impl App {
                 self.search.as_ref().map(|s| s.query.clone())
             }
             InputKind::Filter => self.filter_query.clone(),
-            InputKind::Goto => None,
+            InputKind::Goto | InputKind::Open => None,
         }
         .unwrap_or_default();
     }
@@ -324,15 +341,23 @@ impl App {
     fn commit_input(&mut self, kind: InputKind) {
         let query = std::mem::take(&mut self.input);
         self.mode = Mode::Normal;
-        if let InputKind::Goto = kind {
-            self.goto_line(&query);
-            return;
+        // These two take the text literally rather than as a regex.
+        match kind {
+            InputKind::Goto => return self.goto_line(&query),
+            InputKind::Open => {
+                let path = query.trim();
+                if !path.is_empty() {
+                    self.open_request = Some(path.to_string());
+                }
+                return;
+            }
+            _ => {}
         }
         if query.is_empty() {
             match kind {
                 InputKind::Search | InputKind::ColumnSearch => self.search = None,
                 InputKind::Filter => self.clear_filter(),
-                InputKind::Goto => unreachable!(),
+                InputKind::Goto | InputKind::Open => unreachable!(),
             }
             return;
         }
@@ -347,7 +372,7 @@ impl App {
             InputKind::Search => self.apply_search(query, re, None),
             InputKind::ColumnSearch => self.apply_search(query, re, Some(self.selected_col)),
             InputKind::Filter => self.apply_filter(query, re),
-            InputKind::Goto => unreachable!(),
+            InputKind::Goto | InputKind::Open => unreachable!(),
         }
     }
 

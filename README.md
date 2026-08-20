@@ -3,7 +3,8 @@
 A terminal viewer for parquet, CSV, and TSV files, in the manner of
 [csvlens](https://github.com/YS-L/csvlens).
 
-Opens a data file and lets you scroll around it in a TUI — a header row with
+Opens one or more data files — each in its own tab — and lets you scroll around
+them in a TUI — a header row with
 column names, a row-number gutter, a status bar showing the selected cell's column
 name and Arrow type, and truncation of wide values. Null values render as a
 highlighted `NA`. Supports global regex search (`/`), column-scoped search
@@ -13,6 +14,9 @@ highlighted `NA`. Supports global regex search (`/`), column-scoped search
 
 ```sh
 cargo run --release -- path/to/file.parquet
+
+# Several files at once, one tab each; Tab switches between them.
+cargo run --release -- first.parquet second.csv third.tsv
 ```
 
 ### Keys
@@ -33,12 +37,15 @@ cargo run --release -- path/to/file.parquet
 | `s` | Sort by the selected column: cycles ascending → descending → unsorted |
 | `f` | Freeze columns `0..=selected` (pinned while scrolling); press again to unfreeze |
 | `t` | Transpose the table (first column becomes the headers); `t`/`Esc` to return |
+| `Tab` / `Shift-Tab` | Switch to the next / previous tab (wraps around) |
+| `o` | Open another file in a new tab (prompts for a path; `~/` is expanded) |
+| `Ctrl-w` | Close the current tab; closing the last one quits |
 | `%` | Numeric column: toggle decimal-point alignment + colouring by log magnitude |
 | `<` / `>` | Decrease / increase displayed decimals (also aligns on the dot, no colouring) |
 | `#` | Show/hide the row-number gutter |
 | `i` | Toggle info mode — the bottom line shows the selected column's name, Arrow type, and the full (untruncated) cell value |
 | `Esc` | Cancel a running operation; otherwise clear search, then filter, then quit |
-| `q` / `Ctrl-c` | Cancel a running operation; otherwise quit |
+| `q` / `Ctrl-c` | Cancel a running operation; otherwise quit (every tab) |
 
 While a heavy operation is running (sorting, filtering, or searching a large
 file), `Esc` or `Ctrl-C` aborts it and leaves the previous state untouched.
@@ -48,6 +55,28 @@ info view.
 
 While typing a search or filter, `Enter` commits and `Esc` cancels. Submitting an
 empty query clears that search/filter.
+
+## Tabs
+
+Every file passed on the command line opens in its own tab, and `o` opens
+another one at any time (a path that fails to load leaves the tabs untouched
+and reports why). `Tab` and `Shift-Tab` cycle through them, `Ctrl-w` closes the
+current one, and closing the last tab quits.
+
+Each tab holds its **own** view state — cursor, search, filter, sort, frozen
+columns, numeric styles, and its own stack of transposed views — so switching
+away and back returns to exactly what you left. A tab's state is untouched by
+anything you do in another tab.
+
+With more than one file open, the title line becomes the tab strip
+(`1:first.parquet  2:second.csv`), with the active tab highlighted; the row and
+column counts stay in the status bar below. When the tabs don't all fit, the
+strip scrolls so the active one is always visible and `‹`/`›` mark the hidden
+ones.
+
+Since a transposed view is itself just a table on that tab's stack, transposing
+in one tab leaves the others alone, and `t`/`Esc` pops only that tab's view
+rather than closing the tab.
 
 ## Formats
 
@@ -77,7 +106,7 @@ data could be misread as a header.
 ## Scope
 
 Core viewer plus regex search, row filtering, type-aware sorting, column
-freeze, and a transposed view. Nulls are shown as a highlighted `NA`. Sort
+freeze, a transposed view, and tabs over several open files. Nulls are shown as a highlighted `NA`. Sort
 composes with the active filter, and the cursor stays on the same record across
 a re-sort.
 

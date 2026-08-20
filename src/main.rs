@@ -16,8 +16,9 @@ use data::Dataset;
 #[derive(Parser)]
 #[command(name = "lambris", version, about)]
 struct Args {
-    /// Path to the parquet file to view.
-    file: PathBuf,
+    /// Paths to the data files to view; each one opens in its own tab.
+    #[arg(required = true, num_args = 1..)]
+    files: Vec<PathBuf>,
 }
 
 /// Largest number of records turned into columns when transposing, so a huge
@@ -26,25 +27,124 @@ const TRANSPOSE_MAX_RECORDS: usize = 4096;
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let dataset = Dataset::load(&args.file)?;
-    let app = App::new(dataset);
+    let mut tabs = Tabs::open(&args.files)?;
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, app);
+    let result = run(&mut terminal, &mut tabs);
     ratatui::restore();
     result
 }
 
-/// Drive a stack of views: the base table plus any transposed views pushed on
-/// top. Transpose builds an in-memory transposed table and runs the very same
-/// render/input path on it, so every command works unchanged.
-fn run(terminal: &mut ratatui::DefaultTerminal, base: App) -> Result<()> {
-    let mut stack = vec![base];
+/// The open files. Each tab owns a stack of views — the base table plus any
+/// transposed views pushed on top — so transposing or filtering one tab leaves
+/// the others untouched, and only the top of the current tab's stack is drawn.
+struct Tabs {
+    tabs: Vec<Vec<App>>,
+    current: usize,
+}
 
-    while let Some(app) = stack.last_mut() {
+impl Tabs {
+    /// Open one tab per path, failing before the TUI starts if any won't load.
+    fn open(paths: &[PathBuf]) -> Result<Self> {
+        let mut tabs = Vec::with_capacity(paths.len());
+        for path in paths {
+            let dataset = Dataset::load(path)
+                .with_context(|| format!("loading {}", path.display()))?;
+            tabs.push(vec![App::new(dataset)]);
+        }
+        Ok(Self { tabs, current: 0 })
+    }
+
+    /// The view on top of the current tab's stack — what the user sees and
+    /// types into.
+    fn app_mut(&mut self) -> &mut App {
+        self.tabs[self.current]
+            .last_mut()
+            .expect("every tab holds at least its base view")
+    }
+
+    /// Labels of the visible view of each tab, for the strip on the title line.
+    fn strip(&self) -> ui::TabStrip {
+        ui::TabStrip {
+            labels: self
+                .tabs
+                .iter()
+                .map(|stack| stack.last().expect("non-empty stack").data.label.clone())
+                .collect(),
+            current: self.current,
+        }
+    }
+
+    /// Act on whatever the current view asked for on the last keypress.
+    /// Returns `false` when the program should exit.
+    fn step(&mut self) -> bool {
+        let app = self.app_mut();
+        if app.should_quit {
+            return false; // quit the whole program from any tab or level
+        }
+        // Drain the requests first so the tab set can be mutated freely below.
+        let exit_transpose = std::mem::take(&mut app.exit_transpose);
+        let transpose = std::mem::take(&mut app.transpose_request);
+        let switch = app.switch_tab.take();
+        let close = std::mem::take(&mut app.close_tab);
+        let open = app.open_request.take();
+
+        if exit_transpose && self.tabs[self.current].len() > 1 {
+            self.tabs[self.current].pop();
+        }
+        if transpose {
+            let built = transposed_view(self.app_mut());
+            match built {
+                Ok(view) => self.tabs[self.current].push(view),
+                Err(e) => self.app_mut().status_msg = Some(format!("transpose failed: {e}")),
+            }
+        }
+        if let Some(delta) = switch {
+            let n = self.tabs.len() as isize;
+            self.current = (((self.current as isize + delta) % n + n) % n) as usize;
+        }
+        if let Some(path) = open {
+            let path = expand_home(&path);
+            match Dataset::load(&path) {
+                Ok(dataset) => {
+                    self.tabs.push(vec![App::new(dataset)]);
+                    self.current = self.tabs.len() - 1;
+                }
+                Err(e) => self.app_mut().status_msg = Some(format!("open failed: {e}")),
+            }
+        }
+        if close {
+            self.tabs.remove(self.current);
+            if self.tabs.is_empty() {
+                return false; // closed the last tab
+            }
+            self.current = self.current.min(self.tabs.len() - 1);
+        }
+        true
+    }
+}
+
+/// Expand a leading `~/` in a path typed at the `o` prompt.
+fn expand_home(input: &str) -> PathBuf {
+    match input.strip_prefix("~/") {
+        Some(rest) => match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home).join(rest),
+            None => PathBuf::from(input),
+        },
+        None => PathBuf::from(input),
+    }
+}
+
+/// Draw the current tab's top view, feed it one key, then let [`Tabs::step`]
+/// apply whatever it asked for. Transposed views and freshly opened files run
+/// through this very same path, so every command works unchanged.
+fn run(terminal: &mut ratatui::DefaultTerminal, tabs: &mut Tabs) -> Result<()> {
+    loop {
+        let strip = tabs.strip();
+        let app = tabs.app_mut();
         terminal
             .draw(|frame| {
-                if let Err(e) = ui::render(frame, app) {
+                if let Err(e) = ui::render(frame, app, &strip) {
                     app.render_error = Some(e.to_string());
                     app.should_quit = true;
                 }
@@ -60,22 +160,8 @@ fn run(terminal: &mut ratatui::DefaultTerminal, base: App) -> Result<()> {
         if let Some(e) = app.render_error.take() {
             anyhow::bail!("render error: {e}");
         }
-        if app.should_quit {
-            break; // quit the whole program from any level
-        }
-        if app.exit_transpose {
-            app.exit_transpose = false;
-            if stack.len() > 1 {
-                stack.pop();
-            }
-            continue;
-        }
-        if app.transpose_request {
-            app.transpose_request = false;
-            match transposed_view(app) {
-                Ok(view) => stack.push(view),
-                Err(e) => app.status_msg = Some(format!("transpose failed: {e}")),
-            }
+        if !tabs.step() {
+            break;
         }
     }
     Ok(())
@@ -107,7 +193,7 @@ mod tests {
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use crossterm::event::{KeyCode, KeyEvent};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use parquet::arrow::ArrowWriter;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -191,9 +277,14 @@ mod tests {
     }
 
     fn buffer_text(app: &mut App, w: u16, h: u16) -> String {
+        buffer_text_tabs(app, &ui::TabStrip::default(), w, h)
+    }
+
+    /// Render `app` as the visible view of `tabs` (an empty strip = one tab).
+    fn buffer_text_tabs(app: &mut App, tabs: &ui::TabStrip, w: u16, h: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal
-            .draw(|f| ui::render(f, app).unwrap())
+            .draw(|f| ui::render(f, app, tabs).unwrap())
             .unwrap();
         terminal
             .backend()
@@ -206,6 +297,14 @@ mod tests {
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::from(KeyCode::Char(c))
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn code(c: KeyCode) -> KeyEvent {
+        KeyEvent::from(c)
     }
 
     fn type_str(app: &mut App, s: &str) {
@@ -637,6 +736,136 @@ mod tests {
             transposed_view(&app).is_err(),
             "single-column transpose is meaningless"
         );
+    }
+
+    #[test]
+    fn tabs_cycle_with_tab_and_back_tab() {
+        let mut tabs = Tabs::open(&[fixture(), fixture(), fixture()]).unwrap();
+        assert_eq!(tabs.tabs.len(), 3);
+        assert_eq!(tabs.current, 0);
+
+        tabs.app_mut().handle_key(code(KeyCode::Tab));
+        assert!(tabs.step());
+        assert_eq!(tabs.current, 1);
+
+        // Wraps past the last tab, and BackTab walks the other way.
+        tabs.app_mut().handle_key(code(KeyCode::Tab));
+        assert!(tabs.step());
+        tabs.app_mut().handle_key(code(KeyCode::Tab));
+        assert!(tabs.step());
+        assert_eq!(tabs.current, 0, "Tab wraps around to the first tab");
+        tabs.app_mut().handle_key(code(KeyCode::BackTab));
+        assert!(tabs.step());
+        assert_eq!(tabs.current, 2, "BackTab wraps back to the last tab");
+    }
+
+    #[test]
+    fn each_tab_keeps_its_own_view_state() {
+        let mut tabs = Tabs::open(&[fixture(), fixture()]).unwrap();
+
+        // Transpose tab 0.
+        tabs.app_mut().handle_key(key('t'));
+        assert!(tabs.step());
+        assert!(tabs.app_mut().is_transposed);
+
+        // Tab 1 is an untouched base view; move its cursor.
+        tabs.app_mut().handle_key(code(KeyCode::Tab));
+        assert!(tabs.step());
+        assert!(!tabs.app_mut().is_transposed, "transpose is per tab");
+        tabs.app_mut().handle_key(key('j'));
+        assert_eq!(tabs.app_mut().selected_row, 1);
+
+        // Back on tab 0: still transposed, its own cursor untouched.
+        tabs.app_mut().handle_key(code(KeyCode::BackTab));
+        assert!(tabs.step());
+        assert!(tabs.app_mut().is_transposed);
+        assert_eq!(tabs.app_mut().selected_row, 0);
+
+        // Leaving the transposed view pops only that tab's stack.
+        tabs.app_mut().handle_key(key('t'));
+        assert!(tabs.step());
+        assert!(!tabs.app_mut().is_transposed);
+        assert_eq!(tabs.tabs.len(), 2, "leaving a transposed view keeps the tab");
+    }
+
+    #[test]
+    fn open_adds_a_tab_and_ctrl_w_closes_it() {
+        let mut tabs = Tabs::open(&[fixture()]).unwrap();
+        let other = fixture();
+
+        tabs.app_mut().handle_key(key('o'));
+        type_str(tabs.app_mut(), other.to_str().unwrap());
+        tabs.app_mut().handle_key(code(KeyCode::Enter));
+        assert!(tabs.step());
+        assert_eq!(tabs.tabs.len(), 2);
+        assert_eq!(tabs.current, 1, "the newly opened file becomes current");
+
+        // Ctrl-W closes it and lands back on the remaining tab.
+        tabs.app_mut().handle_key(ctrl('w'));
+        assert!(tabs.step());
+        assert_eq!(tabs.tabs.len(), 1);
+        assert_eq!(tabs.current, 0);
+
+        // Closing the last tab exits the program.
+        tabs.app_mut().handle_key(ctrl('w'));
+        assert!(!tabs.step(), "closing the last tab should quit");
+    }
+
+    #[test]
+    fn open_reports_a_bad_path_without_adding_a_tab() {
+        let mut tabs = Tabs::open(&[fixture()]).unwrap();
+        tabs.app_mut().handle_key(key('o'));
+        type_str(tabs.app_mut(), "/no/such/file.parquet");
+        tabs.app_mut().handle_key(code(KeyCode::Enter));
+        assert!(tabs.step());
+        assert_eq!(tabs.tabs.len(), 1, "a failed open must not create a tab");
+        let msg = tabs.app_mut().status_msg.clone().unwrap_or_default();
+        assert!(msg.contains("open failed"), "unexpected message: {msg}");
+    }
+
+    #[test]
+    fn open_prompt_takes_a_literal_path_and_can_be_cancelled() {
+        let mut tabs = Tabs::open(&[fixture()]).unwrap();
+        // The prompt shows the typed path verbatim (no regex handling).
+        tabs.app_mut().handle_key(key('o'));
+        type_str(tabs.app_mut(), "some/file.csv");
+        let text = buffer_text(tabs.app_mut(), 100, 20);
+        assert!(text.contains("open some/file.csv"), "prompt missing: {text}");
+
+        // Esc abandons it, leaving the tab set alone.
+        tabs.app_mut().handle_key(code(KeyCode::Esc));
+        assert!(tabs.step());
+        assert_eq!(tabs.tabs.len(), 1);
+    }
+
+    #[test]
+    fn tab_strip_lists_the_open_files() {
+        let paths = vec![fixture(), fixture()];
+        let mut tabs = Tabs::open(&paths).unwrap();
+        let strip = tabs.strip();
+        assert_eq!(strip.labels.len(), 2);
+        let text = buffer_text_tabs(tabs.app_mut(), &strip, 120, 20);
+        for path in &paths {
+            let name = path.file_name().unwrap().to_string_lossy();
+            assert!(text.contains(name.as_ref()), "tab {name} missing: {text}");
+        }
+        // A single tab keeps the plain title line with the row/column counts.
+        let mut one = App::new(Dataset::load(&paths[0]).unwrap());
+        let text = buffer_text(&mut one, 120, 20);
+        assert!(text.contains("50 rows"), "single-tab title missing: {text}");
+    }
+
+    #[test]
+    fn tab_strip_windows_to_keep_the_active_tab_visible() {
+        // More tabs than fit: the strip scrolls so the active one is on screen.
+        let paths: Vec<PathBuf> = (0..8).map(|_| fixture()).collect();
+        let mut tabs = Tabs::open(&paths).unwrap();
+        tabs.current = 7;
+        let strip = tabs.strip();
+        let text = buffer_text_tabs(tabs.app_mut(), &strip, 40, 20);
+        let active = paths[7].file_name().unwrap().to_string_lossy();
+        assert!(text.contains(active.as_ref()), "active tab hidden: {text}");
+        assert!(text.contains('\u{2039}'), "no overflow marker: {text}");
     }
 
     #[test]

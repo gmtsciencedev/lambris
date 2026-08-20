@@ -14,6 +14,15 @@ const MIN_COL_WIDTH: u16 = 3;
 const COL_SPACING: u16 = 1;
 const NA: &str = "NA";
 
+/// The open tabs, drawn on the title line whenever more than one file is open.
+/// `labels` holds one label per tab (the label of the view on top of that
+/// tab's stack, so a transposed tab says so) and `current` is the active one.
+#[derive(Default)]
+pub struct TabStrip {
+    pub labels: Vec<String>,
+    pub current: usize,
+}
+
 /// Formatted cells for one column over the visible row window (`None` = null),
 /// plus the display width they imply and, for log-coloured numeric columns, a
 /// per-cell foreground colour.
@@ -23,7 +32,7 @@ struct RenderedColumn {
     colors: Option<Vec<Option<Color>>>,
 }
 
-pub fn render(frame: &mut Frame, app: &mut App) -> Result<()> {
+pub fn render(frame: &mut Frame, app: &mut App, tabs: &TabStrip) -> Result<()> {
     let [title_area, body_area, status_area, help_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -36,7 +45,7 @@ pub fn render(frame: &mut Frame, app: &mut App) -> Result<()> {
     let viewport_rows = body_area.height.saturating_sub(1) as usize;
     app.viewport_rows = viewport_rows.max(1);
 
-    render_title(frame, title_area, app);
+    render_title(frame, title_area, app, tabs);
     render_status(frame, status_area, app);
     render_help(frame, help_area, app);
 
@@ -62,7 +71,13 @@ pub fn render(frame: &mut Frame, app: &mut App) -> Result<()> {
     Ok(())
 }
 
-fn render_title(frame: &mut Frame, area: Rect, app: &App) {
+fn render_title(frame: &mut Frame, area: Rect, app: &App, tabs: &TabStrip) {
+    // With several files open the title line becomes the tab strip; the row
+    // and column counts stay visible in the status bar below.
+    if tabs.labels.len() > 1 {
+        frame.render_widget(Line::from(tab_spans(tabs, area.width)), area);
+        return;
+    }
     let line = Line::from(vec![
         Span::styled(
             format!(" {} ", app.data.label),
@@ -71,6 +86,56 @@ fn render_title(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw(format!("  {} rows × {} cols", app.data.nrows, app.data.ncols)),
     ]);
     frame.render_widget(line, area);
+}
+
+/// One chip per open tab, windowed so the active tab is always on screen:
+/// chips scroll off the left until it fits, and ‹/› mark the hidden ones.
+fn tab_spans(tabs: &TabStrip, width: u16) -> Vec<Span<'static>> {
+    let chips: Vec<String> = tabs
+        .labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| format!(" {}:{} ", i + 1, label))
+        .collect();
+    let len = |s: &String| s.chars().count();
+    let current = tabs.current.min(chips.len() - 1);
+    // Leave room for the two overflow markers.
+    let budget = (width as usize).saturating_sub(2);
+
+    // Scroll chips off the left until the active one fits.
+    let mut start = 0;
+    while start < current && chips[start..=current].iter().map(len).sum::<usize>() > budget {
+        start += 1;
+    }
+    // Then fill rightwards, always keeping at least one chip.
+    let mut end = start;
+    let mut used = 0;
+    while end < chips.len() {
+        let need = len(&chips[end]);
+        if end > start && used + need > budget {
+            break;
+        }
+        used += need;
+        end += 1;
+    }
+
+    let marker = |m: &'static str| Span::styled(m, Style::new().fg(Color::DarkGray));
+    let mut spans = Vec::with_capacity(end - start + 2);
+    if start > 0 {
+        spans.push(marker("‹"));
+    }
+    for (i, chip) in chips.iter().enumerate().take(end).skip(start) {
+        let style = if i == current {
+            Style::new().bold().bg(Color::Blue).fg(Color::White)
+        } else {
+            Style::new().fg(Color::Gray).dim()
+        };
+        spans.push(Span::styled(chip.clone(), style));
+    }
+    if end < chips.len() {
+        spans.push(marker("›"));
+    }
+    spans
 }
 
 fn render_table(
@@ -387,10 +452,11 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     // In input mode the status bar becomes the search/filter prompt.
     if let Mode::Input(kind) = app.mode {
         let sigil = match kind {
-            InputKind::Search => '/',
-            InputKind::ColumnSearch => '-',
-            InputKind::Filter => '&',
-            InputKind::Goto => ':',
+            InputKind::Search => "/",
+            InputKind::ColumnSearch => "-",
+            InputKind::Filter => "&",
+            InputKind::Goto => ":",
+            InputKind::Open => "open ",
         };
         let line = Line::from(vec![
             Span::styled(
@@ -463,11 +529,11 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
         )),
         Mode::Normal if app.show_info => info_line(app, area.width),
         Mode::Normal if app.is_transposed => Line::from(Span::styled(
-            " transposed · j/k/h/l move · s sort · % numeric · & filter · t/Esc back · q quit",
+            " transposed · j/k/h/l move · s sort · % numeric · & filter · t/Esc back · Tab tab · q quit",
             Style::new().dim(),
         )),
         Mode::Normal => Line::from(Span::styled(
-            " j/k/h/l move · / search · & filter · s sort · f freeze · t transpose · q quit",
+            " j/k/h/l move · / search · & filter · s sort · f freeze · t transpose · Tab/o tabs · q quit",
             Style::new().dim(),
         )),
     };
