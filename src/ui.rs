@@ -40,7 +40,11 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             ("s", "sort by the selected column: ascending → descending → off"),
             ("f", "freeze columns up to the selected one"),
+            ("x", "hide the selected column"),
+            ("[ / ]", "move the selected column left / right (or Shift-←/→)"),
+            ("u", "put every hidden column back, in the file's order"),
             ("t", "transpose the table (t or Esc to come back)"),
+            ("J", "join two tabs on a key column: Enter on each side"),
             ("%", "numeric column: align on the dot, colour by magnitude"),
             ("< / >", "fewer / more decimals"),
         ],
@@ -99,7 +103,12 @@ struct RenderedColumn {
     colors: Option<Vec<Option<Color>>>,
 }
 
-pub fn render(frame: &mut Frame, app: &mut App, tabs: &TabStrip) -> Result<()> {
+pub fn render(
+    frame: &mut Frame,
+    app: &mut App,
+    tabs: &TabStrip,
+    banner: Option<&str>,
+) -> Result<()> {
     let [title_area, body_area, status_area, help_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -114,7 +123,7 @@ pub fn render(frame: &mut Frame, app: &mut App, tabs: &TabStrip) -> Result<()> {
 
     render_title(frame, title_area, app, tabs);
     render_status(frame, status_area, app);
-    render_help(frame, help_area, app);
+    render_help(frame, help_area, app, banner);
 
     // The key reference covers the table rather than sitting beside it.
     if app.show_help {
@@ -308,9 +317,12 @@ fn render_table(
     };
 
     let mut cache: HashMap<usize, RenderedColumn> = HashMap::new();
-    let (visible_cols, frozen) = fit_columns(app, &visible_orig, available, &mut cache)?;
+    // Positions into the displayed column order, not dataset column indices:
+    // columns can be moved and hidden, so the two differ.
+    let (visible_pos, frozen) = fit_columns(app, &visible_orig, available, &mut cache)?;
+    let data_col = |pos: usize| app.visible_cols()[pos];
     // Draw a divider only when frozen columns sit beside a scrollable region.
-    let divider_at = (frozen > 0 && visible_cols.len() > frozen).then_some(frozen);
+    let divider_at = (frozen > 0 && visible_pos.len() > frozen).then_some(frozen);
 
     let frozen_bg = Color::Rgb(30, 30, 45);
     let sel_bg = Color::Rgb(40, 40, 55);
@@ -320,7 +332,8 @@ fn render_table(
     if app.show_line_numbers {
         header_cells.push(Cell::from("#").style(Style::new().dim()));
     }
-    for (idx, &col) in visible_cols.iter().enumerate() {
+    for (idx, &pos) in visible_pos.iter().enumerate() {
+        let col = data_col(pos);
         if divider_at == Some(idx) {
             header_cells.push(divider_cell());
         }
@@ -335,7 +348,7 @@ fn render_table(
         );
         let base = if idx < frozen { Color::Magenta } else { Color::Cyan };
         let mut style = Style::new().bold().fg(base);
-        if col == app.selected_col {
+        if pos == app.selected_pos {
             style = style.add_modifier(Modifier::REVERSED);
         }
         header_cells.push(Cell::from(label).style(style));
@@ -352,12 +365,13 @@ fn render_table(
         if app.show_line_numbers {
             cells.push(Cell::from(format!("{}", orig + 1)).style(Style::new().dim()));
         }
-        for (idx, &col) in visible_cols.iter().enumerate() {
+        for (idx, &pos) in visible_pos.iter().enumerate() {
+            let col = data_col(pos);
             if divider_at == Some(idx) {
                 cells.push(divider_cell());
             }
             let width = cache[&col].width;
-            let sel_cell = sel_row && col == app.selected_col;
+            let sel_cell = sel_row && pos == app.selected_pos;
             let (text, mut style) = match &cache[&col].cells[i] {
                 None => (
                     NA.to_string(),
@@ -402,11 +416,11 @@ fn render_table(
     if app.show_line_numbers {
         widths.push(Constraint::Length(gutter));
     }
-    for (idx, &col) in visible_cols.iter().enumerate() {
+    for (idx, &pos) in visible_pos.iter().enumerate() {
         if divider_at == Some(idx) {
             widths.push(Constraint::Length(1));
         }
-        widths.push(Constraint::Length(cache[&col].width));
+        widths.push(Constraint::Length(cache[&data_col(pos)].width));
     }
 
     let table = Table::new(rows, widths)
@@ -462,22 +476,25 @@ fn divider_cell() -> Cell<'static> {
 
 /// Decide which columns fit: the frozen prefix `0..frozen` (always shown),
 /// then a scrollable region from `col_offset`, scrolling right so the selected
-/// column stays visible. Returns the visible columns and the frozen count.
+/// column stays visible. Works in display positions, since columns can be moved
+/// and hidden. Returns the visible positions and the frozen count.
 fn fit_columns(
     app: &mut App,
     visible_orig: &[usize],
     available: u16,
     cache: &mut HashMap<usize, RenderedColumn>,
 ) -> Result<(Vec<usize>, usize)> {
-    let frozen = app.frozen_cols.min(app.data.ncols);
+    let shown = app.visible_cols().len();
+    let frozen = app.frozen_cols.min(shown);
 
     // Frozen columns are always present and consume width up front.
     let mut frozen_cols = Vec::with_capacity(frozen);
     let mut frozen_width = 0u16;
-    for c in 0..frozen {
-        render_column(app, c, visible_orig, cache)?;
-        frozen_width += cache[&c].width + COL_SPACING;
-        frozen_cols.push(c);
+    for pos in 0..frozen {
+        let col = app.visible_cols()[pos];
+        render_column(app, col, visible_orig, cache)?;
+        frozen_width += cache[&col].width + COL_SPACING;
+        frozen_cols.push(pos);
     }
     // The divider between frozen and scrollable regions costs one column.
     if frozen > 0 {
@@ -488,27 +505,28 @@ fn fit_columns(
     if app.col_offset < frozen {
         app.col_offset = frozen;
     }
-    if app.selected_col >= frozen && app.selected_col < app.col_offset {
-        app.col_offset = app.selected_col;
+    if app.selected_pos >= frozen && app.selected_pos < app.col_offset {
+        app.col_offset = app.selected_pos;
     }
 
     loop {
         let mut scroll = Vec::new();
         let mut used = frozen_width;
-        let mut c = app.col_offset;
-        while c < app.data.ncols {
-            render_column(app, c, visible_orig, cache)?;
-            let needed = cache[&c].width + COL_SPACING;
+        let mut pos = app.col_offset;
+        while pos < shown {
+            let col = app.visible_cols()[pos];
+            render_column(app, col, visible_orig, cache)?;
+            let needed = cache[&col].width + COL_SPACING;
             if !scroll.is_empty() && used + needed > available {
                 break;
             }
             used += needed;
-            scroll.push(c);
-            c += 1;
+            scroll.push(pos);
+            pos += 1;
         }
         let last_visible = *scroll.last().unwrap_or(&app.col_offset);
         // Selected column is either frozen (always visible) or within the scroll.
-        if app.selected_col < frozen || app.selected_col <= last_visible {
+        if app.selected_pos < frozen || app.selected_pos <= last_visible {
             let mut all = frozen_cols;
             all.extend(scroll);
             return Ok((all, frozen));
@@ -664,9 +682,19 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     let mut spans = vec![Span::styled(
-        format!(" row {sel_row}/{count}  col {}/{} ", app.selected_col + 1, app.data.ncols),
+        format!(
+            " row {sel_row}/{count}  col {}/{} ",
+            app.selected_pos + 1,
+            app.visible_cols().len()
+        ),
         Style::new().bg(Color::DarkGray).fg(Color::White),
     )];
+    if app.hidden_count() > 0 {
+        spans.push(Span::styled(
+            format!("  {} hidden", app.hidden_count()),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
     if let Some(search) = &app.search {
         let label = match search.scope {
             Some(col) => format!("  -{} @{}", search.query, app.data.column_names[col]),
@@ -703,7 +731,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             Style::new().fg(Color::Magenta),
         ));
     }
-    if let Some(st) = app.num_styles.get(&app.selected_col) {
+    if let Some(st) = app.num_styles.get(&app.selected_col()) {
         let dec = st.decimals.map(|n| format!(".{n}")).unwrap_or_default();
         let log = if st.log { " log" } else { "" };
         spans.push(Span::styled(
@@ -719,7 +747,17 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
 
 /// The bottom line: command hints normally, the input legend while typing, or
 /// the selected column's info when info mode (`i`) is on.
-fn render_help(frame: &mut Frame, area: Rect, app: &App) {
+fn render_help(frame: &mut Frame, area: Rect, app: &App, banner: Option<&str>) {
+    // A wizard driven by the loop takes the line over: it is what the next
+    // keypress does.
+    if let Some(banner) = banner {
+        let line = Line::from(Span::styled(
+            banner.to_string(),
+            Style::new().fg(Color::Black).bg(Color::Yellow).bold(),
+        ));
+        frame.render_widget(line, area);
+        return;
+    }
     let line = match app.mode {
         Mode::Input(InputKind::Open) => Line::from(Span::styled(
             " Tab: list folder · ↑/↓: pick · Enter: open · Esc: back",
@@ -747,7 +785,7 @@ fn info_line(app: &App, width: u16) -> Line<'static> {
     if app.data.ncols == 0 || app.row_count() == 0 {
         return Line::from(Span::styled(" (no data)", Style::new().dim()));
     }
-    let col = app.selected_col;
+    let col = app.selected_col();
     let name = &app.data.column_names[col];
     let ty = &app.data.column_types[col];
     let orig = app.selected_orig();

@@ -118,7 +118,12 @@ pub struct App {
     pub col_offset: usize,
     /// Selection is expressed against `rows`, not the underlying dataset.
     pub selected_row: usize,
-    pub selected_col: usize,
+    /// Which *displayed* column is selected: an index into `cols`, not a
+    /// dataset column — the two differ once columns are moved or hidden.
+    pub selected_pos: usize,
+    /// Dataset columns in display order. `x` drops one, `[`/`]` move them and
+    /// `u` restores the lot; the data itself is never touched.
+    cols: Vec<usize>,
     /// Rows of table body the last render could fit; used for paging.
     pub viewport_rows: usize,
     pub should_quit: bool,
@@ -158,6 +163,15 @@ pub struct App {
     /// Set when the selected row should become the header — or, when one has
     /// already been promoted, when that should be undone.
     pub promote_header: bool,
+    /// Set when the user asks to start the join wizard.
+    pub join_request: bool,
+    /// Whether the loop is currently running the join wizard, so `Enter`
+    /// confirms a pick and `Esc` backs out of the wizard before anything else.
+    pub join_active: bool,
+    /// Set by `Enter` while the wizard is running.
+    pub confirm: bool,
+    /// Set by `Esc` while the wizard is running.
+    pub cancel_join: bool,
     /// Whether the `?` key reference is covering the table.
     pub show_help: bool,
     /// First line of the key reference on screen, for scrolling it.
@@ -174,6 +188,7 @@ pub struct App {
 
 impl App {
     pub fn new(data: Dataset) -> Self {
+        let cols = (0..data.ncols).collect();
         Self {
             data,
             filter: None,
@@ -181,7 +196,8 @@ impl App {
             row_offset: 0,
             col_offset: 0,
             selected_row: 0,
-            selected_col: 0,
+            selected_pos: 0,
+            cols,
             viewport_rows: 1,
             should_quit: false,
             render_error: None,
@@ -201,6 +217,10 @@ impl App {
             open_request: None,
             toggle_header: false,
             promote_header: false,
+            join_request: false,
+            join_active: false,
+            confirm: false,
+            cancel_join: false,
             show_help: false,
             help_offset: 0,
             frozen_cols: 0,
@@ -212,6 +232,21 @@ impl App {
 
     pub fn row_count(&self) -> usize {
         self.view.len(self.data.nrows)
+    }
+
+    /// The dataset columns on display, in order.
+    pub fn visible_cols(&self) -> &[usize] {
+        &self.cols
+    }
+
+    /// The dataset column under the cursor.
+    pub fn selected_col(&self) -> usize {
+        self.cols.get(self.selected_pos).copied().unwrap_or(0)
+    }
+
+    /// How many columns are hidden.
+    pub fn hidden_count(&self) -> usize {
+        self.data.ncols.saturating_sub(self.cols.len())
     }
 
     /// Original dataset row index shown at view position `i`.
@@ -229,7 +264,45 @@ impl App {
     }
 
     fn last_col(&self) -> usize {
-        self.data.ncols.saturating_sub(1)
+        self.cols.len().saturating_sub(1)
+    }
+
+    /// Move the selected column one place left or right, taking the cursor with
+    /// it so it stays on the same column.
+    fn shift_col(&mut self, delta: isize) {
+        let to = self.selected_pos as isize + delta;
+        if to < 0 || to > self.last_col() as isize {
+            return;
+        }
+        let to = to as usize;
+        self.cols.swap(self.selected_pos, to);
+        self.selected_pos = to;
+        self.status_msg = Some(format!(
+            "moved {} to column {}",
+            self.data.column_names[self.selected_col()],
+            to + 1
+        ));
+    }
+
+    /// Drop the selected column from the display. The last one stays: a table
+    /// with no columns is nothing to look at.
+    fn hide_col(&mut self) {
+        if self.cols.len() < 2 {
+            self.status_msg = Some("the last column stays".into());
+            return;
+        }
+        let name = self.data.column_names[self.selected_col()].clone();
+        self.cols.remove(self.selected_pos);
+        self.selected_pos = self.selected_pos.min(self.last_col());
+        self.status_msg = Some(format!("hid {name} · u restores"));
+    }
+
+    /// Put every column back, in the file's own order.
+    fn restore_cols(&mut self) {
+        let was = self.selected_col();
+        self.cols = (0..self.data.ncols).collect();
+        self.selected_pos = was.min(self.last_col());
+        self.status_msg = Some("all columns restored".into());
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -290,7 +363,9 @@ impl App {
             // Esc peels away search, then filter, then leaves a transposed
             // view (or quits at the top level).
             KeyCode::Esc => {
-                if self.search.take().is_some() {
+                if self.join_active {
+                    self.cancel_join = true;
+                } else if self.search.take().is_some() {
                     self.status_msg = Some("search cleared".into());
                 } else if self.filter_query.is_some() {
                     self.clear_filter();
@@ -317,6 +392,10 @@ impl App {
             KeyCode::Char('w') if ctrl => self.close_tab = true,
             KeyCode::Char('o') => self.enter_input(InputKind::Open),
             KeyCode::Char('?') => self.show_help = true,
+            // `J` starts the join wizard; `Enter` then picks the key column
+            // under the cursor, once on each side.
+            KeyCode::Char('J') => self.join_request = true,
+            KeyCode::Enter if self.join_active => self.confirm = true,
             // `T` re-reads the file with the first row as names or as data;
             // `H` moves the header down to the selected row (or undoes that).
             KeyCode::Char('T') => {
@@ -343,6 +422,18 @@ impl App {
             KeyCode::Char('n') => self.jump_match(true),
             KeyCode::Char('N') => self.jump_match(false),
 
+            // Columns: `x` hides, `u` restores, `[`/`]` (or Shift-arrows) move.
+            KeyCode::Char('x') => self.hide_col(),
+            KeyCode::Char('u') if !ctrl => self.restore_cols(),
+            KeyCode::Char('[') => self.shift_col(-1),
+            KeyCode::Char(']') => self.shift_col(1),
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.shift_col(-1)
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.shift_col(1)
+            }
+
             KeyCode::Char('j') | KeyCode::Down => self.move_row_accel(1, 1, now),
             KeyCode::Char('k') | KeyCode::Up => self.move_row_accel(2, -1, now),
             KeyCode::Char('h') | KeyCode::Left => self.move_col(-1),
@@ -358,10 +449,10 @@ impl App {
             KeyCode::Char('g') | KeyCode::Home => self.selected_row = 0,
             KeyCode::Char('G') | KeyCode::End => self.selected_row = self.last_row(),
             KeyCode::Char('0') | KeyCode::Char('^') => {
-                self.selected_col = 0;
+                self.selected_pos = 0;
                 self.col_offset = 0;
             }
-            KeyCode::Char('$') => self.selected_col = self.last_col(),
+            KeyCode::Char('$') => self.selected_pos = self.last_col(),
             _ => {}
         }
     }
@@ -535,7 +626,7 @@ impl App {
         };
         match kind {
             InputKind::Search => self.apply_search(query, re, None),
-            InputKind::ColumnSearch => self.apply_search(query, re, Some(self.selected_col)),
+            InputKind::ColumnSearch => self.apply_search(query, re, Some(self.selected_col())),
             InputKind::Filter => self.apply_filter(query, re),
             InputKind::Goto | InputKind::Open => unreachable!(),
         }
@@ -567,7 +658,7 @@ impl App {
     }
 
     fn apply_filter(&mut self, query: String, re: Regex) {
-        match self.data.filter_rows(&re, interrupt::requested) {
+        match self.data.filter_rows(self.visible_cols(), &re, interrupt::requested) {
             Ok(Some(rows)) => {
                 let n = rows.len();
                 self.filter = Some(rows);
@@ -610,7 +701,7 @@ impl App {
     }
 
     fn cycle_sort(&mut self) {
-        self.cycle_sort_col(self.selected_col);
+        self.cycle_sort_col(self.selected_col());
     }
 
     /// Cycle `col` through none → ascending → descending → none.
@@ -640,7 +731,7 @@ impl App {
     }
 
     fn toggle_numeric(&mut self) {
-        self.toggle_numeric_col(self.selected_col);
+        self.toggle_numeric_col(self.selected_col());
     }
 
     /// Toggle decimal-aligned, log-coloured numeric display on `col`. Turning
@@ -667,7 +758,7 @@ impl App {
     }
 
     fn adjust_decimals(&mut self, delta: isize) {
-        self.adjust_decimals_col(self.selected_col, delta);
+        self.adjust_decimals_col(self.selected_col(), delta);
     }
 
     /// Adjust the fixed decimal count on `col`, enabling decimal alignment
@@ -691,7 +782,7 @@ impl App {
         if self.data.ncols == 0 {
             return;
         }
-        let want = self.selected_col + 1;
+        let want = self.selected_pos + 1;
         if self.frozen_cols == want {
             self.frozen_cols = 0;
             self.status_msg = Some("columns unfrozen".into());
@@ -746,20 +837,23 @@ impl App {
 
     fn jump_match(&mut self, forward: bool) {
         let Some(search) = &self.search else { return };
+        // Searching walks the columns on display, so a hit can never land the
+        // cursor on a column that has been hidden.
         let found = self.data.find_match(
             &search.re,
             self.row_count(),
+            self.visible_cols(),
             |i| self.view.orig(i),
             self.selected_row,
-            self.selected_col,
+            self.selected_pos,
             forward,
             search.scope,
             interrupt::requested,
         );
         match found {
-            Some((row, col)) => {
+            Some((row, pos)) => {
                 self.selected_row = row;
-                self.selected_col = col;
+                self.selected_pos = pos;
             }
             None if interrupt::take() => self.status_msg = Some("search cancelled".into()),
             None => self.status_msg = Some("no match".into()),
@@ -790,8 +884,8 @@ impl App {
     }
 
     fn move_col(&mut self, delta: isize) {
-        self.selected_col =
-            (self.selected_col as isize + delta).clamp(0, self.last_col() as isize) as usize;
+        self.selected_pos =
+            (self.selected_pos as isize + delta).clamp(0, self.last_col() as isize) as usize;
     }
 }
 

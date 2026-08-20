@@ -42,7 +42,11 @@ cargo run --release -- --no-header data.csv
 | `&` | Filter rows to those with a cell matching a regex |
 | `s` | Sort by the selected column: cycles ascending → descending → unsorted |
 | `f` | Freeze columns `0..=selected` (pinned while scrolling); press again to unfreeze |
+| `x` | Hide the selected column |
+| `[` / `]` (or `Shift-←`/`Shift-→`) | Move the selected column left / right |
+| `u` | Put every hidden column back, in the file's own order |
 | `t` | Transpose the table (first column becomes the headers); `t`/`Esc` to return |
+| `J` | Join two tabs on a key column: `Enter` on each side (see [Join](#join)) |
 | `Tab` / `Shift-Tab` | Switch to the next / previous tab (wraps around) |
 | `o` | Open another file in a new tab; at the prompt `Tab` browses the folder |
 | `Ctrl-w` | Close the current tab; closing the last one quits |
@@ -110,6 +114,68 @@ ones.
 Since a transposed view is itself just a table on that tab's stack, transposing
 in one tab leaves the others alone, and `t`/`Esc` pops only that tab's view
 rather than closing the tab.
+
+## Columns
+
+`x` hides the column under the cursor, `[` and `]` move it left and right
+(`Shift-←`/`Shift-→` do the same where the terminal sends them), and `u` puts
+everything back in the file's own order. The status bar counts what is hidden.
+
+Nothing is deleted — this is the *view*'s column order, held per tab, so the
+file is untouched and `u` always gets you back. It earns its keep after a join,
+where two tables' columns arrive together and only a few of them matter.
+
+Because it is what you are looking at, the rest of the viewer follows it:
+searching and filtering consider only the columns on display (so a hit can never
+put the cursor on a hidden column), and **transpose and join take the columns you
+can see, in the order you put them**. Hide the noise, then join, and the result
+has only the columns you kept.
+
+`Ctrl-<`/`Ctrl->` would have been the obvious pair for moving, but terminals
+cannot distinguish Ctrl from shifted punctuation — most send nothing at all for
+`Ctrl-<` — so `[`/`]` are used instead.
+
+## Join
+
+`J` starts a small wizard: go to the column holding the key — `Tab` switches
+tabs, `h`/`l` move across columns — and press `Enter`; then do the same on the
+other side and press `Enter` again. The bottom line says which step you are on
+and names the column you picked. `Esc` backs out at any point.
+
+The result opens as a new tab, labelled `left ⋈ right`:
+
+```
+#  sample depth label            row 1/3  col 1/3   3 rows · 2 matched, 1 unmatched
+1  S1     10    control
+2  S2     20    treated
+3  S3     30    NA
+```
+
+It is a **left join**: every row of the first side is kept, and one that matched
+nothing carries `NA` across the second side's columns — so what *didn't* match
+stays visible instead of silently disappearing. A key appearing several times on
+the right multiplies the left row, as a join does. The status line reports how
+many rows matched and how many didn't.
+
+- The second side's **key column is dropped**, since it would repeat the first
+  one exactly. Any other name clash gets a `_2` suffix.
+- Keys are compared as the **trimmed text you see**, so a number in one file
+  matches the same number stored as text in another. A blank key matches
+  nothing — pairing rows on "no value" is never what you meant.
+- **Column types survive**, so a joined numeric column still sorts numerically
+  and takes `%`.
+- Each side contributes **the rows and columns it is currently showing**, so a
+  filter, a sort, a transposed view or a hidden column all carry through — you
+  can transpose a sheet and join what is on screen, or hide the columns you
+  don't want before joining rather than after.
+- Closing a tab mid-wizard keeps a pick pointing at the same table; closing the
+  picked tab itself cancels the join rather than quietly aiming it elsewhere.
+
+A join is the one operation that cannot stream: matching keys means holding both
+key columns, and the result can address any row of either side. Both sides are
+therefore materialised, and each is capped at **200 000 rows** — enough that the
+columns stay in the chunk cache. Past that it declines rather than trying; a long
+join can be abandoned with `Esc`/`Ctrl-C` like any other heavy operation.
 
 ## The first row
 
@@ -210,7 +276,8 @@ data could be misread as a header.
 ## Scope
 
 Core viewer plus regex search, row filtering, type-aware sorting, column
-freeze, a transposed view, and tabs over several open files or workbook sheets. Nulls are shown as a highlighted `NA`. Sort
+freeze, hiding and reordering columns, a transposed view, joins between tabs,
+and tabs over several open files or workbook sheets. Nulls are shown as a highlighted `NA`. Sort
 composes with the active filter, and the cursor stays on the same record across
 a re-sort.
 

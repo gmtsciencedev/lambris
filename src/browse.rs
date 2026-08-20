@@ -44,8 +44,20 @@ impl Completions {
     /// an empty list carrying the reason.
     pub fn for_input(input: &str, base: &Path) -> Self {
         let (dir, prefix) = split_input(input, base);
+        // Canonicalise the folder being listed, so every path this hands back is
+        // plain and absolute: no `..` or `.` left for anything downstream to
+        // trip over, however the user typed their way here.
+        let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
         let mut entries = Vec::new();
         let mut note = None;
+        // `..` is offered as a way up, not as a hidden file, so it sits outside
+        // the dotfile rule and ahead of everything else.
+        if dir.parent().is_some() && "..".starts_with(&prefix) {
+            entries.push(Entry {
+                name: "..".to_string(),
+                is_dir: true,
+            });
+        }
         match std::fs::read_dir(&dir) {
             Ok(reader) => {
                 let wanted = prefix.to_lowercase();
@@ -61,13 +73,15 @@ impl Completions {
                     let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
                     entries.push(Entry { name, is_dir });
                 }
-                // Directories first — they are the way onwards — then by name.
+                // `..` first, then directories — the ways onwards — then names.
                 entries.sort_by(|a, b| {
-                    b.is_dir
-                        .cmp(&a.is_dir)
+                    let up = |e: &Entry| e.name != "..";
+                    up(a)
+                        .cmp(&up(b))
+                        .then_with(|| b.is_dir.cmp(&a.is_dir))
                         .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
                 });
-                if entries.is_empty() {
+                if entries.iter().all(|e| e.name == "..") {
                     note = Some(if prefix.is_empty() {
                         "empty directory".to_string()
                     } else {
@@ -107,7 +121,12 @@ impl Completions {
     /// directory gains a trailing slash so the next `Tab` steps into it.
     pub fn selected_input(&self) -> Option<String> {
         let entry = self.selected_entry()?;
-        let path = self.dir.join(&entry.name);
+        // Going up resolves to the parent path itself; appending `..` would
+        // leave a path that only the filesystem knows how to read.
+        let path = match entry.name.as_str() {
+            ".." => self.dir.parent().unwrap_or(&self.dir).to_path_buf(),
+            name => self.dir.join(name),
+        };
         let mut text = path.to_string_lossy().into_owned();
         if entry.is_dir {
             text.push('/');
@@ -118,6 +137,10 @@ impl Completions {
     /// The longest prefix every candidate shares, for shell-style completion.
     /// `None` when it adds nothing to what was typed.
     pub fn common_prefix(&self) -> Option<String> {
+        // `..` is a destination, not text worth completing towards.
+        if self.entries.iter().any(|e| e.name == "..") {
+            return None;
+        }
         let first = self.entries.first()?;
         let mut common = first.name.clone();
         for entry in &self.entries[1..] {
@@ -183,9 +206,12 @@ pub fn resolve(input: &str, base: &Path) -> PathBuf {
         return PathBuf::from(home).join(rest);
     }
     let path = PathBuf::from(input);
-    if path.is_absolute() {
+    let joined = if path.is_absolute() {
         path
     } else {
         base.join(path)
-    }
+    };
+    // Clean up `.` and `..` where the path exists, so what gets opened is what
+    // the picker showed.
+    std::fs::canonicalize(&joined).unwrap_or(joined)
 }

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use arrow::array::{
     make_comparator, Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array,
-    StringArray, TimestampMillisecondArray,
+    StringArray, TimestampMillisecondArray, UInt32Array,
 };
 use arrow::compute::SortOptions;
 use arrow::csv::reader::Format as CsvFormat;
@@ -29,6 +29,12 @@ const CSV_INFER_ROWS: usize = 1000;
 /// How many chunks to keep resident. Bounds memory to ~`CACHE_CHUNKS * CHUNK`
 /// rows regardless of file size.
 const CACHE_CHUNKS: usize = 32;
+/// Largest table either side of a join may hold. A join is the one operation
+/// that cannot stream — matching keys means holding both key columns, and the
+/// result addresses any row of either side — so both sides are materialised and
+/// this keeps that bounded. It sits just under `CACHE_CHUNKS * CHUNK`, so the
+/// columns a join reads stay in the chunk cache instead of being re-decoded.
+pub const JOIN_MAX_ROWS: usize = 200_000;
 
 /// How the top of a file (or sheet) is read: how many rows to ignore, and
 /// whether the row after them holds the column names.
@@ -220,14 +226,16 @@ impl Dataset {
     /// values become the column headers, and the remaining columns become rows
     /// labelled by their name in a leading `field` column. Each record column's
     /// type is inferred from its values, so the result behaves like any table.
-    pub fn transpose(&self, orig_rows: &[usize]) -> Result<Dataset> {
-        // Original columns 1.. become rows; column 0 titles the records.
-        let field_cols: Vec<usize> = (1..self.ncols).collect();
+    pub fn transpose(&self, orig_rows: &[usize], cols: &[usize]) -> Result<Dataset> {
+        // The first displayed column titles the records; the rest become rows.
+        // Working from the displayed order means a hidden column stays hidden
+        // and a moved one keeps its new place.
+        let field_cols: Vec<usize> = cols[1..].to_vec();
         let field_values: Vec<Vec<Option<String>>> = field_cols
             .iter()
             .map(|&c| self.cells(c, orig_rows))
             .collect::<Result<_>>()?;
-        let titles = self.cells(0, orig_rows)?;
+        let titles = self.cells(cols[0], orig_rows)?;
 
         let mut names = Vec::with_capacity(orig_rows.len() + 1);
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(orig_rows.len() + 1);
@@ -265,6 +273,124 @@ impl Dataset {
             None, // a transposed view is not the file's own layout
             HeaderSpec::default(),
         ))
+    }
+
+    /// Left-join `right` onto this dataset: every row of `left_rows` is kept,
+    /// with the matching row of `right` appended, or nulls where nothing
+    /// matched. Rows are given in view order, so an active filter or sort on
+    /// either side is respected, and a transposed view joins as the table it
+    /// shows. Keys are compared as the trimmed text the viewer displays, so a
+    /// number in one file matches the same number stored as text in the other.
+    ///
+    /// Duplicate keys on the right multiply the left row, as a join does.
+    /// Returns `None` if `cancel` fires.
+    pub fn join(
+        left: JoinSide<'_>,
+        right: JoinSide<'_>,
+        cancel: impl Fn() -> bool,
+    ) -> Result<Option<(Dataset, JoinReport)>> {
+        let (left_rows, left_key) = (left.rows, left.key);
+        let (right_rows, right_key) = (right.rows, right.key);
+        let (this, right_data) = (left.data, right.data);
+        for (side, data) in [("left", this), ("right", right_data)] {
+            if data.nrows > JOIN_MAX_ROWS {
+                anyhow::bail!(
+                    "{side} side has {} rows; a join reads whole columns, so it is capped at {JOIN_MAX_ROWS}",
+                    data.nrows
+                );
+            }
+        }
+        let left_keys = this.cells(left_key, left_rows)?;
+        let right_keys = right_data.cells(right_key, right_rows)?;
+
+        // Index the right side by key. Blank keys match nothing — joining on
+        // "no value" would pair up rows that have nothing in common.
+        let mut index: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, key) in right_keys.iter().enumerate() {
+            if let Some(key) = key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+                index.entry(key).or_default().push(right_rows[i]);
+            }
+        }
+
+        // Walk the left side, building the row pairing of the result.
+        let mut take_left: Vec<u32> = Vec::with_capacity(left_rows.len());
+        let mut take_right: Vec<Option<u32>> = Vec::with_capacity(left_rows.len());
+        let mut report = JoinReport::default();
+        'rows: for (i, key) in left_keys.iter().enumerate() {
+            if i % 1024 == 0 && cancel() {
+                return Ok(None);
+            }
+            let hits = key
+                .as_deref()
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+                .and_then(|k| index.get(k));
+            match hits {
+                Some(rows) => {
+                    report.matched += 1;
+                    for &r in rows {
+                        if take_left.len() >= JOIN_MAX_ROWS {
+                            report.truncated = true;
+                            break 'rows;
+                        }
+                        take_left.push(left_rows[i] as u32);
+                        take_right.push(Some(r as u32));
+                    }
+                }
+                None => {
+                    report.unmatched += 1;
+                    if take_left.len() >= JOIN_MAX_ROWS {
+                        report.truncated = true;
+                        break 'rows;
+                    }
+                    take_left.push(left_rows[i] as u32);
+                    take_right.push(None);
+                }
+            }
+        }
+        report.rows = take_left.len();
+
+        // Gather both sides through Arrow, so column types survive the join and
+        // an unmatched row reads as a null rather than an empty string.
+        let left_idx = UInt32Array::from(take_left);
+        let right_idx = UInt32Array::from(take_right);
+        // Only the columns each side is showing, in the order it shows them.
+        let mut names: Vec<String> = Vec::new();
+        let mut columns: Vec<ArrayRef> = Vec::new();
+        for &col in left.cols {
+            let Some(full) = this.full_column(col, &cancel)? else {
+                return Ok(None);
+            };
+            columns.push(arrow::compute::take(full.as_ref(), &left_idx, None)?);
+            names.push(this.column_names[col].clone());
+        }
+        for &col in right.cols {
+            // The right key column would repeat the left one exactly.
+            if col == right_key {
+                continue;
+            }
+            let Some(full) = right_data.full_column(col, &cancel)? else {
+                return Ok(None);
+            };
+            columns.push(arrow::compute::take(full.as_ref(), &right_idx, None)?);
+            names.push(unique_name(&right_data.column_names[col], &names));
+        }
+
+        let fields: Vec<Field> = names
+            .iter()
+            .zip(&columns)
+            .map(|(n, a)| Field::new(n, a.data_type().clone(), true))
+            .collect();
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .context("building joined batch")?;
+        let dataset = Dataset::in_memory(
+            batch,
+            this.path.clone(),
+            format!("{} ⋈ {}", this.label, right_data.label),
+            None, // a join is not the file's own layout
+            HeaderSpec::default(),
+        );
+        Ok(Some((dataset, report)))
     }
 
     fn num_chunks(&self) -> usize {
@@ -457,6 +583,7 @@ impl Dataset {
     /// Streams the file one chunk at a time; returns `None` if `cancel` fires.
     pub fn filter_rows(
         &self,
+        cols: &[usize],
         re: &Regex,
         cancel: impl Fn() -> bool,
     ) -> Result<Option<Vec<usize>>> {
@@ -467,12 +594,13 @@ impl Dataset {
                 return Ok(None);
             }
             let batch = self.chunk(k)?;
-            let formatters: Vec<ArrayFormatter> = (0..self.ncols)
-                .map(|c| ArrayFormatter::try_new(batch.column(c), &opts).map_err(Into::into))
+            let formatters: Vec<ArrayFormatter> = cols
+                .iter()
+                .map(|&c| ArrayFormatter::try_new(batch.column(c), &opts).map_err(Into::into))
                 .collect::<Result<_>>()?;
             for r in 0..batch.num_rows() {
-                let hit = (0..self.ncols).any(|c| {
-                    !batch.column(c).is_null(r) && re.is_match(&formatters[c].value(r).to_string())
+                let hit = cols.iter().enumerate().any(|(i, &c)| {
+                    !batch.column(c).is_null(r) && re.is_match(&formatters[i].value(r).to_string())
                 });
                 if hit {
                     out.push(k * CHUNK + r);
@@ -483,23 +611,30 @@ impl Dataset {
     }
 
     /// Find the next cell matching `re`, scanning the view starting just after
-    /// `(start_row, start_col)` and wrapping around. The view has `view_len`
+    /// `(start_row, start_pos)` and wrapping around. The view has `view_len`
     /// rows and `orig(i)` maps a view row to its original dataset row — so the
-    /// identity view needs no materialised index. When `scope` is `Some(col)`
-    /// the search is confined to that single column; otherwise it sweeps every
-    /// column in row-major order. Returns a `(view_row, col)` position.
+    /// identity view needs no materialised index. `cols` are the dataset columns
+    /// on display, in display order: only those are searched, and positions in
+    /// and out are indices into it. When `scope` is `Some(col)` the search is
+    /// confined to that one dataset column (nothing matches if it is hidden);
+    /// otherwise it sweeps every displayed column in row-major order.
+    /// Returns a `(view_row, position)` pair.
+    // Every argument here is a distinct part of "where to look and when to
+    // stop"; grouping them into a struct would only move the list.
+    #[allow(clippy::too_many_arguments)]
     pub fn find_match(
         &self,
         re: &Regex,
         view_len: usize,
+        cols: &[usize],
         orig: impl Fn(usize) -> usize,
         start_row: usize,
-        start_col: usize,
+        start_pos: usize,
         forward: bool,
         scope: Option<usize>,
         cancel: impl Fn() -> bool,
     ) -> Option<(usize, usize)> {
-        if view_len == 0 || self.ncols == 0 {
+        if view_len == 0 || cols.is_empty() {
             return None;
         }
         let matches = |vr: usize, c: usize| -> bool {
@@ -509,6 +644,8 @@ impl Dataset {
         // worst-case cancel latency to a few chunk decodes.
         const STRIDE: usize = 512;
         if let Some(col) = scope {
+            // A column search over a column no longer on display finds nothing.
+            let pos = cols.iter().position(|&c| c == col)?;
             let n = view_len;
             for i in 1..=n {
                 if i % STRIDE == 0 && cancel() {
@@ -520,13 +657,13 @@ impl Dataset {
                     (start_row + n - i) % n
                 };
                 if matches(vr, col) {
-                    return Some((vr, col));
+                    return Some((vr, pos));
                 }
             }
             return None;
         }
-        let total = view_len * self.ncols;
-        let start = start_row * self.ncols + start_col;
+        let total = view_len * cols.len();
+        let start = start_row * cols.len() + start_pos.min(cols.len() - 1);
         for i in 1..=total {
             if i % STRIDE == 0 && cancel() {
                 return None;
@@ -536,13 +673,47 @@ impl Dataset {
             } else {
                 (start + total - i) % total
             };
-            let (vr, c) = (p / self.ncols, p % self.ncols);
-            if matches(vr, c) {
-                return Some((vr, c));
+            let (vr, pos) = (p / cols.len(), p % cols.len());
+            if matches(vr, cols[pos]) {
+                return Some((vr, pos));
             }
         }
         None
     }
+}
+
+/// One side of a join: the table, the rows and columns it is showing, and which
+/// of those columns holds the key.
+pub struct JoinSide<'a> {
+    pub data: &'a Dataset,
+    pub rows: &'a [usize],
+    pub cols: &'a [usize],
+    pub key: usize,
+}
+
+/// What a join produced, for the status line.
+#[derive(Default, Debug, PartialEq)]
+pub struct JoinReport {
+    /// Rows in the result.
+    pub rows: usize,
+    /// Left rows that found at least one match.
+    pub matched: usize,
+    /// Left rows that found none, and so carry nulls on the right.
+    pub unmatched: usize,
+    /// Whether the result hit [`JOIN_MAX_ROWS`] and was cut short.
+    pub truncated: bool,
+}
+
+/// `name`, or the first `name_2`, `name_3`, … not already taken — the two
+/// sides of a join often share column names.
+fn unique_name(name: &str, taken: &[String]) -> String {
+    if !taken.iter().any(|t| t == name) {
+        return name.to_string();
+    }
+    (2..)
+        .map(|n| format!("{name}_{n}"))
+        .find(|candidate| !taken.iter().any(|t| t == candidate))
+        .expect("an unused suffix always exists")
 }
 
 /// A tiny LRU cache of decoded chunks keyed by chunk index.

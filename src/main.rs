@@ -11,7 +11,7 @@ use clap::Parser;
 use crossterm::event::{self, Event, KeyEventKind};
 
 use app::App;
-use data::{Dataset, HeaderSpec};
+use data::{Dataset, HeaderSpec, JoinSide, JOIN_MAX_ROWS};
 
 /// A terminal viewer for parquet, CSV/TSV and Excel files, in the manner of
 /// csvlens.
@@ -53,6 +53,16 @@ fn main() -> Result<()> {
 struct Tabs {
     tabs: Vec<Vec<App>>,
     current: usize,
+    /// The join wizard, while one is running.
+    join: Option<JoinWizard>,
+}
+
+/// The join wizard: the user walks to a key column and confirms, once on each
+/// side. Tabs and columns are picked with the ordinary movement keys, so the
+/// wizard only has to remember the first pick.
+struct JoinWizard {
+    /// The first pick: which tab, and which of its columns.
+    left: Option<(usize, usize)>,
 }
 
 impl Tabs {
@@ -68,7 +78,39 @@ impl Tabs {
         if tabs.is_empty() {
             anyhow::bail!("nothing to show");
         }
-        Ok(Self { tabs, current: 0 })
+        Ok(Self {
+            tabs,
+            current: 0,
+            join: None,
+        })
+    }
+
+    /// Feed one key to the visible view, first telling it whether the wizard is
+    /// running — which changes what `Enter` and `Esc` mean.
+    fn key(&mut self, key: crossterm::event::KeyEvent) {
+        let active = self.join.is_some();
+        let app = self.app_mut();
+        app.join_active = active;
+        app.handle_key(key);
+    }
+
+    /// The line the wizard shows in place of the command hints.
+    fn join_banner(&self) -> Option<String> {
+        let wizard = self.join.as_ref()?;
+        Some(match wizard.left {
+            None => " join: go to the first key column — Tab switches tabs · Enter picks · Esc cancels".into(),
+            Some((tab, col)) => format!(
+                " join on {} — now the second key column · Enter joins · Esc cancels",
+                self.column_label(tab, col).unwrap_or_else(|| "?".into()),
+            ),
+        })
+    }
+
+    /// `tab[sheet].column`, for naming a pick in the banner.
+    fn column_label(&self, tab: usize, col: usize) -> Option<String> {
+        let app = self.tabs.get(tab)?.last()?;
+        let name = app.data.column_names.get(col)?;
+        Some(format!("{}.{name}", app.data.label))
     }
 
     /// The view on top of the current tab's stack — what the user sees and
@@ -106,6 +148,9 @@ impl Tabs {
         let open = app.open_request.take();
         let toggle_header = std::mem::take(&mut app.toggle_header);
         let promote_header = std::mem::take(&mut app.promote_header);
+        let join_request = std::mem::take(&mut app.join_request);
+        let confirm = std::mem::take(&mut app.confirm);
+        let cancel_join = std::mem::take(&mut app.cancel_join);
 
         if exit_transpose && self.tabs[self.current].len() > 1 {
             self.tabs[self.current].pop();
@@ -128,6 +173,16 @@ impl Tabs {
         if promote_header {
             self.promote_header_row();
         }
+        if join_request {
+            self.join = Some(JoinWizard { left: None });
+        }
+        if cancel_join {
+            self.join = None;
+            self.app_mut().status_msg = Some("join cancelled".into());
+        }
+        if confirm {
+            self.join_pick();
+        }
         if let Some(delta) = switch {
             let n = self.tabs.len() as isize;
             self.current = (((self.current as isize + delta) % n + n) % n) as usize;
@@ -148,11 +203,27 @@ impl Tabs {
             }
         }
         if close {
-            self.tabs.remove(self.current);
+            let closed = self.current;
+            self.tabs.remove(closed);
+            // Tab indices shift, so a pending join pick has to move with them —
+            // otherwise it would quietly point at a different table.
+            let orphaned = match self.join.as_mut().and_then(|w| w.left.as_mut()) {
+                Some((tab, _)) if *tab == closed => true,
+                Some((tab, _)) if *tab > closed => {
+                    *tab -= 1;
+                    false
+                }
+                _ => false,
+            };
             if self.tabs.is_empty() {
                 return false; // closed the last tab
             }
             self.current = self.current.min(self.tabs.len() - 1);
+            if orphaned {
+                self.join = None;
+                self.app_mut().status_msg =
+                    Some("join cancelled: that tab was closed".into());
+            }
         }
         true
     }
@@ -195,30 +266,102 @@ impl Tabs {
     }
 }
 
+impl Tabs {
+    /// Record the key column under the cursor: the first press stores it, the
+    /// second runs the join.
+    fn join_pick(&mut self) {
+        let pick = (self.current, self.app_mut().selected_col());
+        let Some(wizard) = &mut self.join else { return };
+        match wizard.left {
+            None => {
+                wizard.left = Some(pick);
+                let named = self.column_label(pick.0, pick.1).unwrap_or_default();
+                self.app_mut().status_msg = Some(format!("join on {named} …"));
+            }
+            Some(left) => {
+                self.join = None;
+                self.run_join(left, pick);
+            }
+        }
+    }
+
+    /// Join the two picked columns and open the result in a new tab. Each side
+    /// contributes the rows it is currently showing, so filters, sorts and
+    /// transposed views all carry through.
+    fn run_join(&mut self, left: (usize, usize), right: (usize, usize)) {
+        let ((left_tab, left_col), (right_tab, right_col)) = (left, right);
+        // A tab could have been closed between the two picks.
+        let (Some(left_app), Some(right_app)) = (
+            self.tabs.get(left_tab).and_then(|s| s.last()),
+            self.tabs.get(right_tab).and_then(|s| s.last()),
+        ) else {
+            self.app_mut().status_msg = Some("join: that tab is gone".into());
+            return;
+        };
+        let left_rows = left_app.view_rows(JOIN_MAX_ROWS);
+        let right_rows = right_app.view_rows(JOIN_MAX_ROWS);
+        let joined = Dataset::join(
+            JoinSide {
+                data: &left_app.data,
+                rows: &left_rows,
+                cols: left_app.visible_cols(),
+                key: left_col,
+            },
+            JoinSide {
+                data: &right_app.data,
+                rows: &right_rows,
+                cols: right_app.visible_cols(),
+                key: right_col,
+            },
+            interrupt::requested,
+        );
+        match joined {
+            Ok(Some((dataset, report))) => {
+                let mut view = App::new(dataset);
+                let mut msg = format!(
+                    "{} rows · {} matched, {} unmatched",
+                    report.rows, report.matched, report.unmatched
+                );
+                if report.truncated {
+                    msg.push_str(&format!(" · cut at {JOIN_MAX_ROWS}"));
+                }
+                view.status_msg = Some(msg);
+                self.tabs.push(vec![view]);
+                self.current = self.tabs.len() - 1;
+            }
+            Ok(None) => {
+                interrupt::take();
+                self.app_mut().status_msg = Some("join cancelled".into());
+            }
+            Err(e) => self.app_mut().status_msg = Some(format!("join failed: {e}")),
+        }
+    }
+}
+
 /// Draw the current tab's top view, feed it one key, then let [`Tabs::step`]
 /// apply whatever it asked for. Transposed views and freshly opened files run
 /// through this very same path, so every command works unchanged.
 fn run(terminal: &mut ratatui::DefaultTerminal, tabs: &mut Tabs) -> Result<()> {
     loop {
         let strip = tabs.strip();
+        let banner = tabs.join_banner();
         let app = tabs.app_mut();
         terminal
             .draw(|frame| {
-                if let Err(e) = ui::render(frame, app, &strip) {
+                if let Err(e) = ui::render(frame, app, &strip, banner.as_deref()) {
                     app.render_error = Some(e.to_string());
                     app.should_quit = true;
                 }
             })
             .context("drawing frame")?;
 
-        if let Event::Key(key) = event::read().context("reading input event")? {
-            if key.kind == KeyEventKind::Press {
-                app.handle_key(key);
-            }
-        }
-
         if let Some(e) = app.render_error.take() {
             anyhow::bail!("render error: {e}");
+        }
+        if let Event::Key(key) = event::read().context("reading input event")?
+            && key.kind == KeyEventKind::Press
+        {
+            tabs.key(key);
         }
         if !tabs.step() {
             break;
@@ -229,11 +372,11 @@ fn run(terminal: &mut ratatui::DefaultTerminal, tabs: &mut Tabs) -> Result<()> {
 
 /// Build a transposed view from the current app's view, capped in width.
 fn transposed_view(app: &App) -> Result<App> {
-    if app.data.ncols < 2 || app.row_count() == 0 {
+    if app.visible_cols().len() < 2 || app.row_count() == 0 {
         anyhow::bail!("needs at least 2 columns and 1 row");
     }
     let rows = app.view_rows(TRANSPOSE_MAX_RECORDS);
-    let dataset = app.data.transpose(&rows)?;
+    let dataset = app.data.transpose(&rows, app.visible_cols())?;
     let mut view = App::new(dataset);
     view.is_transposed = true;
     if app.row_count() > TRANSPOSE_MAX_RECORDS {
@@ -421,7 +564,8 @@ mod tests {
         std::fs::write(root.join("beta.tsv"), "a\tb\n1\t2\n").unwrap();
         std::fs::write(root.join(".hidden.csv"), "a,b\n9,9\n").unwrap();
         std::fs::write(nested.join("inner.csv"), "x,y\n3,4\n").unwrap();
-        root
+        // The picker canonicalises, so tests compare against canonical paths.
+        std::fs::canonicalize(&root).unwrap()
     }
 
     /// Labels of the entries the picker is offering.
@@ -445,7 +589,11 @@ mod tests {
         // Tab lists the folder the open file lives in: directories first,
         // dotfiles hidden until asked for.
         tabs.app_mut().handle_key(code(KeyCode::Tab));
-        assert_eq!(offered(tabs.app_mut()), vec!["nested/", "alpha.csv", "beta.tsv"]);
+        assert_eq!(
+            offered(tabs.app_mut()),
+            vec!["../", "nested/", "alpha.csv", "beta.tsv"],
+            "`..` leads, then directories, then files"
+        );
 
         // The listing is drawn over the table, headed by the folder.
         let text = buffer_text(tabs.app_mut(), 90, 20);
@@ -465,7 +613,7 @@ mod tests {
         tabs.app_mut().handle_key(code(KeyCode::Up));
         assert_eq!(
             tabs.app_mut().completions.as_ref().unwrap().selected,
-            2,
+            3,
             "wraps to the last entry"
         );
     }
@@ -479,13 +627,15 @@ mod tests {
         tabs.app_mut().handle_key(code(KeyCode::Tab));
 
         // Enter on `nested/` steps inside and lists it, rather than opening it.
+        tabs.app_mut().handle_key(code(KeyCode::Down)); // past `..`
         tabs.app_mut().handle_key(code(KeyCode::Enter));
         assert!(tabs.step());
         assert_eq!(tabs.tabs.len(), 1, "a folder is not a file to open");
         assert!(tabs.app_mut().input.ends_with("nested/"));
-        assert_eq!(offered(tabs.app_mut()), vec!["inner.csv"]);
+        assert_eq!(offered(tabs.app_mut()), vec!["../", "inner.csv"]);
 
         // Enter on the file opens it in a new tab.
+        tabs.app_mut().handle_key(code(KeyCode::Down)); // past `..`
         tabs.app_mut().handle_key(code(KeyCode::Enter));
         assert!(tabs.step());
         assert_eq!(tabs.tabs.len(), 2);
@@ -520,7 +670,7 @@ mod tests {
         type_str(tabs.app_mut(), "n");
         assert_eq!(offered(tabs.app_mut()), vec!["nested/"]);
         tabs.app_mut().handle_key(code(KeyCode::Backspace));
-        assert_eq!(offered(tabs.app_mut()).len(), 3);
+        assert_eq!(offered(tabs.app_mut()).len(), 4);
 
         // A prefix matching nothing says so instead of closing.
         type_str(tabs.app_mut(), "zzz");
@@ -537,6 +687,69 @@ mod tests {
     }
 
     #[test]
+    fn slash_types_a_path_separator_not_a_search() {
+        let root = browse_fixture();
+        let mut tabs =
+            Tabs::open(&[root.join("alpha.csv")], HeaderSpec::default()).unwrap();
+
+        // In the open prompt `/` is a path separator: it reaches the input and
+        // does not start a search.
+        tabs.app_mut().handle_key(key('o'));
+        type_str(tabs.app_mut(), "nested/");
+        assert_eq!(tabs.app_mut().input, "nested/");
+        assert!(
+            matches!(tabs.app_mut().mode, app::Mode::Input(app::InputKind::Open)),
+            "still the open prompt"
+        );
+        assert!(tabs.app_mut().search.is_none(), "no search was started");
+        // And it navigates: the listing is of that folder.
+        tabs.app_mut().handle_key(code(KeyCode::Tab));
+        assert!(offered(tabs.app_mut()).contains(&"inner.csv".to_string()));
+
+        // Back in the table, `/` still opens search as always.
+        tabs.app_mut().handle_key(code(KeyCode::Esc)); // close the picker
+        tabs.app_mut().handle_key(code(KeyCode::Esc)); // leave the prompt
+        tabs.app_mut().handle_key(key('/'));
+        assert!(matches!(
+            tabs.app_mut().mode,
+            app::Mode::Input(app::InputKind::Search)
+        ));
+    }
+
+    #[test]
+    fn open_prompt_goes_up_a_folder_and_opens_from_there() {
+        let root = browse_fixture();
+        let mut tabs = Tabs::open(
+            &[root.join("nested").join("inner.csv")],
+            HeaderSpec::default(),
+        )
+        .unwrap();
+        tabs.app_mut().handle_key(key('o'));
+        tabs.app_mut().handle_key(code(KeyCode::Tab));
+        // Starting in `nested/`, the way up is the first entry.
+        assert_eq!(offered(tabs.app_mut())[0], "../");
+
+        tabs.app_mut().handle_key(code(KeyCode::Enter));
+        assert!(tabs.step());
+        // The typed path is the parent itself — no `..` left in it.
+        let input = tabs.app_mut().input.clone();
+        assert_eq!(input, format!("{}/", root.display()));
+        assert!(!input.contains(".."), "path should be plain: {input}");
+        assert!(offered(tabs.app_mut()).contains(&"beta.tsv".to_string()));
+
+        // And a file picked up there actually opens.
+        while tabs.app_mut().completions.as_ref().unwrap().selected_entry().unwrap().name
+            != "beta.tsv"
+        {
+            tabs.app_mut().handle_key(code(KeyCode::Down));
+        }
+        tabs.app_mut().handle_key(code(KeyCode::Enter));
+        assert!(tabs.step());
+        assert_eq!(tabs.tabs.len(), 2, "status: {:?}", tabs.app_mut().status_msg);
+        assert_eq!(tabs.app_mut().data.label, "beta.tsv");
+    }
+
+    #[test]
     fn open_prompt_shows_hidden_files_only_when_asked() {
         let root = browse_fixture();
         let mut tabs =
@@ -545,7 +758,7 @@ mod tests {
         tabs.app_mut().handle_key(code(KeyCode::Tab));
         assert!(!offered(tabs.app_mut()).contains(&".hidden.csv".to_string()));
         type_str(tabs.app_mut(), ".");
-        assert_eq!(offered(tabs.app_mut()), vec![".hidden.csv"]);
+        assert_eq!(offered(tabs.app_mut()), vec!["../", ".hidden.csv"]);
     }
 
     #[test]
@@ -587,6 +800,329 @@ mod tests {
         assert_eq!(listing.selected, last);
         let (start, window) = listing.window(browse::VISIBLE);
         assert_eq!(start + window.len() - 1, last, "the last entry is on screen");
+    }
+
+    /// Two related tables: `meta` keyed by sample, `dict` describing each one.
+    fn join_fixtures() -> (PathBuf, PathBuf) {
+        let meta = write_text_fixture("csv", "sample,depth\nS1,10\nS2,20\nS3,30\n");
+        let dict = write_text_fixture("csv", "sample,label\nS1,control\nS2,treated\n");
+        (meta, dict)
+    }
+
+    /// Drive the wizard: `J`, then Enter on `left_col` of the current tab, then
+    /// move to `right_tab` and Enter on `right_col`.
+    fn run_wizard(tabs: &mut Tabs, left_col: usize, right_tab: usize, right_col: usize) {
+        tabs.key(key('J'));
+        assert!(tabs.step());
+        tabs.app_mut().selected_pos = left_col;
+        tabs.key(KeyEvent::from(KeyCode::Enter));
+        assert!(tabs.step());
+        while tabs.current != right_tab {
+            tabs.key(KeyEvent::from(KeyCode::Tab));
+            assert!(tabs.step());
+        }
+        tabs.app_mut().selected_pos = right_col;
+        tabs.key(KeyEvent::from(KeyCode::Enter));
+        assert!(tabs.step());
+    }
+
+    #[test]
+    fn columns_can_be_hidden_moved_and_restored() {
+        let csv = "id,name,score\n1,alpha,3\n2,beta,4\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        assert_eq!(app.visible_cols(), &[0, 1, 2]);
+
+        // `]` moves the selected column right, carrying the cursor with it.
+        app.handle_key(key(']'));
+        assert_eq!(app.visible_cols(), &[1, 0, 2]);
+        assert_eq!(app.selected_pos, 1, "cursor follows the column");
+        assert_eq!(app.selected_col(), 0, "…which is still `id`");
+        let text = buffer_text(&mut app, 60, 10);
+        let header = text.find("name").unwrap();
+        assert!(header < text.find("id").unwrap(), "name now sits first: {text}");
+        // Shift-arrows do the same thing where the terminal sends them.
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        assert_eq!(app.visible_cols(), &[0, 1, 2]);
+
+        // `[` and `]` stop at the ends rather than wrapping.
+        app.handle_key(key('['));
+        assert_eq!(app.visible_cols(), &[0, 1, 2]);
+
+        // `x` hides the selected column; the cursor stays in range.
+        app.selected_pos = 1;
+        app.handle_key(key('x'));
+        assert_eq!(app.visible_cols(), &[0, 2]);
+        assert_eq!(app.hidden_count(), 1);
+        let text = buffer_text(&mut app, 60, 10);
+        assert!(!text.contains("alpha"), "hidden column still drawn: {text}");
+        assert!(text.contains("1 hidden"), "no marker in the status bar: {text}");
+        assert!(text.contains("col 2/2"), "count should be of shown columns: {text}");
+
+        // `u` brings them all back, in the file's own order.
+        app.handle_key(key('[')); // move something first
+        app.handle_key(key('u'));
+        assert_eq!(app.visible_cols(), &[0, 1, 2]);
+        assert_eq!(app.hidden_count(), 0);
+        assert!(buffer_text(&mut app, 60, 10).contains("alpha"));
+
+        // Plain `u` restores columns, so Ctrl-u must still page up.
+        app.selected_row = 20;
+        app.handle_key(ctrl('u'));
+        assert!(app.selected_row < 20, "Ctrl-u should still move rows");
+        assert_eq!(app.visible_cols(), &[0, 1, 2], "…without touching columns");
+
+        // The last column stays: an empty table is nothing to look at.
+        app.handle_key(key('x'));
+        app.handle_key(key('x'));
+        assert_eq!(app.visible_cols().len(), 1);
+        app.handle_key(key('x'));
+        assert_eq!(app.visible_cols().len(), 1, "refused");
+        assert_eq!(app.status_msg.as_deref(), Some("the last column stays"));
+    }
+
+    #[test]
+    fn hidden_columns_are_left_out_of_search_filter_and_sort() {
+        let csv = "id,secret\n1,findme\n2,other\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+
+        // Searching finds it while it is on display …
+        app.handle_key(key('/'));
+        type_str(&mut app, "findme");
+        app.handle_key(code(KeyCode::Enter));
+        assert_eq!((app.selected_row, app.selected_pos), (0, 1));
+
+        // … and cannot land on it once hidden.
+        app.selected_pos = 1;
+        app.handle_key(key('x'));
+        app.handle_key(key('n'));
+        assert_eq!(app.status_msg.as_deref(), Some("no match"));
+        assert_eq!(app.selected_pos, 0, "cursor stays on a shown column");
+
+        // Filtering looks only at what is shown, too.
+        app.handle_key(key('&'));
+        type_str(&mut app, "findme");
+        app.handle_key(code(KeyCode::Enter));
+        assert_eq!(app.row_count(), 0, "the match is not on display");
+    }
+
+    #[test]
+    fn transpose_and_join_use_the_columns_on_display() {
+        // Hide a column, then transpose: it stays hidden, and the moved order
+        // decides which column titles the records.
+        let csv = "sample,depth,junk\nS1,10,x\nS2,20,y\n";
+        let mut tabs =
+            Tabs::open(&[write_text_fixture("csv", csv)], HeaderSpec::default()).unwrap();
+        tabs.app_mut().selected_pos = 2;
+        tabs.key(key('x')); // drop `junk`
+        tabs.key(key('t'));
+        assert!(tabs.step());
+        let transposed = &tabs.app_mut().data;
+        assert_eq!(transposed.column_names, vec!["field", "S1", "S2"]);
+        assert_eq!(transposed.nrows, 1, "only `depth` became a row");
+        tabs.key(key('t')); // back
+        assert!(tabs.step());
+
+        // Now join, with a column hidden on each side: the result carries only
+        // the columns that were on display.
+        let dict = write_text_fixture("csv", "sample,label,notes\nS1,control,n1\nS2,treated,n2\n");
+        tabs.app_mut().handle_key(key('o'));
+        type_str(tabs.app_mut(), dict.to_str().unwrap());
+        tabs.app_mut().handle_key(code(KeyCode::Enter));
+        assert!(tabs.step());
+        tabs.app_mut().selected_pos = 2;
+        tabs.key(key('x')); // drop `notes`
+        assert_eq!(tabs.app_mut().visible_cols(), &[0, 1]);
+
+        tabs.current = 0; // join the first tab onto the second
+        run_wizard(&mut tabs, 0, 1, 0);
+        let joined = &tabs.app_mut().data;
+        assert_eq!(
+            joined.column_names,
+            vec!["sample", "depth", "label"],
+            "junk and notes were both hidden"
+        );
+        assert_eq!(joined.nrows, 2);
+    }
+
+    #[test]
+    fn join_wizard_combines_two_tabs() {
+        let (meta, dict) = join_fixtures();
+        let mut tabs = Tabs::open(&[meta, dict], HeaderSpec::default()).unwrap();
+
+        // The banner leads the way, and only while the wizard is running.
+        assert!(tabs.join_banner().is_none());
+        tabs.key(key('J'));
+        assert!(tabs.step());
+        let banner = tabs.join_banner().unwrap();
+        assert!(banner.contains("first key column"), "unexpected: {banner}");
+        let text = buffer_text_banner(tabs.app_mut(), &banner, 100, 20);
+        assert!(text.contains("first key column"), "banner not drawn: {text}");
+
+        // First pick, then the banner names it and asks for the second.
+        tabs.key(KeyEvent::from(KeyCode::Enter));
+        assert!(tabs.step());
+        let banner = tabs.join_banner().unwrap();
+        assert!(banner.contains(".sample") && banner.contains("second"), "{banner}");
+
+        tabs.key(KeyEvent::from(KeyCode::Tab));
+        assert!(tabs.step());
+        tabs.key(KeyEvent::from(KeyCode::Enter));
+        assert!(tabs.step());
+
+        // The result is a new tab, current, with both sides' columns.
+        assert!(tabs.join_banner().is_none(), "the wizard is done");
+        assert_eq!(tabs.tabs.len(), 3);
+        assert_eq!(tabs.current, 2);
+        let joined = &tabs.app_mut().data;
+        // The right key column is dropped: it would repeat the left one.
+        assert_eq!(joined.column_names, vec!["sample", "depth", "label"]);
+        assert!(joined.label.contains('⋈'), "label: {}", joined.label);
+        assert_eq!(joined.nrows, 3, "every left row is kept");
+        assert_eq!(joined.cell_display(2, 0).unwrap().as_deref(), Some("control"));
+        assert_eq!(joined.cell_display(2, 1).unwrap().as_deref(), Some("treated"));
+        // S3 matched nothing, so the right side reads as null (shown as NA).
+        assert!(joined.is_null(2, 2), "unmatched row should be null");
+        // Types survive the join, so the joined column still sorts numerically.
+        assert_eq!(joined.column_types[1], "Int64");
+        assert!(joined.is_numeric(1));
+        let msg = tabs.app_mut().status_msg.clone().unwrap_or_default();
+        assert!(msg.contains("2 matched, 1 unmatched"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn join_multiplies_rows_on_duplicate_keys_and_renames_clashes() {
+        // `note` appears on both sides, and S1 appears twice on the right.
+        let left = write_text_fixture("csv", "sample,note\nS1,a\nS2,b\n");
+        let right = write_text_fixture(
+            "csv",
+            "sample,note\nS1,first\nS1,second\nS2,only\n",
+        );
+        let mut tabs = Tabs::open(&[left, right], HeaderSpec::default()).unwrap();
+        run_wizard(&mut tabs, 0, 1, 0);
+
+        let joined = &tabs.app_mut().data;
+        assert_eq!(joined.column_names, vec!["sample", "note", "note_2"]);
+        assert_eq!(joined.nrows, 3, "S1 matches twice, S2 once");
+        assert_eq!(joined.cell_display(2, 0).unwrap().as_deref(), Some("first"));
+        assert_eq!(joined.cell_display(2, 1).unwrap().as_deref(), Some("second"));
+        assert_eq!(joined.cell_display(1, 0).unwrap().as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn join_uses_what_each_tab_is_showing() {
+        let (meta, dict) = join_fixtures();
+        let mut tabs = Tabs::open(&[meta, dict], HeaderSpec::default()).unwrap();
+
+        // Filter the left tab down to one row; the join sees only that row.
+        tabs.key(key('&'));
+        type_str(tabs.app_mut(), "S2");
+        tabs.key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(tabs.app_mut().row_count(), 1);
+
+        run_wizard(&mut tabs, 0, 1, 0);
+        let joined = &tabs.app_mut().data;
+        assert_eq!(joined.nrows, 1, "the filter carried into the join");
+        assert_eq!(joined.cell_display(0, 0).unwrap().as_deref(), Some("S2"));
+        assert_eq!(joined.cell_display(2, 0).unwrap().as_deref(), Some("treated"));
+    }
+
+    #[test]
+    fn join_works_on_a_transposed_tab() {
+        // Transposed, the dict's `sample` values become column headers and its
+        // fields become rows — so joining it means joining what is on screen.
+        let (meta, dict) = join_fixtures();
+        let mut tabs = Tabs::open(&[dict, meta], HeaderSpec::default()).unwrap();
+        tabs.key(key('t'));
+        assert!(tabs.step());
+        assert!(tabs.app_mut().is_transposed);
+        assert_eq!(tabs.app_mut().data.column_names, vec!["field", "S1", "S2"]);
+
+        // Join the transposed view's `field` column against meta's `depth`.
+        // Nothing matches — the point is that it joins the table as displayed.
+        run_wizard(&mut tabs, 0, 1, 1);
+        let joined = &tabs.app_mut().data;
+        assert_eq!(joined.column_names, vec!["field", "S1", "S2", "sample"]);
+        assert_eq!(joined.nrows, 1, "one row: the transposed view's only row");
+        assert_eq!(tabs.tabs.len(), 3);
+        // The transposed tab is untouched and still transposed.
+        tabs.current = 0;
+        assert!(tabs.app_mut().is_transposed);
+    }
+
+    #[test]
+    fn join_wizard_cancels_and_survives_a_closed_tab() {
+        let (meta, dict) = join_fixtures();
+        let mut tabs = Tabs::open(&[meta, dict], HeaderSpec::default()).unwrap();
+
+        // Esc backs out of the wizard rather than clearing search or quitting.
+        tabs.key(key('J'));
+        assert!(tabs.step());
+        tabs.key(KeyEvent::from(KeyCode::Esc));
+        assert!(tabs.step(), "Esc must not quit while the wizard is up");
+        assert!(tabs.join_banner().is_none());
+        assert_eq!(tabs.tabs.len(), 2, "nothing joined");
+
+        // Closing the very tab a pick is on cancels the wizard rather than
+        // letting the pick slide onto whatever table takes that index.
+        tabs.key(key('J'));
+        assert!(tabs.step());
+        tabs.key(KeyEvent::from(KeyCode::Enter));
+        assert!(tabs.step());
+        tabs.current = 0;
+        tabs.key(ctrl('w'));
+        assert!(tabs.step());
+        assert!(tabs.join_banner().is_none(), "the wizard should be off");
+        let msg = tabs.app_mut().status_msg.clone().unwrap_or_default();
+        assert!(msg.contains("that tab was closed"), "unexpected: {msg}");
+        assert_eq!(tabs.tabs.len(), 1);
+    }
+
+    #[test]
+    fn join_pick_follows_its_tab_when_another_closes() {
+        // Pick on the third tab, close the first: the pick must still mean the
+        // same table, even though every index after it shifted down.
+        let (meta, dict) = join_fixtures();
+        let spare = write_text_fixture("csv", "z\n1\n");
+        let mut tabs =
+            Tabs::open(&[spare, meta, dict], HeaderSpec::default()).unwrap();
+        tabs.current = 2;
+        tabs.key(key('J'));
+        assert!(tabs.step());
+        tabs.key(KeyEvent::from(KeyCode::Enter)); // pick dict.sample on tab 2
+        assert!(tabs.step());
+
+        tabs.current = 0;
+        tabs.key(ctrl('w'));
+        assert!(tabs.step());
+        assert_eq!(tabs.tabs.len(), 2);
+        let banner = tabs.join_banner().expect("wizard still running");
+        assert!(banner.contains(".sample"), "pick lost: {banner}");
+
+        // Finishing it joins dict with meta, not with the wrong table.
+        tabs.current = 0; // meta, after the shift
+        tabs.app_mut().selected_pos = 0;
+        tabs.key(KeyEvent::from(KeyCode::Enter));
+        assert!(tabs.step());
+        let joined = &tabs.app_mut().data;
+        assert_eq!(joined.column_names, vec!["sample", "label", "depth"]);
+        assert_eq!(joined.nrows, 2, "dict's two rows, both matched");
+    }
+
+    #[test]
+    fn join_matches_across_types_and_ignores_blank_keys() {
+        // The same key as a number on one side and text on the other, plus a
+        // blank key that must not pair up with the other blank.
+        let left = write_text_fixture("csv", "id,x\n1,a\n2,b\n,c\n");
+        let right = write_text_fixture("tsv", "id\ty\n1\tone\n\tblank\n");
+        let mut tabs = Tabs::open(&[left, right], HeaderSpec::default()).unwrap();
+        assert_eq!(tabs.app_mut().data.column_types[0], "Int64");
+        run_wizard(&mut tabs, 0, 1, 0);
+
+        let joined = &tabs.app_mut().data;
+        assert_eq!(joined.nrows, 3);
+        assert_eq!(joined.cell_display(2, 0).unwrap().as_deref(), Some("one"));
+        assert!(joined.is_null(2, 1), "id 2 has no match");
+        assert!(joined.is_null(2, 2), "a blank key matches nothing");
     }
 
     #[test]
@@ -861,7 +1397,7 @@ mod tests {
         let mut app = App::new(Dataset::load(&xlsx_fixture()).unwrap());
 
         // Sorting a float column orders it numerically, nulls aside.
-        app.selected_col = 2;
+        app.selected_pos = 2;
         app.handle_key(key('s'));
         let ordered: Vec<f64> = app
             .data
@@ -903,11 +1439,26 @@ mod tests {
         buffer_text_tabs(app, &ui::TabStrip::default(), w, h)
     }
 
+    /// Render `app` with a wizard banner on the bottom line.
+    fn buffer_text_banner(app: &mut App, banner: &str, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|f| ui::render(f, app, &ui::TabStrip::default(), Some(banner)).unwrap())
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
     /// Render `app` as the visible view of `tabs` (an empty strip = one tab).
     fn buffer_text_tabs(app: &mut App, tabs: &ui::TabStrip, w: u16, h: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal
-            .draw(|f| ui::render(f, app, tabs).unwrap())
+            .draw(|f| ui::render(f, app, tabs, None).unwrap())
             .unwrap();
         terminal
             .backend()
@@ -1001,7 +1552,7 @@ mod tests {
         assert_eq!(ds.cell_display(0, 19999).unwrap().as_deref(), Some("19999"));
         // Filtering streams every chunk; the match lives in the third one.
         let hits = ds
-            .filter_rows(&regex::Regex::new("^18000$").unwrap(), || false)
+            .filter_rows(&[0, 1], &regex::Regex::new("^18000$").unwrap(), || false)
             .unwrap()
             .unwrap();
         assert_eq!(hits, vec![18000]);
@@ -1017,7 +1568,7 @@ mod tests {
         let all: Vec<usize> = (0..BIG as usize).collect();
         assert!(ds.sort_indices(&all, 0, true, always).unwrap().is_none());
         assert!(ds
-            .filter_rows(&regex::Regex::new("x").unwrap(), always)
+            .filter_rows(&[0, 1], &regex::Regex::new("x").unwrap(), always)
             .unwrap()
             .is_none());
 
@@ -1025,11 +1576,11 @@ mod tests {
         // firing cancel aborts before reaching it.
         let re = regex::Regex::new("^19999$").unwrap();
         assert_eq!(
-            ds.find_match(&re, BIG as usize, |i| i, 0, 0, true, Some(0), never),
+            ds.find_match(&re, BIG as usize, &[0, 1], |i| i, 0, 0, true, Some(0), never),
             Some((19999, 0)),
         );
         assert!(ds
-            .find_match(&re, BIG as usize, |i| i, 0, 0, true, Some(0), always)
+            .find_match(&re, BIG as usize, &[0, 1], |i| i, 0, 0, true, Some(0), always)
             .is_none());
     }
 
@@ -1143,11 +1694,11 @@ mod tests {
         app.handle_key(KeyEvent::from(KeyCode::Up)); // above row 0
         assert_eq!(app.selected_row, 0);
         app.handle_key(KeyEvent::from(KeyCode::Left)); // left of col 0
-        assert_eq!(app.selected_col, 0);
+        assert_eq!(app.selected_pos, 0);
         app.handle_key(KeyEvent::from(KeyCode::Char('$')));
-        assert_eq!(app.selected_col, 2);
+        assert_eq!(app.selected_pos, 2);
         app.handle_key(KeyEvent::from(KeyCode::Right)); // past last col
-        assert_eq!(app.selected_col, 2);
+        assert_eq!(app.selected_pos, 2);
     }
 
     #[test]
@@ -1308,7 +1859,7 @@ mod tests {
         // A features × samples matrix: first column labels, rest numeric.
         let csv = "gene,s1,s2\ng1,10,20\ng2,3,4\n";
         let ds = Dataset::load(&write_text_fixture("csv", csv)).unwrap();
-        let t = ds.transpose(&[0, 1]).unwrap();
+        let t = ds.transpose(&[0, 1], &[0, 1, 2]).unwrap();
 
         // Columns become the field column + one per record (titled by gene).
         assert_eq!(t.column_names, vec!["field", "g1", "g2"]);
@@ -1340,7 +1891,8 @@ mod tests {
 
         // All the usual commands act on the transposed columns directly.
         tv.handle_key(key('l')); // select record column `g1`
-        assert_eq!(tv.selected_col, 1);
+        assert_eq!(tv.selected_pos, 1);
+        assert_eq!(tv.selected_col(), 1, "nothing moved, so the two agree");
         tv.handle_key(key('s')); // sort by it
         assert_eq!(tv.sort.unwrap().col, 1);
         tv.handle_key(key('%')); // numeric-style it
@@ -1496,7 +2048,7 @@ mod tests {
         let csv = "id,name,val\n1,alpha,3.14\n2,beta,100.5\n3,gamma,0.007\n";
         let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
         app.handle_key(key('$')); // select `val` (col 2)
-        assert_eq!(app.selected_col, 2);
+        assert_eq!(app.selected_pos, 2);
 
         app.handle_key(key('%'));
         let st = app.num_styles.get(&2).copied().expect("numeric style set");
@@ -1510,7 +2062,7 @@ mod tests {
 
         // `%` is rejected on a non-numeric column.
         app.handle_key(key('h')); // move to `name` (col 1)
-        assert_eq!(app.selected_col, 1);
+        assert_eq!(app.selected_pos, 1);
         app.handle_key(key('%'));
         assert!(!app.num_styles.contains_key(&1));
         assert!(app.status_msg.as_deref().unwrap().contains("not numeric"));
@@ -1561,7 +2113,7 @@ mod tests {
         type_str(&mut app, "item_0042");
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         assert_eq!(app.selected_orig(), 42);
-        assert_eq!(app.selected_col, 1, "should land on the name column");
+        assert_eq!(app.selected_pos, 1, "should land on the name column");
         assert_eq!(app.search.as_ref().unwrap().scope, None, "global search is unscoped");
     }
 
@@ -1574,11 +2126,11 @@ mod tests {
         app.handle_key(KeyEvent::from(KeyCode::Enter));
 
         assert_eq!(app.search.as_ref().unwrap().scope, Some(1));
-        assert_eq!(app.selected_col, 1);
+        assert_eq!(app.selected_pos, 1);
         assert_eq!(app.selected_orig(), 40, "lands on first in-column match");
 
         app.handle_key(key('n'));
-        assert_eq!(app.selected_col, 1, "next match stays in the searched column");
+        assert_eq!(app.selected_pos, 1, "next match stays in the searched column");
         assert_eq!(app.selected_orig(), 41);
     }
 
