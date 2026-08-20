@@ -10,7 +10,7 @@ use clap::Parser;
 use crossterm::event::{self, Event, KeyEventKind};
 
 use app::App;
-use data::Dataset;
+use data::{Dataset, HeaderSpec};
 
 /// A terminal viewer for parquet, CSV/TSV and Excel files, in the manner of
 /// csvlens.
@@ -33,7 +33,12 @@ const TRANSPOSE_MAX_RECORDS: usize = 4096;
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let mut tabs = Tabs::open(&args.files, !args.no_header)?;
+    let header = if args.no_header {
+        HeaderSpec::NONE
+    } else {
+        HeaderSpec::default()
+    };
+    let mut tabs = Tabs::open(&args.files, header)?;
 
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut tabs);
@@ -52,10 +57,10 @@ struct Tabs {
 impl Tabs {
     /// Open one tab per table, failing before the TUI starts if any path won't
     /// load. A workbook contributes one tab per sheet that holds data.
-    fn open(paths: &[PathBuf], has_header: bool) -> Result<Self> {
+    fn open(paths: &[PathBuf], header: HeaderSpec) -> Result<Self> {
         let mut tabs = Vec::with_capacity(paths.len());
         for path in paths {
-            let datasets = Dataset::load_all(path, has_header)
+            let datasets = Dataset::load_all(path, header)
                 .with_context(|| format!("loading {}", path.display()))?;
             tabs.extend(datasets.into_iter().map(|d| vec![App::new(d)]));
         }
@@ -99,6 +104,7 @@ impl Tabs {
         let close = std::mem::take(&mut app.close_tab);
         let open = app.open_request.take();
         let toggle_header = std::mem::take(&mut app.toggle_header);
+        let promote_header = std::mem::take(&mut app.promote_header);
 
         if exit_transpose && self.tabs[self.current].len() > 1 {
             self.tabs[self.current].pop();
@@ -111,7 +117,15 @@ impl Tabs {
             }
         }
         if toggle_header {
-            self.reload_header();
+            let named = !self.app_mut().data.header.named;
+            let skip = self.app_mut().data.header.skip;
+            self.reload_header(
+                HeaderSpec { skip, named },
+                if named { "first row: column names" } else { "first row: data" },
+            );
+        }
+        if promote_header {
+            self.promote_header_row();
         }
         if let Some(delta) = switch {
             let n = self.tabs.len() as isize;
@@ -119,8 +133,8 @@ impl Tabs {
         }
         if let Some(path) = open {
             let path = expand_home(&path);
-            let has_header = self.app_mut().data.has_header;
-            match Dataset::load_all(&path, has_header) {
+            let header = self.app_mut().data.header;
+            match Dataset::load_all(&path, header) {
                 // A workbook lands as several tabs; the first one becomes current.
                 Ok(datasets) => {
                     let first = self.tabs.len();
@@ -143,25 +157,39 @@ impl Tabs {
 }
 
 impl Tabs {
-    /// Re-read the current tab's file with the first row switched between
-    /// column names and data. The schema changes (names, and the types of any
-    /// column the first row joins), so the tab starts from a fresh view rather
-    /// than trying to carry a cursor, filter or sort across the change.
-    fn reload_header(&mut self) {
+    /// Re-read the current tab's file with a different reading of its top rows.
+    /// The schema changes with it (the names, and the type of any column the
+    /// header row joins), so the tab starts from a fresh view rather than
+    /// trying to carry a cursor, filter or sort across the change.
+    fn reload_header(&mut self, want: HeaderSpec, msg: &str) {
         let app = self.app_mut();
-        let want = !app.data.has_header;
         match app.data.reload_with_header(want) {
             Ok(dataset) => {
                 let mut view = App::new(dataset);
-                view.status_msg = Some(if want {
-                    "first row: column names".into()
-                } else {
-                    "first row: data".into()
-                });
+                view.status_msg = Some(msg.to_string());
                 self.tabs[self.current] = vec![view];
             }
             Err(e) => app.status_msg = Some(format!("header: {e}")),
         }
+    }
+
+    /// Make the selected row the header, dropping everything above it — the fix
+    /// for a file that puts title or provenance rows before its real header.
+    /// Pressing `H` again with a promoted header puts it back at the top.
+    fn promote_header_row(&mut self) {
+        let app = self.app_mut();
+        if app.data.header.skip > 0 {
+            self.reload_header(HeaderSpec::default(), "header: back to the first row");
+            return;
+        }
+        if app.row_count() == 0 {
+            return;
+        }
+        // The raw file row under the cursor, which is what becomes the header.
+        let skip = app.data.raw_row(app.selected_orig());
+        let spec = HeaderSpec { skip, named: true };
+        let msg = format!("header: row {}", spec.header_line());
+        self.reload_header(spec, &msg);
     }
 }
 
@@ -386,6 +414,112 @@ mod tests {
     }
 
     #[test]
+    fn question_mark_shows_every_key_and_scrolls() {
+        let mut app = App::new(Dataset::load(&fixture()).unwrap());
+        // The bottom line only teases; `?` is the way in.
+        let text = buffer_text(&mut app, 100, 24);
+        assert!(text.contains("? all keys"), "missing pointer to help: {text}");
+        assert!(!text.contains("this page"), "help shown unasked: {text}");
+
+        app.handle_key(key('?'));
+        assert!(app.show_help);
+        let text = buffer_text(&mut app, 100, 44);
+        // Sections and keys that the one-line hint has no room for.
+        for expected in ["Moving", "Finding", "The first row", "Tabs", "keys"] {
+            assert!(text.contains(expected), "help missing {expected}: {text}");
+        }
+        assert!(text.contains("make the selected row the header"));
+        assert!(!text.contains("item_0000"), "table should be covered: {text}");
+
+        // Keys drive the page, not the table behind it.
+        app.handle_key(key('j'));
+        assert_eq!(app.help_offset, 1);
+        assert_eq!(app.selected_row, 0, "the cursor must not move behind the page");
+        app.handle_key(key('k'));
+        assert_eq!(app.help_offset, 0);
+        // Scrolling past the end is clamped by the renderer.
+        for _ in 0..200 {
+            app.handle_key(key('j'));
+        }
+        let text = buffer_text(&mut app, 100, 24);
+        assert!(text.contains("q / Ctrl-c"), "last section unreachable: {text}");
+
+        // And it closes without quitting.
+        app.handle_key(key('?'));
+        assert!(!app.show_help && !app.should_quit);
+        assert_eq!(app.help_offset, 0);
+        app.handle_key(key('?'));
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(!app.show_help && !app.should_quit, "Esc closes, it does not quit");
+    }
+
+    #[test]
+    fn promoting_a_row_to_header_drops_what_is_above() {
+        // Two rows of title junk above the real header — the ill-conceived case.
+        let csv = "exported by hand,,\nnote,2026,-\nid,name,score\n1,alpha,3\n2,beta,4\n";
+        let mut tabs = Tabs::open(&[write_text_fixture("csv", csv)], HeaderSpec::default())
+            .unwrap();
+        assert_eq!(tabs.app_mut().data.column_names[0], "exported by hand");
+
+        // Move to the row holding the real header and press H.
+        tabs.app_mut().handle_key(key('j'));
+        let selected = tabs.app_mut().selected_orig();
+        let under_cursor = tabs.app_mut().data.cell_display(0, selected).unwrap();
+        assert_eq!(under_cursor.as_deref(), Some("id"), "cursor is on the real header");
+        tabs.app_mut().handle_key(key('H'));
+        assert!(tabs.step());
+        assert_eq!(tabs.app_mut().data.column_names, vec!["id", "name", "score"]);
+        assert_eq!(tabs.app_mut().row_count(), 2, "only the real data rows remain");
+        assert_eq!(tabs.app_mut().data.header.skip, 2);
+        assert_eq!(tabs.app_mut().data.header.header_line(), 3);
+        // The score column is numeric now that the junk rows are gone.
+        assert!(tabs.app_mut().data.is_numeric(2));
+        assert!(buffer_text(tabs.app_mut(), 100, 20).contains("header@3"));
+
+        // Pressing H again cancels it, back to the file as it comes.
+        tabs.app_mut().handle_key(key('H'));
+        assert!(tabs.step());
+        assert_eq!(tabs.app_mut().data.header, HeaderSpec::default());
+        assert_eq!(tabs.app_mut().data.column_names[0], "exported by hand");
+        assert_eq!(tabs.tabs.len(), 1, "it stays one tab throughout");
+    }
+
+    #[test]
+    fn promoting_counts_from_the_row_under_the_cursor() {
+        // Header at the top, so the first data row is raw row 2.
+        let csv = "id,name\nalpha,1\nbeta,2\n";
+        let mut tabs = Tabs::open(&[write_text_fixture("csv", csv)], HeaderSpec::default())
+            .unwrap();
+        tabs.app_mut().handle_key(key('H'));
+        assert!(tabs.step());
+        assert_eq!(tabs.app_mut().data.header.skip, 1, "row under the cursor, not row 0");
+        assert_eq!(tabs.app_mut().data.column_names, vec!["alpha", "1"]);
+        assert_eq!(tabs.app_mut().row_count(), 1);
+    }
+
+    #[test]
+    fn promoting_a_row_works_on_a_sheet_and_a_commented_file() {
+        // A worksheet: H re-reads just that sheet.
+        let mut tabs = Tabs::open(&[xlsx_fixture()], HeaderSpec::default()).unwrap();
+        tabs.app_mut().handle_key(key('H'));
+        assert!(tabs.step());
+        assert_eq!(tabs.app_mut().data.header.skip, 1);
+        assert_eq!(tabs.app_mut().data.column_names, vec!["1", "alpha", "3.5"]);
+        assert_eq!(tabs.app_mut().row_count(), 3);
+        assert_eq!(tabs.tabs.len(), 2, "the other sheet is untouched");
+
+        // A `#` preamble is skipped first, so H counts from the real content.
+        let tsv = "# a comment\njunk\tjunk2\nid\tname\n1\talpha\n";
+        let mut tabs =
+            Tabs::open(&[write_text_fixture("tsv", tsv)], HeaderSpec::default()).unwrap();
+        assert_eq!(tabs.app_mut().data.column_names, vec!["junk", "junk2"]);
+        tabs.app_mut().handle_key(key('H'));
+        assert!(tabs.step());
+        assert_eq!(tabs.app_mut().data.column_names, vec!["id", "name"]);
+        assert_eq!(tabs.app_mut().row_count(), 1);
+    }
+
+    #[test]
     fn no_header_names_columns_positionally() {
         let csv = "1,2,3\n4,5,6\n";
         let path = write_text_fixture("csv", csv);
@@ -393,25 +527,25 @@ mod tests {
         let headed = Dataset::load(&path).unwrap();
         assert_eq!(headed.column_names, vec!["1", "2", "3"]);
         assert_eq!(headed.nrows, 1);
-        assert!(headed.has_header);
+        assert!(headed.header.named);
         // Without one, every record is data and the names are positional.
-        let bare = Dataset::load_all(&path, false).unwrap().remove(0);
+        let bare = Dataset::load_all(&path, HeaderSpec::NONE).unwrap().remove(0);
         assert_eq!(bare.column_names, vec!["column_1", "column_2", "column_3"]);
         assert_eq!(bare.nrows, 2);
-        assert!(!bare.has_header);
+        assert!(!bare.header.named);
         assert_eq!(bare.cell_display(0, 0).unwrap().as_deref(), Some("1"));
     }
 
     #[test]
     fn header_toggle_reloads_the_current_tab() {
         let csv = "id,name\n1,alpha\n2,beta\n";
-        let mut tabs = Tabs::open(&[write_text_fixture("csv", csv)], true).unwrap();
+        let mut tabs = Tabs::open(&[write_text_fixture("csv", csv)], HeaderSpec::default()).unwrap();
         assert_eq!(tabs.app_mut().row_count(), 2);
 
         // `T` re-reads the file with the header row as data.
         tabs.app_mut().handle_key(key('T'));
         assert!(tabs.step());
-        assert!(!tabs.app_mut().data.has_header);
+        assert!(!tabs.app_mut().data.header.named);
         assert_eq!(tabs.app_mut().data.column_names, vec!["column_1", "column_2"]);
         assert_eq!(tabs.app_mut().row_count(), 3, "the header row is now data");
         assert_eq!(tabs.tabs.len(), 1, "toggling stays in the same tab");
@@ -419,7 +553,7 @@ mod tests {
         // And back again.
         tabs.app_mut().handle_key(key('T'));
         assert!(tabs.step());
-        assert!(tabs.app_mut().data.has_header);
+        assert!(tabs.app_mut().data.header.named);
         assert_eq!(tabs.app_mut().data.column_names, vec!["id", "name"]);
         assert_eq!(tabs.app_mut().row_count(), 2);
     }
@@ -429,15 +563,14 @@ mod tests {
         // The status bar flags a headerless view.
         let csv = "1,2\n3,4\n";
         let path = write_text_fixture("csv", csv);
-        let mut bare = App::new(Dataset::load_all(&path, false).unwrap().remove(0));
+        let mut bare = App::new(Dataset::load_all(&path, HeaderSpec::NONE).unwrap().remove(0));
         let text = buffer_text(&mut bare, 100, 20);
         assert!(text.contains("no header"), "missing marker: {text}");
-        assert!(text.contains("T header"), "missing hint: {text}");
         let mut headed = App::new(Dataset::load(&path).unwrap());
         assert!(!buffer_text(&mut headed, 100, 20).contains("no header"));
 
         // Parquet carries its own names, so there is nothing to toggle.
-        let mut tabs = Tabs::open(&[fixture()], true).unwrap();
+        let mut tabs = Tabs::open(&[fixture()], HeaderSpec::default()).unwrap();
         tabs.app_mut().handle_key(key('T'));
         assert!(tabs.step());
         let msg = tabs.app_mut().status_msg.clone().unwrap_or_default();
@@ -461,7 +594,7 @@ mod tests {
         assert_eq!(headed.column_names, vec!["id", "name"]);
         assert_eq!(headed.nrows, 1);
 
-        let bare = Dataset::load_all(&path, false).unwrap().remove(0);
+        let bare = Dataset::load_all(&path, HeaderSpec::NONE).unwrap().remove(0);
         assert_eq!(bare.column_names, vec!["column_1", "column_2"]);
         assert_eq!(bare.nrows, 2, "the id/name line is data now");
         assert_eq!(bare.cell_display(0, 0).unwrap().as_deref(), Some("id"));
@@ -470,7 +603,7 @@ mod tests {
     #[test]
     fn xlsx_header_can_be_turned_off_per_sheet() {
         let book = xlsx_fixture();
-        let sheets = Dataset::load_all(&book, false).unwrap();
+        let sheets = Dataset::load_all(&book, HeaderSpec::NONE).unwrap();
         let numbers = &sheets[0];
         assert_eq!(
             numbers.column_names,
@@ -480,28 +613,28 @@ mod tests {
         assert_eq!(numbers.nrows, 5);
         assert_eq!(numbers.column_types[0], "Utf8");
         assert_eq!(numbers.cell_display(0, 0).unwrap().as_deref(), Some("id"));
-        assert!(!numbers.has_header);
+        assert!(!numbers.header.named);
 
         // Toggling a workbook tab reloads just that sheet, keeping the others.
-        let mut tabs = Tabs::open(&[book], true).unwrap();
+        let mut tabs = Tabs::open(&[book], HeaderSpec::default()).unwrap();
         tabs.app_mut().handle_key(code(KeyCode::Tab));
         assert!(tabs.step());
         tabs.app_mut().handle_key(key('T'));
         assert!(tabs.step());
         assert_eq!(tabs.tabs.len(), 2, "the other sheet's tab survives");
         assert_eq!(tabs.current, 1);
-        assert!(!tabs.app_mut().data.has_header);
+        assert!(!tabs.app_mut().data.header.named);
         assert_eq!(tabs.app_mut().data.column_names, vec!["column_1", "column_2"]);
         assert!(tabs.app_mut().data.label.ends_with("[Dates]"));
         // The untouched sheet still has its header.
         tabs.app_mut().handle_key(code(KeyCode::Tab));
         assert!(tabs.step());
-        assert!(tabs.app_mut().data.has_header);
+        assert!(tabs.app_mut().data.header.named);
     }
 
     #[test]
     fn xlsx_opens_one_tab_per_sheet() {
-        let mut tabs = Tabs::open(&[xlsx_fixture()], true).unwrap();
+        let mut tabs = Tabs::open(&[xlsx_fixture()], HeaderSpec::default()).unwrap();
         assert_eq!(tabs.tabs.len(), 2, "the blank sheet earns no tab");
         let strip = tabs.strip();
         assert!(
@@ -534,7 +667,7 @@ mod tests {
 
     #[test]
     fn xlsx_dates_become_real_date_columns() {
-        let sheets = Dataset::load_all(&xlsx_fixture(), true).unwrap();
+        let sheets = Dataset::load_all(&xlsx_fixture(), HeaderSpec::default()).unwrap();
         let dates = &sheets[1];
         // Date-formatted cells become dates; a time of day promotes to timestamp.
         assert_eq!(dates.column_types, vec!["Date32", "Timestamp(ms)"]);
@@ -585,7 +718,7 @@ mod tests {
         let mut path = std::env::temp_dir();
         path.push(format!("{}.dat", book.file_stem().unwrap().to_string_lossy()));
         std::fs::copy(&book, &path).unwrap();
-        let sheets = Dataset::load_all(&path, true).unwrap();
+        let sheets = Dataset::load_all(&path, HeaderSpec::default()).unwrap();
         assert_eq!(sheets.len(), 2);
         assert_eq!(sheets[0].column_names, vec!["id", "name", "score"]);
     }
@@ -1054,7 +1187,7 @@ mod tests {
 
     #[test]
     fn tabs_cycle_with_tab_and_back_tab() {
-        let mut tabs = Tabs::open(&[fixture(), fixture(), fixture()], true).unwrap();
+        let mut tabs = Tabs::open(&[fixture(), fixture(), fixture()], HeaderSpec::default()).unwrap();
         assert_eq!(tabs.tabs.len(), 3);
         assert_eq!(tabs.current, 0);
 
@@ -1075,7 +1208,7 @@ mod tests {
 
     #[test]
     fn each_tab_keeps_its_own_view_state() {
-        let mut tabs = Tabs::open(&[fixture(), fixture()], true).unwrap();
+        let mut tabs = Tabs::open(&[fixture(), fixture()], HeaderSpec::default()).unwrap();
 
         // Transpose tab 0.
         tabs.app_mut().handle_key(key('t'));
@@ -1104,7 +1237,7 @@ mod tests {
 
     #[test]
     fn open_adds_a_tab_and_ctrl_w_closes_it() {
-        let mut tabs = Tabs::open(&[fixture()], true).unwrap();
+        let mut tabs = Tabs::open(&[fixture()], HeaderSpec::default()).unwrap();
         let other = fixture();
 
         tabs.app_mut().handle_key(key('o'));
@@ -1127,7 +1260,7 @@ mod tests {
 
     #[test]
     fn open_reports_a_bad_path_without_adding_a_tab() {
-        let mut tabs = Tabs::open(&[fixture()], true).unwrap();
+        let mut tabs = Tabs::open(&[fixture()], HeaderSpec::default()).unwrap();
         tabs.app_mut().handle_key(key('o'));
         type_str(tabs.app_mut(), "/no/such/file.parquet");
         tabs.app_mut().handle_key(code(KeyCode::Enter));
@@ -1139,7 +1272,7 @@ mod tests {
 
     #[test]
     fn open_prompt_takes_a_literal_path_and_can_be_cancelled() {
-        let mut tabs = Tabs::open(&[fixture()], true).unwrap();
+        let mut tabs = Tabs::open(&[fixture()], HeaderSpec::default()).unwrap();
         // The prompt shows the typed path verbatim (no regex handling).
         tabs.app_mut().handle_key(key('o'));
         type_str(tabs.app_mut(), "some/file.csv");
@@ -1155,7 +1288,7 @@ mod tests {
     #[test]
     fn tab_strip_lists_the_open_files() {
         let paths = vec![fixture(), fixture()];
-        let mut tabs = Tabs::open(&paths, true).unwrap();
+        let mut tabs = Tabs::open(&paths, HeaderSpec::default()).unwrap();
         let strip = tabs.strip();
         assert_eq!(strip.labels.len(), 2);
         let text = buffer_text_tabs(tabs.app_mut(), &strip, 120, 20);
@@ -1173,7 +1306,7 @@ mod tests {
     fn tab_strip_windows_to_keep_the_active_tab_visible() {
         // More tabs than fit: the strip scrolls so the active one is on screen.
         let paths: Vec<PathBuf> = (0..8).map(|_| fixture()).collect();
-        let mut tabs = Tabs::open(&paths, true).unwrap();
+        let mut tabs = Tabs::open(&paths, HeaderSpec::default()).unwrap();
         tabs.current = 7;
         let strip = tabs.strip();
         let text = buffer_text_tabs(tabs.app_mut(), &strip, 40, 20);

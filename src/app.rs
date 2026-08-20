@@ -152,6 +152,13 @@ pub struct App {
     /// Set when the first row should switch between column names and data
     /// (handled by the loop, which reloads the file).
     pub toggle_header: bool,
+    /// Set when the selected row should become the header — or, when one has
+    /// already been promoted, when that should be undone.
+    pub promote_header: bool,
+    /// Whether the `?` key reference is covering the table.
+    pub show_help: bool,
+    /// First line of the key reference on screen, for scrolling it.
+    pub help_offset: usize,
     /// Number of leftmost columns pinned in place while scrolling horizontally.
     pub frozen_cols: usize,
     /// Active sort, if any.
@@ -189,6 +196,9 @@ impl App {
             close_tab: false,
             open_request: None,
             toggle_header: false,
+            promote_header: false,
+            show_help: false,
+            help_offset: 0,
             frozen_cols: 0,
             sort: None,
             num_styles: HashMap::new(),
@@ -224,9 +234,39 @@ impl App {
 
     /// `now` is injected so held-key acceleration can be tested deterministically.
     pub fn handle_key_at(&mut self, key: KeyEvent, now: Instant) {
+        // The key reference swallows input while it is up, so a stray key can't
+        // move the cursor behind it.
+        if self.show_help {
+            return self.handle_help(key);
+        }
         match self.mode {
             Mode::Normal => self.handle_normal(key, now),
             Mode::Input(kind) => self.handle_input(key, kind),
+        }
+    }
+
+    /// Scroll or dismiss the `?` key reference. Only `Ctrl-c` still quits.
+    fn handle_help(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let scroll = |off: usize, by: usize| off.saturating_add(by);
+        match key.code {
+            KeyCode::Char('c') if ctrl => self.should_quit = true,
+            KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => {
+                self.show_help = false;
+                self.help_offset = 0;
+            }
+            KeyCode::Char('j') | KeyCode::Down => self.help_offset = scroll(self.help_offset, 1),
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.help_offset = self.help_offset.saturating_sub(1)
+            }
+            KeyCode::PageDown | KeyCode::Char('f') if !ctrl => {
+                self.help_offset = scroll(self.help_offset, 10)
+            }
+            KeyCode::PageUp | KeyCode::Char('b') => {
+                self.help_offset = self.help_offset.saturating_sub(10)
+            }
+            KeyCode::Char('g') | KeyCode::Home => self.help_offset = 0,
+            _ => {}
         }
     }
 
@@ -272,13 +312,17 @@ impl App {
             KeyCode::BackTab => self.switch_tab = Some(-1),
             KeyCode::Char('w') if ctrl => self.close_tab = true,
             KeyCode::Char('o') => self.enter_input(InputKind::Open),
-            // `T` re-reads the file with the first row as names or as data.
+            KeyCode::Char('?') => self.show_help = true,
+            // `T` re-reads the file with the first row as names or as data;
+            // `H` moves the header down to the selected row (or undoes that).
             KeyCode::Char('T') => {
-                if self.is_transposed {
-                    self.status_msg =
-                        Some("header applies to the file — press t first".into());
-                } else {
+                if self.header_applies() {
                     self.toggle_header = true;
+                }
+            }
+            KeyCode::Char('H') => {
+                if self.header_applies() {
+                    self.promote_header = true;
                 }
             }
             KeyCode::Char('%') => self.toggle_numeric(),
@@ -316,6 +360,16 @@ impl App {
             KeyCode::Char('$') => self.selected_col = self.last_col(),
             _ => {}
         }
+    }
+
+    /// Whether a header change makes sense here: a transposed view is built
+    /// from the table, not read from the file, so it has no header row to move.
+    fn header_applies(&mut self) -> bool {
+        if self.is_transposed {
+            self.status_msg = Some("header applies to the file — press t first".into());
+            return false;
+        }
+        true
     }
 
     fn handle_input(&mut self, key: KeyEvent, kind: InputKind) {

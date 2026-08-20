@@ -4,10 +4,75 @@ use anyhow::Result;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::app::{App, InputKind, Mode, NumStyle, SortDir};
+
+/// The full key reference shown by `?`, grouped into sections. Kept as data so
+/// the page can grow into tabbed pages later without touching the renderer.
+const HELP: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Moving",
+        &[
+            ("j / k / ↓ / ↑", "down / up one row (hold to accelerate)"),
+            ("h / l / ← / →", "left / right one column"),
+            ("Ctrl-d / Ctrl-u", "half page down / up"),
+            ("Ctrl-f / Ctrl-b / PgDn / PgUp", "page down / up"),
+            ("g / G", "first / last row"),
+            ("0 / $", "first / last column"),
+            (":", "go to a row number (original numbering)"),
+        ],
+    ),
+    (
+        "Finding",
+        &[
+            ("/", "search every column (regex, case-insensitive)"),
+            ("-", "search within the selected column only"),
+            ("n / N", "next / previous match"),
+            ("&", "keep only rows matching a regex"),
+            ("Esc", "clear the search, then the filter"),
+        ],
+    ),
+    (
+        "Shaping",
+        &[
+            ("s", "sort by the selected column: ascending → descending → off"),
+            ("f", "freeze columns up to the selected one"),
+            ("t", "transpose the table (t or Esc to come back)"),
+            ("%", "numeric column: align on the dot, colour by magnitude"),
+            ("< / >", "fewer / more decimals"),
+        ],
+    ),
+    (
+        "The first row",
+        &[
+            ("T", "the first row is column names, or data — toggle"),
+            ("H", "make the selected row the header, dropping rows above it"),
+            ("", "press H again to put the header back at the top"),
+        ],
+    ),
+    (
+        "Tabs",
+        &[
+            ("Tab / Shift-Tab", "next / previous tab (a workbook opens one per sheet)"),
+            ("o", "open another file in a new tab"),
+            ("Ctrl-w", "close this tab; closing the last one quits"),
+        ],
+    ),
+    (
+        "View",
+        &[
+            ("i", "info line: the column's type and the full cell value"),
+            ("#", "show / hide the row-number gutter"),
+            ("?", "this page"),
+            ("q / Ctrl-c", "quit — or cancel a running sort, filter or search"),
+        ],
+    ),
+];
+
+/// Column where the key descriptions line up on the help page.
+const HELP_KEY_WIDTH: usize = 30;
 
 const MAX_COL_WIDTH: u16 = 40;
 const MIN_COL_WIDTH: u16 = 3;
@@ -48,6 +113,12 @@ pub fn render(frame: &mut Frame, app: &mut App, tabs: &TabStrip) -> Result<()> {
     render_title(frame, title_area, app, tabs);
     render_status(frame, status_area, app);
     render_help(frame, help_area, app);
+
+    // The key reference covers the table rather than sitting beside it.
+    if app.show_help {
+        render_help_page(frame, body_area, app);
+        return Ok(());
+    }
 
     if app.row_count() == 0 {
         // A sheet or file can legitimately hold only a header row, so say which
@@ -271,6 +342,45 @@ fn render_table(
         .column_spacing(COL_SPACING);
     frame.render_widget(table, area);
     Ok(())
+}
+
+/// Draw the `?` key reference over the table, scrolled to `app.help_offset`.
+fn render_help_page(frame: &mut Frame, area: Rect, app: &mut App) {
+    let mut lines: Vec<Line> = Vec::new();
+    for (section, keys) in HELP {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::from(Span::styled(
+            *section,
+            Style::new().bold().fg(Color::Cyan),
+        )));
+        for (key, what) in *keys {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {key:<HELP_KEY_WIDTH$}"),
+                    Style::new().fg(Color::Yellow),
+                ),
+                Span::raw(*what),
+            ]));
+        }
+    }
+
+    // Clamp the scroll so holding `j` can't run off the end of the page.
+    let visible = area.height.saturating_sub(2) as usize;
+    app.help_offset = app.help_offset.min(lines.len().saturating_sub(visible));
+
+    let block = Block::bordered()
+        .title(" keys ")
+        .title_bottom(" j/k scroll · ?/Esc/q close ")
+        .border_style(Style::new().fg(Color::DarkGray));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .scroll((app.help_offset as u16, 0)),
+        area,
+    );
 }
 
 fn divider_cell() -> Cell<'static> {
@@ -505,9 +615,13 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             Style::new().fg(Color::Blue),
         ));
     }
-    if !app.data.has_header {
+    // Flag any reading of the top rows other than the usual one.
+    if !app.data.header.named {
+        spans.push(Span::styled("  no header", Style::new().fg(Color::Yellow)));
+    }
+    if app.data.header.skip > 0 {
         spans.push(Span::styled(
-            "  no header",
+            format!("  header@{}", app.data.header.header_line()),
             Style::new().fg(Color::Yellow),
         ));
     }
@@ -541,11 +655,11 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
         )),
         Mode::Normal if app.show_info => info_line(app, area.width),
         Mode::Normal if app.is_transposed => Line::from(Span::styled(
-            " transposed · j/k/h/l move · s sort · % numeric · & filter · t/Esc back · Tab tab · q quit",
+            " transposed · hjkl move · s sort · % numeric · & filter · t/Esc back · ? all keys · q quit",
             Style::new().dim(),
         )),
         Mode::Normal => Line::from(Span::styled(
-            " hjkl move · / search · & filter · s sort · f freeze · t transpose · T header · Tab/o tabs · q quit",
+            " hjkl move · / search · & filter · s sort · t transpose · Tab tabs · ? all keys · q quit",
             Style::new().dim(),
         )),
     };
