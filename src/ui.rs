@@ -505,6 +505,12 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             Style::new().fg(Color::Blue),
         ));
     }
+    if !app.data.has_header {
+        spans.push(Span::styled(
+            "  no header",
+            Style::new().fg(Color::Yellow),
+        ));
+    }
     if app.frozen_cols > 0 {
         spans.push(Span::styled(
             format!("  ❄{}", app.frozen_cols),
@@ -539,7 +545,7 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
             Style::new().dim(),
         )),
         Mode::Normal => Line::from(Span::styled(
-            " j/k/h/l move · / search · & filter · s sort · f freeze · t transpose · Tab/o tabs · q quit",
+            " hjkl move · / search · & filter · s sort · f freeze · t transpose · T header · Tab/o tabs · q quit",
             Style::new().dim(),
         )),
     };

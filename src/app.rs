@@ -149,6 +149,9 @@ pub struct App {
     pub close_tab: bool,
     /// A path typed at the `o` prompt, to be opened in a new tab by the loop.
     pub open_request: Option<String>,
+    /// Set when the first row should switch between column names and data
+    /// (handled by the loop, which reloads the file).
+    pub toggle_header: bool,
     /// Number of leftmost columns pinned in place while scrolling horizontally.
     pub frozen_cols: usize,
     /// Active sort, if any.
@@ -185,6 +188,7 @@ impl App {
             switch_tab: None,
             close_tab: false,
             open_request: None,
+            toggle_header: false,
             frozen_cols: 0,
             sort: None,
             num_styles: HashMap::new(),
@@ -268,6 +272,15 @@ impl App {
             KeyCode::BackTab => self.switch_tab = Some(-1),
             KeyCode::Char('w') if ctrl => self.close_tab = true,
             KeyCode::Char('o') => self.enter_input(InputKind::Open),
+            // `T` re-reads the file with the first row as names or as data.
+            KeyCode::Char('T') => {
+                if self.is_transposed {
+                    self.status_msg =
+                        Some("header applies to the file — press t first".into());
+                } else {
+                    self.toggle_header = true;
+                }
+            }
             KeyCode::Char('%') => self.toggle_numeric(),
             KeyCode::Char('>') => self.adjust_decimals(1),
             KeyCode::Char('<') => self.adjust_decimals(-1),

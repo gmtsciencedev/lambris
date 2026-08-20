@@ -54,6 +54,11 @@ pub struct Dataset {
     pub path: PathBuf,
     /// Name shown in the title bar (the file name, or a transposed label).
     pub label: String,
+    /// The worksheet this came from, when the file is a workbook. Kept so the
+    /// header choice can be flipped without reopening the other sheets.
+    sheet: Option<String>,
+    /// Whether the first row of the file (or sheet) was read as column names.
+    pub has_header: bool,
     backend: Backend,
     schema: SchemaRef,
     pub column_names: Vec<String>,
@@ -66,19 +71,23 @@ pub struct Dataset {
 impl Dataset {
     /// Autodetect the file format and open every table the file holds: one per
     /// worksheet for an Excel workbook, and exactly one for anything else.
-    pub fn load_all(path: &Path) -> Result<Vec<Self>> {
+    /// `has_header` decides whether the first row holds column names (it does,
+    /// overwhelmingly, which is why that is the default) or is data, in which
+    /// case columns are named `column_N`.
+    pub fn load_all(path: &Path, has_header: bool) -> Result<Vec<Self>> {
         match detect_source(path)? {
-            Source::Excel => load_workbook(path),
-            source => Ok(vec![Self::from_source(path, source)?]),
+            Source::Excel => load_workbook(path, has_header),
+            source => Ok(vec![Self::from_source(path, source, has_header)?]),
         }
     }
 
-    /// Open a file as a single table; a workbook yields its first sheet with
-    /// data. Prefer [`Dataset::load_all`] when every sheet should be shown.
-    // Used throughout the tests, where one table per file is the norm.
+    /// Open a file as a single table with the first row as column names; a
+    /// workbook yields its first sheet with data. Prefer [`Dataset::load_all`]
+    /// when every sheet should be shown.
+    // Used throughout the tests, where one headed table per file is the norm.
     #[allow(dead_code)]
     pub fn load(path: &Path) -> Result<Self> {
-        let mut all = Self::load_all(path)?;
+        let mut all = Self::load_all(path, true)?;
         if all.is_empty() {
             anyhow::bail!("{} holds no data", path.display());
         }
@@ -87,10 +96,14 @@ impl Dataset {
 
     /// Prepare a single-table format for lazy access. Reads only metadata
     /// (parquet) or builds a byte-offset index (CSV) — never the data.
-    fn from_source(path: &Path, source: Source) -> Result<Self> {
-        let (backend, schema, nrows) = match source {
-            Source::Parquet => load_parquet_meta(path)?,
-            Source::Delimited(delim) => load_csv_meta(path, delim)?,
+    fn from_source(path: &Path, source: Source, has_header: bool) -> Result<Self> {
+        let (backend, schema, nrows, has_header) = match source {
+            // Parquet carries its own column names, so the flag never applies.
+            Source::Parquet => {
+                let (b, s, n) = load_parquet_meta(path)?;
+                (b, s, n, true)
+            }
+            Source::Delimited(delim) => load_csv_meta(path, delim, has_header)?,
             // Workbooks go through `load_workbook`: a sheet is fully decoded
             // into memory, so there is no lazy backend to set up here.
             Source::Excel => unreachable!("workbooks are opened per sheet"),
@@ -106,6 +119,8 @@ impl Dataset {
         Ok(Self {
             path: path.to_path_buf(),
             label,
+            sheet: None,
+            has_header,
             backend,
             schema,
             column_names,
@@ -116,8 +131,31 @@ impl Dataset {
         })
     }
 
+    /// Re-open this dataset reading the first row as column names or as data.
+    /// Errors for parquet (which carries its own schema) and for a view that
+    /// isn't backed by a file, so the caller can say why nothing happened.
+    pub fn reload_with_header(&self, has_header: bool) -> Result<Dataset> {
+        match detect_source(&self.path)? {
+            Source::Parquet => anyhow::bail!("parquet carries its own column names"),
+            Source::Excel => {
+                let sheet = self
+                    .sheet
+                    .as_deref()
+                    .context("not backed by a worksheet")?;
+                load_sheet(&self.path, sheet, has_header)
+            }
+            source => Dataset::from_source(&self.path, source, has_header),
+        }
+    }
+
     /// Build a dataset from an already-materialised batch (used for transpose).
-    fn in_memory(batch: RecordBatch, path: PathBuf, label: String) -> Self {
+    fn in_memory(
+        batch: RecordBatch,
+        path: PathBuf,
+        label: String,
+        sheet: Option<String>,
+        has_header: bool,
+    ) -> Self {
         let schema = batch.schema();
         let column_names = schema.fields().iter().map(|f| f.name().clone()).collect();
         let column_types = schema
@@ -130,6 +168,8 @@ impl Dataset {
         Self {
             path,
             label,
+            sheet,
+            has_header,
             backend: Backend::Memory(Arc::new(batch)),
             schema,
             column_names,
@@ -186,6 +226,8 @@ impl Dataset {
             batch,
             self.path.clone(),
             format!("{} ⇄ transposed", self.label),
+            None, // a transposed view is not the file's own layout
+            true,
         ))
     }
 
@@ -597,20 +639,27 @@ fn load_parquet_meta(path: &Path) -> Result<(Backend, SchemaRef, usize)> {
 }
 
 /// Infer a CSV/TSV schema from a sample, then scan the file to build the
-/// chunk byte-offset index and count rows. Files that begin with `#` comment
-/// lines take a dedicated path (see [`load_csv_meta_commented`]).
-fn load_csv_meta(path: &Path, delimiter: u8) -> Result<(Backend, SchemaRef, usize)> {
+/// chunk byte-offset index and count rows. Without a header the columns are
+/// named `column_N` and the first record is data. Files that begin with `#`
+/// comment lines take a dedicated path (see [`load_csv_meta_commented`]).
+fn load_csv_meta(
+    path: &Path,
+    delimiter: u8,
+    has_header: bool,
+) -> Result<(Backend, SchemaRef, usize, bool)> {
     if starts_with_comment(path)? {
-        return load_csv_meta_commented(path, delimiter);
+        return load_csv_meta_commented(path, delimiter, has_header);
     }
     let format = CsvFormat::default()
-        .with_header(true)
+        .with_header(has_header)
         .with_delimiter(delimiter);
     let infer_file = File::open(path)?;
     let (schema, _) = format
         .infer_schema(BufReader::new(infer_file), Some(CSV_INFER_ROWS))
         .with_context(|| format!("inferring schema from {}", path.display()))?;
-    let (chunk_offsets, nrows) = build_csv_index(path)?;
+    // The index covers the data rows: everything, or everything but row one.
+    let data_start = if has_header { first_record_end(path)? } else { 0 };
+    let (chunk_offsets, nrows) = build_index_from(path, data_start)?;
     Ok((
         Backend::Csv {
             delimiter,
@@ -618,14 +667,26 @@ fn load_csv_meta(path: &Path, delimiter: u8) -> Result<(Backend, SchemaRef, usiz
         },
         Arc::new(schema),
         nrows,
+        has_header,
     ))
 }
 
 /// Handle files with a leading `#` comment block (MetaPhlAn and friends).
 /// Works out where the real header and data start, then infers column types
 /// from the data alone — the comment lines never reach the chunk reader.
-fn load_csv_meta_commented(path: &Path, delimiter: u8) -> Result<(Backend, SchemaRef, usize)> {
-    let (data_start, names) = analyze_comment_header(path, delimiter)?;
+fn load_csv_meta_commented(
+    path: &Path,
+    delimiter: u8,
+    has_header: bool,
+) -> Result<(Backend, SchemaRef, usize, bool)> {
+    let layout = analyze_comment_header(path, delimiter)?;
+    // Without a header the comment block is still skipped, but the first line
+    // after it is data and the columns are named positionally.
+    let (data_start, names) = if has_header {
+        (layout.data_start, layout.names)
+    } else {
+        (layout.body_start, Vec::new())
+    };
     let (chunk_offsets, nrows) = build_index_from(path, data_start)?;
 
     // Types come from the data rows only (header, if any, is already excluded).
@@ -654,6 +715,7 @@ fn load_csv_meta_commented(path: &Path, delimiter: u8) -> Result<(Backend, Schem
         },
         schema,
         nrows,
+        has_header,
     ))
 }
 
@@ -663,11 +725,22 @@ fn starts_with_comment(path: &Path) -> Result<bool> {
     Ok(n == 1 && byte[0] == b'#')
 }
 
+/// Where a commented file's comment block ends, where its data begins, and
+/// what the column names are.
+struct CommentLayout {
+    /// Byte offset of the first non-`#` line — the start of the data when the
+    /// header is not honoured.
+    body_start: u64,
+    /// Byte offset of the first data row when the header *is* honoured.
+    data_start: u64,
+    names: Vec<String>,
+}
+
 /// Find where the data begins in a commented file and what the column names
 /// are. Two conventions are supported: the header is either the last `#` line
 /// (when, stripped of `#`, its field count matches the first data row — the
 /// MetaPhlAn style) or the first non-`#` line (a pure comment preamble).
-fn analyze_comment_header(path: &Path, delimiter: u8) -> Result<(u64, Vec<String>)> {
+fn analyze_comment_header(path: &Path, delimiter: u8) -> Result<CommentLayout> {
     let delim = delimiter as char;
     let count_fields = |s: &str| s.split(delim).count();
     let split_header = |s: &str| -> Vec<String> {
@@ -688,7 +761,11 @@ fn analyze_comment_header(path: &Path, delimiter: u8) -> Result<(u64, Vec<String
                 .as_deref()
                 .map(|c| split_header(c.strip_prefix('#').unwrap_or(c)))
                 .unwrap_or_default();
-            return Ok((offset, names));
+            return Ok(CommentLayout {
+                body_start: offset,
+                data_start: offset,
+                names,
+            });
         }
         let trimmed = line.trim_end_matches(['\n', '\r']);
         if trimmed.starts_with('#') {
@@ -701,11 +778,19 @@ fn analyze_comment_header(path: &Path, delimiter: u8) -> Result<(u64, Vec<String
             let stripped = comment.strip_prefix('#').unwrap_or(comment);
             if count_fields(stripped) > 1 && count_fields(stripped) == count_fields(trimmed) {
                 // MetaPhlAn style: this line is data, the header was the comment.
-                return Ok((offset, split_header(stripped)));
+                return Ok(CommentLayout {
+                    body_start: offset,
+                    data_start: offset,
+                    names: split_header(stripped),
+                });
             }
         }
         // Pure preamble: this line is the header; data starts after it.
-        return Ok((offset + n as u64, split_header(trimmed)));
+        return Ok(CommentLayout {
+            body_start: offset,
+            data_start: offset + n as u64,
+            names: split_header(trimmed),
+        });
     }
 }
 
@@ -724,13 +809,6 @@ fn infer_types_from(path: &Path, delimiter: u8, data_start: u64) -> Result<Vec<D
         .iter()
         .map(|f| f.data_type().clone())
         .collect())
-}
-
-/// Build the chunk byte-offset index for a headed file: skip the header row,
-/// then index the data rows that follow.
-fn build_csv_index(path: &Path) -> Result<(Vec<u64>, usize)> {
-    let data_start = first_record_end(path)?;
-    build_index_from(path, data_start)
 }
 
 /// Byte offset just past the first record (quote-aware), i.e. the start of the
@@ -807,28 +885,17 @@ fn build_index_from(path: &Path, data_start: u64) -> Result<(Vec<u64>, usize)> {
 /// stream, so there is no random access to seek by row range — and Excel caps a
 /// sheet at ~1M rows), which is exactly what [`Backend::Memory`] serves.
 /// Completely blank sheets are skipped rather than opened as empty tables.
-fn load_workbook(path: &Path) -> Result<Vec<Dataset>> {
+fn load_workbook(path: &Path, has_header: bool) -> Result<Vec<Dataset>> {
     let mut workbook = open_workbook_auto(path)
         .with_context(|| format!("opening workbook {}", path.display()))?;
-    let label = file_label(path);
     let mut sheets = Vec::new();
     for name in workbook.sheet_names() {
         let range = workbook
             .worksheet_range(&name)
             .with_context(|| format!("reading sheet {name} of {}", path.display()))?;
-        if range.is_empty() {
-            continue;
+        if let Some(dataset) = sheet_dataset(path, &name, &range, has_header)? {
+            sheets.push(dataset);
         }
-        let batch = sheet_batch(&range)
-            .with_context(|| format!("reading sheet {name} of {}", path.display()))?;
-        if batch.num_columns() == 0 {
-            continue;
-        }
-        sheets.push(Dataset::in_memory(
-            batch,
-            path.to_path_buf(),
-            format!("{label}[{name}]"),
-        ));
     }
     if sheets.is_empty() {
         anyhow::bail!("no sheet with data in {}", path.display());
@@ -836,24 +903,69 @@ fn load_workbook(path: &Path) -> Result<Vec<Dataset>> {
     Ok(sheets)
 }
 
-/// Turn one worksheet into a record batch: the first row of the used range
-/// gives the column names, the rest is data, and each column is typed from the
-/// values Excel reported (see [`sheet_array`]).
-fn sheet_batch(range: &Range<Data>) -> Result<RecordBatch> {
+/// Re-read a single named sheet, used when the header choice is flipped.
+fn load_sheet(path: &Path, sheet: &str, has_header: bool) -> Result<Dataset> {
+    let mut workbook = open_workbook_auto(path)
+        .with_context(|| format!("opening workbook {}", path.display()))?;
+    let range = workbook
+        .worksheet_range(sheet)
+        .with_context(|| format!("reading sheet {sheet} of {}", path.display()))?;
+    sheet_dataset(path, sheet, &range, has_header)?
+        .with_context(|| format!("sheet {sheet} holds no data"))
+}
+
+/// Turn one worksheet range into a dataset, or `None` when the sheet holds
+/// nothing worth a tab.
+fn sheet_dataset(
+    path: &Path,
+    name: &str,
+    range: &Range<Data>,
+    has_header: bool,
+) -> Result<Option<Dataset>> {
+    if range.is_empty() {
+        return Ok(None);
+    }
+    let batch = sheet_batch(range, has_header)
+        .with_context(|| format!("reading sheet {name} of {}", path.display()))?;
+    if batch.num_columns() == 0 {
+        return Ok(None);
+    }
+    Ok(Some(Dataset::in_memory(
+        batch,
+        path.to_path_buf(),
+        format!("{}[{name}]", file_label(path)),
+        Some(name.to_string()),
+        has_header,
+    )))
+}
+
+/// Turn one worksheet into a record batch. The first row of the used range
+/// gives the column names — which is what a spreadsheet almost always holds —
+/// unless `has_header` is false, in which case it is data and the columns are
+/// named positionally. Each column is typed from the values Excel reported
+/// (see [`sheet_array`]).
+fn sheet_batch(range: &Range<Data>, has_header: bool) -> Result<RecordBatch> {
     let mut rows = range.rows();
-    let Some(header) = rows.next() else {
+    let Some(first) = rows.next() else {
         return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
     };
-    let names: Vec<String> = header
+    let names: Vec<String> = first
         .iter()
         .enumerate()
         .map(|(i, cell)| {
-            cell_text(cell)
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| format!("column_{}", i + 1))
+            let positional = || format!("column_{}", i + 1);
+            if !has_header {
+                return positional();
+            }
+            cell_text(cell).filter(|name| !name.is_empty()).unwrap_or_else(positional)
         })
         .collect();
-    let body: Vec<&[Data]> = rows.collect();
+    // Without a header that first row is a data row like any other.
+    let body: Vec<&[Data]> = if has_header {
+        rows.collect()
+    } else {
+        std::iter::once(first).chain(rows).collect()
+    };
 
     let columns: Vec<ArrayRef> = (0..names.len())
         .map(|c| {

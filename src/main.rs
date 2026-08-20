@@ -20,6 +20,11 @@ struct Args {
     /// Paths to the data files to view; each one opens in its own tab.
     #[arg(required = true, num_args = 1..)]
     files: Vec<PathBuf>,
+
+    /// Treat the first row as data, not column names (columns become
+    /// `column_N`). Toggle it per tab with `T`. Ignored for parquet.
+    #[arg(long)]
+    no_header: bool,
 }
 
 /// Largest number of records turned into columns when transposing, so a huge
@@ -28,7 +33,7 @@ const TRANSPOSE_MAX_RECORDS: usize = 4096;
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let mut tabs = Tabs::open(&args.files)?;
+    let mut tabs = Tabs::open(&args.files, !args.no_header)?;
 
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut tabs);
@@ -47,10 +52,10 @@ struct Tabs {
 impl Tabs {
     /// Open one tab per table, failing before the TUI starts if any path won't
     /// load. A workbook contributes one tab per sheet that holds data.
-    fn open(paths: &[PathBuf]) -> Result<Self> {
+    fn open(paths: &[PathBuf], has_header: bool) -> Result<Self> {
         let mut tabs = Vec::with_capacity(paths.len());
         for path in paths {
-            let datasets = Dataset::load_all(path)
+            let datasets = Dataset::load_all(path, has_header)
                 .with_context(|| format!("loading {}", path.display()))?;
             tabs.extend(datasets.into_iter().map(|d| vec![App::new(d)]));
         }
@@ -93,6 +98,7 @@ impl Tabs {
         let switch = app.switch_tab.take();
         let close = std::mem::take(&mut app.close_tab);
         let open = app.open_request.take();
+        let toggle_header = std::mem::take(&mut app.toggle_header);
 
         if exit_transpose && self.tabs[self.current].len() > 1 {
             self.tabs[self.current].pop();
@@ -104,13 +110,17 @@ impl Tabs {
                 Err(e) => self.app_mut().status_msg = Some(format!("transpose failed: {e}")),
             }
         }
+        if toggle_header {
+            self.reload_header();
+        }
         if let Some(delta) = switch {
             let n = self.tabs.len() as isize;
             self.current = (((self.current as isize + delta) % n + n) % n) as usize;
         }
         if let Some(path) = open {
             let path = expand_home(&path);
-            match Dataset::load_all(&path) {
+            let has_header = self.app_mut().data.has_header;
+            match Dataset::load_all(&path, has_header) {
                 // A workbook lands as several tabs; the first one becomes current.
                 Ok(datasets) => {
                     let first = self.tabs.len();
@@ -129,6 +139,29 @@ impl Tabs {
             self.current = self.current.min(self.tabs.len() - 1);
         }
         true
+    }
+}
+
+impl Tabs {
+    /// Re-read the current tab's file with the first row switched between
+    /// column names and data. The schema changes (names, and the types of any
+    /// column the first row joins), so the tab starts from a fresh view rather
+    /// than trying to carry a cursor, filter or sort across the change.
+    fn reload_header(&mut self) {
+        let app = self.app_mut();
+        let want = !app.data.has_header;
+        match app.data.reload_with_header(want) {
+            Ok(dataset) => {
+                let mut view = App::new(dataset);
+                view.status_msg = Some(if want {
+                    "first row: column names".into()
+                } else {
+                    "first row: data".into()
+                });
+                self.tabs[self.current] = vec![view];
+            }
+            Err(e) => app.status_msg = Some(format!("header: {e}")),
+        }
     }
 }
 
@@ -353,8 +386,122 @@ mod tests {
     }
 
     #[test]
+    fn no_header_names_columns_positionally() {
+        let csv = "1,2,3\n4,5,6\n";
+        let path = write_text_fixture("csv", csv);
+        // With a header the first record names the columns and is not data.
+        let headed = Dataset::load(&path).unwrap();
+        assert_eq!(headed.column_names, vec!["1", "2", "3"]);
+        assert_eq!(headed.nrows, 1);
+        assert!(headed.has_header);
+        // Without one, every record is data and the names are positional.
+        let bare = Dataset::load_all(&path, false).unwrap().remove(0);
+        assert_eq!(bare.column_names, vec!["column_1", "column_2", "column_3"]);
+        assert_eq!(bare.nrows, 2);
+        assert!(!bare.has_header);
+        assert_eq!(bare.cell_display(0, 0).unwrap().as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn header_toggle_reloads_the_current_tab() {
+        let csv = "id,name\n1,alpha\n2,beta\n";
+        let mut tabs = Tabs::open(&[write_text_fixture("csv", csv)], true).unwrap();
+        assert_eq!(tabs.app_mut().row_count(), 2);
+
+        // `T` re-reads the file with the header row as data.
+        tabs.app_mut().handle_key(key('T'));
+        assert!(tabs.step());
+        assert!(!tabs.app_mut().data.has_header);
+        assert_eq!(tabs.app_mut().data.column_names, vec!["column_1", "column_2"]);
+        assert_eq!(tabs.app_mut().row_count(), 3, "the header row is now data");
+        assert_eq!(tabs.tabs.len(), 1, "toggling stays in the same tab");
+
+        // And back again.
+        tabs.app_mut().handle_key(key('T'));
+        assert!(tabs.step());
+        assert!(tabs.app_mut().data.has_header);
+        assert_eq!(tabs.app_mut().data.column_names, vec!["id", "name"]);
+        assert_eq!(tabs.app_mut().row_count(), 2);
+    }
+
+    #[test]
+    fn header_state_is_shown_and_declined_where_it_cannot_apply() {
+        // The status bar flags a headerless view.
+        let csv = "1,2\n3,4\n";
+        let path = write_text_fixture("csv", csv);
+        let mut bare = App::new(Dataset::load_all(&path, false).unwrap().remove(0));
+        let text = buffer_text(&mut bare, 100, 20);
+        assert!(text.contains("no header"), "missing marker: {text}");
+        assert!(text.contains("T header"), "missing hint: {text}");
+        let mut headed = App::new(Dataset::load(&path).unwrap());
+        assert!(!buffer_text(&mut headed, 100, 20).contains("no header"));
+
+        // Parquet carries its own names, so there is nothing to toggle.
+        let mut tabs = Tabs::open(&[fixture()], true).unwrap();
+        tabs.app_mut().handle_key(key('T'));
+        assert!(tabs.step());
+        let msg = tabs.app_mut().status_msg.clone().unwrap_or_default();
+        assert!(msg.contains("parquet"), "unexpected message: {msg}");
+        assert_eq!(tabs.app_mut().data.column_names, vec!["id", "name", "score"]);
+
+        // In a transposed view the file's own layout is not what is on screen.
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        app.is_transposed = true;
+        app.handle_key(key('T'));
+        assert!(!app.toggle_header);
+        assert!(app.status_msg.unwrap().contains("press t first"));
+    }
+
+    #[test]
+    fn no_header_still_skips_a_comment_block() {
+        // The `#` preamble is dropped either way; only the first data line moves.
+        let tsv = "# generated by something\nid\tname\n1\talpha\n";
+        let path = write_text_fixture("tsv", tsv);
+        let headed = Dataset::load(&path).unwrap();
+        assert_eq!(headed.column_names, vec!["id", "name"]);
+        assert_eq!(headed.nrows, 1);
+
+        let bare = Dataset::load_all(&path, false).unwrap().remove(0);
+        assert_eq!(bare.column_names, vec!["column_1", "column_2"]);
+        assert_eq!(bare.nrows, 2, "the id/name line is data now");
+        assert_eq!(bare.cell_display(0, 0).unwrap().as_deref(), Some("id"));
+    }
+
+    #[test]
+    fn xlsx_header_can_be_turned_off_per_sheet() {
+        let book = xlsx_fixture();
+        let sheets = Dataset::load_all(&book, false).unwrap();
+        let numbers = &sheets[0];
+        assert_eq!(
+            numbers.column_names,
+            vec!["column_1", "column_2", "column_3"]
+        );
+        // The header row is data now, so the id column is text, not Int64.
+        assert_eq!(numbers.nrows, 5);
+        assert_eq!(numbers.column_types[0], "Utf8");
+        assert_eq!(numbers.cell_display(0, 0).unwrap().as_deref(), Some("id"));
+        assert!(!numbers.has_header);
+
+        // Toggling a workbook tab reloads just that sheet, keeping the others.
+        let mut tabs = Tabs::open(&[book], true).unwrap();
+        tabs.app_mut().handle_key(code(KeyCode::Tab));
+        assert!(tabs.step());
+        tabs.app_mut().handle_key(key('T'));
+        assert!(tabs.step());
+        assert_eq!(tabs.tabs.len(), 2, "the other sheet's tab survives");
+        assert_eq!(tabs.current, 1);
+        assert!(!tabs.app_mut().data.has_header);
+        assert_eq!(tabs.app_mut().data.column_names, vec!["column_1", "column_2"]);
+        assert!(tabs.app_mut().data.label.ends_with("[Dates]"));
+        // The untouched sheet still has its header.
+        tabs.app_mut().handle_key(code(KeyCode::Tab));
+        assert!(tabs.step());
+        assert!(tabs.app_mut().data.has_header);
+    }
+
+    #[test]
     fn xlsx_opens_one_tab_per_sheet() {
-        let mut tabs = Tabs::open(&[xlsx_fixture()]).unwrap();
+        let mut tabs = Tabs::open(&[xlsx_fixture()], true).unwrap();
         assert_eq!(tabs.tabs.len(), 2, "the blank sheet earns no tab");
         let strip = tabs.strip();
         assert!(
@@ -387,7 +534,7 @@ mod tests {
 
     #[test]
     fn xlsx_dates_become_real_date_columns() {
-        let sheets = Dataset::load_all(&xlsx_fixture()).unwrap();
+        let sheets = Dataset::load_all(&xlsx_fixture(), true).unwrap();
         let dates = &sheets[1];
         // Date-formatted cells become dates; a time of day promotes to timestamp.
         assert_eq!(dates.column_types, vec!["Date32", "Timestamp(ms)"]);
@@ -438,7 +585,7 @@ mod tests {
         let mut path = std::env::temp_dir();
         path.push(format!("{}.dat", book.file_stem().unwrap().to_string_lossy()));
         std::fs::copy(&book, &path).unwrap();
-        let sheets = Dataset::load_all(&path).unwrap();
+        let sheets = Dataset::load_all(&path, true).unwrap();
         assert_eq!(sheets.len(), 2);
         assert_eq!(sheets[0].column_names, vec!["id", "name", "score"]);
     }
@@ -907,7 +1054,7 @@ mod tests {
 
     #[test]
     fn tabs_cycle_with_tab_and_back_tab() {
-        let mut tabs = Tabs::open(&[fixture(), fixture(), fixture()]).unwrap();
+        let mut tabs = Tabs::open(&[fixture(), fixture(), fixture()], true).unwrap();
         assert_eq!(tabs.tabs.len(), 3);
         assert_eq!(tabs.current, 0);
 
@@ -928,7 +1075,7 @@ mod tests {
 
     #[test]
     fn each_tab_keeps_its_own_view_state() {
-        let mut tabs = Tabs::open(&[fixture(), fixture()]).unwrap();
+        let mut tabs = Tabs::open(&[fixture(), fixture()], true).unwrap();
 
         // Transpose tab 0.
         tabs.app_mut().handle_key(key('t'));
@@ -957,7 +1104,7 @@ mod tests {
 
     #[test]
     fn open_adds_a_tab_and_ctrl_w_closes_it() {
-        let mut tabs = Tabs::open(&[fixture()]).unwrap();
+        let mut tabs = Tabs::open(&[fixture()], true).unwrap();
         let other = fixture();
 
         tabs.app_mut().handle_key(key('o'));
@@ -980,7 +1127,7 @@ mod tests {
 
     #[test]
     fn open_reports_a_bad_path_without_adding_a_tab() {
-        let mut tabs = Tabs::open(&[fixture()]).unwrap();
+        let mut tabs = Tabs::open(&[fixture()], true).unwrap();
         tabs.app_mut().handle_key(key('o'));
         type_str(tabs.app_mut(), "/no/such/file.parquet");
         tabs.app_mut().handle_key(code(KeyCode::Enter));
@@ -992,7 +1139,7 @@ mod tests {
 
     #[test]
     fn open_prompt_takes_a_literal_path_and_can_be_cancelled() {
-        let mut tabs = Tabs::open(&[fixture()]).unwrap();
+        let mut tabs = Tabs::open(&[fixture()], true).unwrap();
         // The prompt shows the typed path verbatim (no regex handling).
         tabs.app_mut().handle_key(key('o'));
         type_str(tabs.app_mut(), "some/file.csv");
@@ -1008,7 +1155,7 @@ mod tests {
     #[test]
     fn tab_strip_lists_the_open_files() {
         let paths = vec![fixture(), fixture()];
-        let mut tabs = Tabs::open(&paths).unwrap();
+        let mut tabs = Tabs::open(&paths, true).unwrap();
         let strip = tabs.strip();
         assert_eq!(strip.labels.len(), 2);
         let text = buffer_text_tabs(tabs.app_mut(), &strip, 120, 20);
@@ -1026,7 +1173,7 @@ mod tests {
     fn tab_strip_windows_to_keep_the_active_tab_visible() {
         // More tabs than fit: the strip scrolls so the active one is on screen.
         let paths: Vec<PathBuf> = (0..8).map(|_| fixture()).collect();
-        let mut tabs = Tabs::open(&paths).unwrap();
+        let mut tabs = Tabs::open(&paths, true).unwrap();
         tabs.current = 7;
         let strip = tabs.strip();
         let text = buffer_text_tabs(tabs.app_mut(), &strip, 40, 20);

@@ -20,6 +20,9 @@ cargo run --release -- first.parquet second.csv third.tsv
 
 # A workbook opens one tab per sheet.
 cargo run --release -- book.xlsx
+
+# Treat the first row as data rather than column names.
+cargo run --release -- --no-header data.csv
 ```
 
 ### Keys
@@ -45,6 +48,7 @@ cargo run --release -- book.xlsx
 | `Ctrl-w` | Close the current tab; closing the last one quits |
 | `%` | Numeric column: toggle decimal-point alignment + colouring by log magnitude |
 | `<` / `>` | Decrease / increase displayed decimals (also aligns on the dot, no colouring) |
+| `T` | Toggle whether the first row is column names or data (re-reads the file) |
 | `#` | Show/hide the row-number gutter |
 | `i` | Toggle info mode — the bottom line shows the selected column's name, Arrow type, and the full (untruncated) cell value |
 | `Esc` | Cancel a running operation; otherwise clear search, then filter, then quit |
@@ -81,6 +85,26 @@ Since a transposed view is itself just a table on that tab's stack, transposing
 in one tab leaves the others alone, and `t`/`Esc` pops only that tab's view
 rather than closing the tab.
 
+## The first row
+
+The first row is read as column names — which is what a spreadsheet or a CSV
+almost always holds — and there is no guessing: nothing scans the file trying to
+decide. When that is wrong, say so:
+
+- `--no-header` at startup, for every file opened, or
+- `T` in the viewer, which re-reads the current tab the other way.
+
+Without a header the first row becomes an ordinary data row and columns are
+named `column_1`, `column_2`, … The status bar shows `no header` while that is
+in effect.
+
+Because this changes the schema — the names, and the type of any column the
+first row joins (a numeric column gaining a text cell becomes text) — `T`
+re-reads the file and the tab starts from a fresh view, dropping any cursor
+position, filter or sort. It applies per tab, so one sheet of a workbook can be
+headerless while the others are not. It does nothing on parquet, which carries
+its own column names, and asks you to leave a transposed view first.
+
 ## Formats
 
 The format is autodetected from the file's magic number, falling back to the
@@ -101,8 +125,9 @@ extension:
 
 Each worksheet becomes its own tab, labelled `book.xlsx[Sheet2]`, so every
 command applies to a sheet exactly as it would to a CSV. The first row of a
-sheet's used range is the header; blank header cells get `column_N`. Sheets with
-no cells at all are skipped rather than opened as empty tabs.
+sheet's used range is the header (see [The first row](#the-first-row) to turn
+that off); blank header cells get `column_N`. Sheets with no cells at all are
+skipped rather than opened as empty tabs.
 
 Column types come from what Excel reported, so sorting and numeric styling
 behave:
@@ -130,7 +155,8 @@ format.
 Files that begin with `#` comment lines (MetaPhlAn and other bioinformatics
 tools) are handled automatically:
 
-- A leading block of `#` lines is skipped.
+- A leading block of `#` lines is skipped (with `--no-header`/`T` too — only
+  the header line itself becomes data).
 - If the **last** `#` line has the same number of columns as the data (e.g.
   MetaPhlAn's `#clade_name<TAB>…`), it is used as the header. Otherwise the
   comment block is treated as pure preamble and the first non-`#` line is the
