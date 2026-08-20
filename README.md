@@ -1,6 +1,6 @@
 # lambris
 
-A terminal viewer for parquet, CSV, and TSV files, in the manner of
+A terminal viewer for parquet, CSV/TSV, and Excel files, in the manner of
 [csvlens](https://github.com/YS-L/csvlens).
 
 Opens one or more data files — each in its own tab — and lets you scroll around
@@ -17,6 +17,9 @@ cargo run --release -- path/to/file.parquet
 
 # Several files at once, one tab each; Tab switches between them.
 cargo run --release -- first.parquet second.csv third.tsv
+
+# A workbook opens one tab per sheet.
+cargo run --release -- book.xlsx
 ```
 
 ### Keys
@@ -58,8 +61,8 @@ empty query clears that search/filter.
 
 ## Tabs
 
-Every file passed on the command line opens in its own tab, and `o` opens
-another one at any time (a path that fails to load leaves the tabs untouched
+Every file passed on the command line opens in its own tab (an Excel workbook
+opens one per sheet), and `o` opens another one at any time (a path that fails to load leaves the tabs untouched
 and reports why). `Tab` and `Shift-Tab` cycle through them, `Ctrl-w` closes the
 current one, and closing the last tab quits.
 
@@ -80,13 +83,47 @@ rather than closing the tab.
 
 ## Formats
 
-The format is autodetected:
+The format is autodetected from the file's magic number, falling back to the
+extension:
 
 - **Parquet** — recognised by its `PAR1` magic number.
+- **Excel / OpenDocument** — `.xlsx`, `.xlsm`, `.xlsb`, `.xls` and `.ods`, or
+  any file whose container says so (a ZIP header for the modern formats, the
+  OLE2 one for legacy `.xls`) even when the extension doesn't. Since neither
+  container can be delimited text, such a file is always read as a workbook,
+  and reports clearly if it turns out to hold something else.
 - **CSV / TSV** — anything else is read as delimited text. The delimiter comes
   from the extension (`.tsv`/`.tab` → tab, `.csv` → comma) or, for unknown
   extensions, is sniffed from the first non-comment line. The first row is
   treated as a header, and column types are inferred from a sample of the data.
+
+### Excel workbooks
+
+Each worksheet becomes its own tab, labelled `book.xlsx[Sheet2]`, so every
+command applies to a sheet exactly as it would to a CSV. The first row of a
+sheet's used range is the header; blank header cells get `column_N`. Sheets with
+no cells at all are skipped rather than opened as empty tabs.
+
+Column types come from what Excel reported, so sorting and numeric styling
+behave:
+
+- Whole numbers become `Int64`. Excel has no integer type — xlsx reports every
+  number as a float — so an id column shows `1`, not `1.0`; only genuinely
+  fractional columns stay `Float64`.
+- Date-formatted cells become real dates (`Date32`), or timestamps when any
+  cell carries a time of day. They sort chronologically, and `%` correctly
+  declines them as non-numeric.
+- Booleans stay boolean.
+- Blank cells and Excel **error** cells (`#DIV/0!`, `#REF!`, …) read as nulls,
+  shown as the usual highlighted `NA`.
+- A textual or genuinely mixed column (dates beside numbers, say) falls back to
+  the same string inference the CSV and transposed paths use — so numbers
+  stored as text still sort numerically, and nothing in the column is dropped.
+
+A worksheet is decoded in full rather than lazily: xlsx is a zipped XML stream
+with no way to seek to a row range, and Excel caps a sheet at ~1M rows anyway.
+It is then served from memory through the same chunk interface as every other
+format.
 
 ### Comment lines
 
@@ -106,7 +143,7 @@ data could be misread as a header.
 ## Scope
 
 Core viewer plus regex search, row filtering, type-aware sorting, column
-freeze, a transposed view, and tabs over several open files. Nulls are shown as a highlighted `NA`. Sort
+freeze, a transposed view, and tabs over several open files or workbook sheets. Nulls are shown as a highlighted `NA`. Sort
 composes with the active filter, and the cursor stays on the same record across
 a re-sort.
 
@@ -129,7 +166,8 @@ colouring). The status bar shows the active style (e.g. `num.3 log`).
 
 ## Big files
 
-Data is loaded lazily so memory stays bounded regardless of file size:
+Data is loaded lazily so memory stays bounded regardless of file size (Excel
+excepted — a worksheet is fully resident, see above):
 
 - The file is read in **chunks** of 8192 rows, decoded on demand and kept in a
   small **LRU cache** — only the rows you're near are resident.
@@ -153,6 +191,26 @@ for the visible window using Arrow's `ArrayFormatter`.
 cargo test    # headless render + navigation tests (build their own fixture)
 cargo build
 ```
+
+### Installing
+
+`cargo install --path .` drops the binary in `~/.cargo/bin`. If you copy it
+somewhere yourself instead, **replace the old one rather than overwriting it**:
+
+```sh
+rm -f /usr/local/bin/lambris && cp target/release/lambris /usr/local/bin/
+```
+
+macOS enforces code signatures on every binary, and an installed copy can end
+up in a state where the kernel rejects it: it is `Killed: 9` (SIGKILL) on *every*
+run — including `--version`, which opens no file at all — even though the file is
+byte-for-byte identical to a `target/release/lambris` that runs fine. Overwriting
+the installed binary in place is what triggered it here.
+
+If it happens, `rm` the binary and copy it again (a fresh file, not an overwrite),
+or repair it in place with `codesign -f -s - <path>`. The giveaway is that the
+same bytes run from one path but not another — if `--version` is killed, the
+problem is the binary, not the file you were trying to open.
 
 ## License
 

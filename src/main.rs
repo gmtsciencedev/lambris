@@ -12,7 +12,8 @@ use crossterm::event::{self, Event, KeyEventKind};
 use app::App;
 use data::Dataset;
 
-/// A terminal parquet file viewer, in the manner of csvlens.
+/// A terminal viewer for parquet, CSV/TSV and Excel files, in the manner of
+/// csvlens.
 #[derive(Parser)]
 #[command(name = "lambris", version, about)]
 struct Args {
@@ -44,13 +45,17 @@ struct Tabs {
 }
 
 impl Tabs {
-    /// Open one tab per path, failing before the TUI starts if any won't load.
+    /// Open one tab per table, failing before the TUI starts if any path won't
+    /// load. A workbook contributes one tab per sheet that holds data.
     fn open(paths: &[PathBuf]) -> Result<Self> {
         let mut tabs = Vec::with_capacity(paths.len());
         for path in paths {
-            let dataset = Dataset::load(path)
+            let datasets = Dataset::load_all(path)
                 .with_context(|| format!("loading {}", path.display()))?;
-            tabs.push(vec![App::new(dataset)]);
+            tabs.extend(datasets.into_iter().map(|d| vec![App::new(d)]));
+        }
+        if tabs.is_empty() {
+            anyhow::bail!("nothing to show");
         }
         Ok(Self { tabs, current: 0 })
     }
@@ -105,10 +110,13 @@ impl Tabs {
         }
         if let Some(path) = open {
             let path = expand_home(&path);
-            match Dataset::load(&path) {
-                Ok(dataset) => {
-                    self.tabs.push(vec![App::new(dataset)]);
-                    self.current = self.tabs.len() - 1;
+            match Dataset::load_all(&path) {
+                // A workbook lands as several tabs; the first one becomes current.
+                Ok(datasets) => {
+                    let first = self.tabs.len();
+                    self.tabs
+                        .extend(datasets.into_iter().map(|d| vec![App::new(d)]));
+                    self.current = first.min(self.tabs.len() - 1);
                 }
                 Err(e) => self.app_mut().status_msg = Some(format!("open failed: {e}")),
             }
@@ -274,6 +282,165 @@ mod tests {
             s.push_str(&format!("{i},r{i}\n"));
         }
         write_text_fixture("csv", &s)
+    }
+
+    /// Write a three-sheet xlsx workbook to a unique temp path.
+    /// `Numbers` has typed columns plus a blank cell and a `#DIV/0!` error,
+    /// `Dates` a pure-date column and one carrying a time of day, and `Blank`
+    /// is left completely empty.
+    fn xlsx_fixture() -> PathBuf {
+        use rust_xlsxwriter::{ExcelDateTime, Format, Formula, Workbook};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_worksheet();
+        sheet.set_name("Numbers").unwrap();
+        for (c, name) in ["id", "name", "score"].iter().enumerate() {
+            sheet.write_string(0, c as u16, *name).unwrap();
+        }
+        for (i, (id, name, score)) in [(1, "alpha", 3.5), (2, "beta", 10.25), (3, "gamma", 0.5)]
+            .iter()
+            .enumerate()
+        {
+            let r = i as u32 + 1;
+            sheet.write_number(r, 0, *id as f64).unwrap();
+            sheet.write_string(r, 1, *name).unwrap();
+            sheet.write_number(r, 2, *score).unwrap();
+        }
+        // Fourth row: the name cell is left blank and the score is an Excel error.
+        sheet.write_number(4, 0, 4.0).unwrap();
+        sheet
+            .write_formula(4, 2, Formula::new("=1/0").set_result("#DIV/0!"))
+            .unwrap();
+
+        let day_fmt = Format::new().set_num_format("yyyy\\-mm\\-dd");
+        let moment_fmt = Format::new().set_num_format("yyyy\\-mm\\-dd\\ hh:mm");
+        let sheet = workbook.add_worksheet();
+        sheet.set_name("Dates").unwrap();
+        sheet.write_string(0, 0, "day").unwrap();
+        sheet.write_string(0, 1, "moment").unwrap();
+        for (i, day) in [31u8, 1].iter().enumerate() {
+            let r = i as u32 + 1;
+            let month = if i == 0 { 1 } else { 2 };
+            sheet
+                .write_datetime_with_format(
+                    r,
+                    0,
+                    ExcelDateTime::from_ymd(2024, month, *day).unwrap(),
+                    &day_fmt,
+                )
+                .unwrap();
+            sheet
+                .write_datetime_with_format(
+                    r,
+                    1,
+                    ExcelDateTime::from_ymd(2024, month, *day)
+                        .unwrap()
+                        .and_hms(12, 30, 0)
+                        .unwrap(),
+                    &moment_fmt,
+                )
+                .unwrap();
+        }
+        workbook.add_worksheet().set_name("Blank").unwrap();
+
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!("lambris_test_book_{n}.xlsx"));
+        workbook.save(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn xlsx_opens_one_tab_per_sheet() {
+        let mut tabs = Tabs::open(&[xlsx_fixture()]).unwrap();
+        assert_eq!(tabs.tabs.len(), 2, "the blank sheet earns no tab");
+        let strip = tabs.strip();
+        assert!(
+            strip.labels[0].ends_with("[Numbers]") && strip.labels[1].ends_with("[Dates]"),
+            "sheets should label their tabs: {:?}",
+            strip.labels
+        );
+        // The sheets are ordinary tabs: Tab moves between them.
+        tabs.app_mut().handle_key(code(KeyCode::Tab));
+        assert!(tabs.step());
+        assert_eq!(tabs.current, 1);
+        assert_eq!(tabs.app_mut().data.column_names, vec!["day", "moment"]);
+    }
+
+    #[test]
+    fn xlsx_columns_keep_their_excel_types() {
+        let ds = Dataset::load(&xlsx_fixture()).unwrap(); // first sheet: Numbers
+        assert_eq!(ds.column_names, vec!["id", "name", "score"]);
+        assert_eq!(ds.nrows, 4);
+        // Excel reports every number as a float; whole ones read back as Int64,
+        // so an id column shows `1` rather than `1.0`.
+        assert_eq!(ds.column_types, vec!["Int64", "Utf8", "Float64"]);
+        assert_eq!(ds.cell_display(0, 0).unwrap().as_deref(), Some("1"));
+        assert_eq!(ds.cell_display(2, 1).unwrap().as_deref(), Some("10.25"));
+        assert!(ds.is_numeric(0) && ds.is_numeric(2));
+        // A blank cell and an Excel error cell both read as null (shown as NA).
+        assert!(ds.is_null(1, 3), "blank cell should be null");
+        assert!(ds.is_null(2, 3), "#DIV/0! should be null");
+    }
+
+    #[test]
+    fn xlsx_dates_become_real_date_columns() {
+        let sheets = Dataset::load_all(&xlsx_fixture()).unwrap();
+        let dates = &sheets[1];
+        // Date-formatted cells become dates; a time of day promotes to timestamp.
+        assert_eq!(dates.column_types, vec!["Date32", "Timestamp(ms)"]);
+        assert_eq!(dates.cell_display(0, 0).unwrap().as_deref(), Some("2024-01-31"));
+        assert_eq!(
+            dates.cell_display(1, 0).unwrap().as_deref(),
+            Some("2024-01-31T12:30:00")
+        );
+        // Dates are not numeric, so `%` correctly declines them.
+        assert!(!dates.is_numeric(0) && !dates.is_numeric(1));
+    }
+
+    #[test]
+    fn xlsx_sheet_behaves_like_a_normal_table() {
+        let mut app = App::new(Dataset::load(&xlsx_fixture()).unwrap());
+
+        // Sorting a float column orders it numerically, nulls aside.
+        app.selected_col = 2;
+        app.handle_key(key('s'));
+        let ordered: Vec<f64> = app
+            .data
+            .cells(2, &app.view_rows(10))
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .map(|v| v.parse::<f64>().unwrap())
+            .collect();
+        assert_eq!(ordered, vec![0.5, 3.5, 10.25], "sorted ascending by score");
+
+        // Filtering streams the in-memory sheet like any other backend.
+        app.handle_key(key('&'));
+        type_str(&mut app, "beta");
+        app.handle_key(code(KeyCode::Enter));
+        assert_eq!(app.row_count(), 1);
+        assert_eq!(app.data.cell_display(1, app.selected_orig()).unwrap().as_deref(), Some("beta"));
+
+        // And it transposes like any other table.
+        app.handle_key(code(KeyCode::Esc));
+        let view = transposed_view(&app).unwrap();
+        assert!(view.is_transposed);
+        assert_eq!(view.data.ncols, 5, "field column plus one per record");
+    }
+
+    #[test]
+    fn workbook_detected_from_its_magic_number() {
+        // No useful extension: the ZIP container still identifies a workbook.
+        let book = xlsx_fixture();
+        let mut path = std::env::temp_dir();
+        path.push(format!("{}.dat", book.file_stem().unwrap().to_string_lossy()));
+        std::fs::copy(&book, &path).unwrap();
+        let sheets = Dataset::load_all(&path).unwrap();
+        assert_eq!(sheets.len(), 2);
+        assert_eq!(sheets[0].column_names, vec!["id", "name", "score"]);
     }
 
     fn buffer_text(app: &mut App, w: u16, h: u16) -> String {

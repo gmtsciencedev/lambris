@@ -5,13 +5,20 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use arrow::array::{make_comparator, Array, ArrayRef, Float64Array, Int64Array, StringArray};
+use arrow::array::{
+    make_comparator, Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array,
+    StringArray, TimestampMillisecondArray,
+};
 use arrow::compute::SortOptions;
 use arrow::csv::reader::Format as CsvFormat;
 use arrow::csv::ReaderBuilder as CsvReaderBuilder;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
+// `DataType` is imported anonymously: it carries the cell accessors we need
+// (`as_datetime`), and the name would collide with Arrow's own `DataType`.
+use calamine::{open_workbook_auto, Data, DataType as _, Range, Reader};
+use chrono::{NaiveDate, NaiveTime};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use regex::Regex;
 
@@ -37,9 +44,12 @@ enum Backend {
     Memory(Arc<RecordBatch>),
 }
 
-/// A lazily-loaded view of a parquet or CSV/TSV file. Only the schema, some
-/// metadata, and a bounded LRU cache of decoded chunks live in memory; cells
-/// are fetched on demand. Everything above this layer is format-agnostic.
+/// A lazily-loaded view of one table: a parquet or CSV/TSV file, or a single
+/// worksheet of an Excel workbook. For the lazy formats only the schema, some
+/// metadata, and a bounded LRU cache of decoded chunks live in memory and cells
+/// are fetched on demand; a worksheet has no seekable structure, so it is
+/// decoded once and served from memory. Everything above this layer is
+/// format-agnostic.
 pub struct Dataset {
     pub path: PathBuf,
     /// Name shown in the title bar (the file name, or a transposed label).
@@ -54,12 +64,36 @@ pub struct Dataset {
 }
 
 impl Dataset {
-    /// Autodetect the file format and prepare it for lazy access. Reads only
-    /// metadata (parquet) or builds a byte-offset index (CSV) — not the data.
+    /// Autodetect the file format and open every table the file holds: one per
+    /// worksheet for an Excel workbook, and exactly one for anything else.
+    pub fn load_all(path: &Path) -> Result<Vec<Self>> {
+        match detect_source(path)? {
+            Source::Excel => load_workbook(path),
+            source => Ok(vec![Self::from_source(path, source)?]),
+        }
+    }
+
+    /// Open a file as a single table; a workbook yields its first sheet with
+    /// data. Prefer [`Dataset::load_all`] when every sheet should be shown.
+    // Used throughout the tests, where one table per file is the norm.
+    #[allow(dead_code)]
     pub fn load(path: &Path) -> Result<Self> {
-        let (backend, schema, nrows) = match detect_source(path)? {
+        let mut all = Self::load_all(path)?;
+        if all.is_empty() {
+            anyhow::bail!("{} holds no data", path.display());
+        }
+        Ok(all.remove(0))
+    }
+
+    /// Prepare a single-table format for lazy access. Reads only metadata
+    /// (parquet) or builds a byte-offset index (CSV) — never the data.
+    fn from_source(path: &Path, source: Source) -> Result<Self> {
+        let (backend, schema, nrows) = match source {
             Source::Parquet => load_parquet_meta(path)?,
             Source::Delimited(delim) => load_csv_meta(path, delim)?,
+            // Workbooks go through `load_workbook`: a sheet is fully decoded
+            // into memory, so there is no lazy backend to set up here.
+            Source::Excel => unreachable!("workbooks are opened per sheet"),
         };
         let column_names = schema.fields().iter().map(|f| f.name().clone()).collect();
         let column_types = schema
@@ -68,10 +102,7 @@ impl Dataset {
             .map(|f| f.data_type().to_string())
             .collect();
         let ncols = schema.fields().len();
-        let label = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
+        let label = file_label(path);
         Ok(Self {
             path: path.to_path_buf(),
             label,
@@ -482,17 +513,29 @@ enum Source {
     Parquet,
     /// Delimited text with the given field separator (`,` or `\t`).
     Delimited(u8),
+    /// An Excel (or OpenDocument) workbook, read one sheet at a time.
+    Excel,
 }
 
-/// Autodetect the format: parquet files carry a `PAR1` magic number, so trust
-/// that; otherwise treat the file as delimited text and pick the separator
-/// from the extension (`.tsv`/`.tab` → tab) or by sniffing the first line.
+/// A ZIP container: xlsx, xlsm and ods all start with it.
+const ZIP_MAGIC: &[u8] = b"PK\x03\x04";
+/// The OLE2 compound-file header of legacy `.xls` workbooks.
+const OLE2_MAGIC: &[u8] = &[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+
+/// Autodetect the format from the file's magic number, falling back to the
+/// extension. Parquet carries `PAR1`; workbooks are either a ZIP container
+/// (xlsx/xlsm/ods) or the OLE2 one (xls), and since neither can be delimited
+/// text they are handed to the workbook reader — which reports clearly if the
+/// container turns out to hold something else. Everything else is read as
+/// delimited text, with the separator taken from the extension
+/// (`.tsv`/`.tab` → tab) or sniffed from the first line.
 fn detect_source(path: &Path) -> Result<Source> {
     let mut file =
         File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut magic = [0u8; 4];
+    let mut magic = [0u8; 8];
     let read = file.read(&mut magic).unwrap_or(0);
-    if read == 4 && &magic == b"PAR1" {
+    let magic = &magic[..read];
+    if magic.starts_with(b"PAR1") {
         return Ok(Source::Parquet);
     }
     let ext = path
@@ -500,12 +543,26 @@ fn detect_source(path: &Path) -> Result<Source> {
         .and_then(|e| e.to_str())
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
+    let is_workbook_ext = matches!(
+        ext.as_str(),
+        "xlsx" | "xlsm" | "xlsb" | "xlam" | "xla" | "xls" | "ods"
+    );
+    if is_workbook_ext || magic.starts_with(ZIP_MAGIC) || magic.starts_with(OLE2_MAGIC) {
+        return Ok(Source::Excel);
+    }
     let delimiter = match ext.as_str() {
         "tsv" | "tab" => b'\t',
         "csv" => b',',
         _ => sniff_delimiter(path)?,
     };
     Ok(Source::Delimited(delimiter))
+}
+
+/// The file name, shown in the title bar and the tab strip.
+fn file_label(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 /// Guess the delimiter of an unknown text file from its first non-comment
@@ -743,6 +800,192 @@ fn build_index_from(path: &Path, data_start: u64) -> Result<(Vec<u64>, usize)> {
         rows += 1;
     }
     Ok((offsets, rows))
+}
+
+/// Read a workbook and turn every sheet that holds data into its own dataset,
+/// labelled `file[sheet]`. A sheet is decoded in full (xlsx is a zipped XML
+/// stream, so there is no random access to seek by row range — and Excel caps a
+/// sheet at ~1M rows), which is exactly what [`Backend::Memory`] serves.
+/// Completely blank sheets are skipped rather than opened as empty tables.
+fn load_workbook(path: &Path) -> Result<Vec<Dataset>> {
+    let mut workbook = open_workbook_auto(path)
+        .with_context(|| format!("opening workbook {}", path.display()))?;
+    let label = file_label(path);
+    let mut sheets = Vec::new();
+    for name in workbook.sheet_names() {
+        let range = workbook
+            .worksheet_range(&name)
+            .with_context(|| format!("reading sheet {name} of {}", path.display()))?;
+        if range.is_empty() {
+            continue;
+        }
+        let batch = sheet_batch(&range)
+            .with_context(|| format!("reading sheet {name} of {}", path.display()))?;
+        if batch.num_columns() == 0 {
+            continue;
+        }
+        sheets.push(Dataset::in_memory(
+            batch,
+            path.to_path_buf(),
+            format!("{label}[{name}]"),
+        ));
+    }
+    if sheets.is_empty() {
+        anyhow::bail!("no sheet with data in {}", path.display());
+    }
+    Ok(sheets)
+}
+
+/// Turn one worksheet into a record batch: the first row of the used range
+/// gives the column names, the rest is data, and each column is typed from the
+/// values Excel reported (see [`sheet_array`]).
+fn sheet_batch(range: &Range<Data>) -> Result<RecordBatch> {
+    let mut rows = range.rows();
+    let Some(header) = rows.next() else {
+        return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
+    };
+    let names: Vec<String> = header
+        .iter()
+        .enumerate()
+        .map(|(i, cell)| {
+            cell_text(cell)
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| format!("column_{}", i + 1))
+        })
+        .collect();
+    let body: Vec<&[Data]> = rows.collect();
+
+    let columns: Vec<ArrayRef> = (0..names.len())
+        .map(|c| {
+            let values: Vec<&Data> = body
+                .iter()
+                .map(|row| row.get(c).unwrap_or(&Data::Empty))
+                .collect();
+            sheet_array(&values)
+        })
+        .collect();
+    let fields: Vec<Field> = names
+        .iter()
+        .zip(&columns)
+        .map(|(n, a)| Field::new(n, a.data_type().clone(), true))
+        .collect();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .context("building sheet batch")
+}
+
+/// Build one column from its cells, keeping the type Excel gave them so that
+/// sorting and numeric styling behave: a column of integers stays Int64, mixed
+/// integers and floats become Float64, booleans stay boolean, and dates become
+/// a real date (or timestamp, when any cell carries a time of day). Anything
+/// textual or mixed falls back to the same string inference the CSV and
+/// transposed paths use, so numbers stored as text still sort numerically.
+/// Blank cells and Excel error cells (`#REF!`, `#DIV/0!`) become nulls.
+fn sheet_array(values: &[&Data]) -> ArrayRef {
+    let (mut ints, mut floats, mut bools, mut dates, mut texts) = (0, 0, 0, 0, 0);
+    for value in values {
+        match value {
+            Data::Int(_) => ints += 1,
+            Data::Float(_) => floats += 1,
+            Data::Bool(_) => bools += 1,
+            Data::DateTime(_) | Data::DateTimeIso(_) => dates += 1,
+            Data::String(_) | Data::DurationIso(_) => texts += 1,
+            Data::Error(_) | Data::Empty => {}
+        }
+    }
+    let present = ints + floats + bools + dates + texts;
+    if present > 0 && texts == 0 {
+        if dates == present {
+            // Falls through to text if none of the cells actually converts.
+            if let Some(array) = sheet_dates(values) {
+                return array;
+            }
+        } else if bools == present {
+            let a: BooleanArray = values
+                .iter()
+                .map(|v| match v {
+                    Data::Bool(b) => Some(*b),
+                    _ => None,
+                })
+                .collect();
+            return Arc::new(a);
+        } else if ints + floats == present {
+            let numbers: Vec<Option<f64>> = values
+                .iter()
+                .map(|v| match v {
+                    Data::Int(i) => Some(*i as f64),
+                    Data::Float(f) => Some(*f),
+                    _ => None,
+                })
+                .collect();
+            // Excel has no integer type — xlsx reports every number as a float
+            // — so a column of whole numbers becomes Int64, which is what Excel
+            // itself displays. Only genuinely fractional columns stay Float64.
+            if numbers.iter().flatten().copied().all(is_whole) {
+                let a: Int64Array = numbers.iter().map(|v| v.map(|v| v as i64)).collect();
+                return Arc::new(a);
+            }
+            let a: Float64Array = numbers.into_iter().collect();
+            return Arc::new(a);
+        }
+        // Anything else is a genuine mix (dates beside numbers, say), which
+        // falls through to the text path rather than nulling half the column.
+    }
+    let text: Vec<Option<String>> = values.iter().map(|v| cell_text(v)).collect();
+    infer_array(&text)
+}
+
+/// Whether a float is a whole number small enough to hold exactly in an i64.
+fn is_whole(v: f64) -> bool {
+    // 2^53 — beyond this, f64 can no longer represent every integer.
+    v.fract() == 0.0 && v.abs() <= 9_007_199_254_740_992.0
+}
+
+/// A column of date cells as a `Date32` array, or a millisecond timestamp one
+/// when any cell carries a time of day. `None` if no cell converts at all
+/// (e.g. a column of durations), leaving the caller to fall back to text.
+fn sheet_dates(values: &[&Data]) -> Option<ArrayRef> {
+    let stamps: Vec<Option<chrono::NaiveDateTime>> =
+        values.iter().map(|v| v.as_datetime()).collect();
+    if stamps.iter().all(Option::is_none) {
+        return None;
+    }
+    if stamps
+        .iter()
+        .flatten()
+        .all(|d| d.time() == NaiveTime::MIN)
+    {
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)?;
+        let a: Date32Array = stamps
+            .iter()
+            .map(|d| d.map(|d| d.date().signed_duration_since(epoch).num_days() as i32))
+            .collect();
+        return Some(Arc::new(a));
+    }
+    let a: TimestampMillisecondArray = stamps
+        .iter()
+        .map(|d| d.map(|d| d.and_utc().timestamp_millis()))
+        .collect();
+    Some(Arc::new(a))
+}
+
+/// One cell as display text, trimmed. `None` for blanks and error cells — the
+/// viewer shows those as `NA`, like any other null. Dates are rendered in ISO
+/// form so a mixed column stays readable instead of showing Excel's serial.
+fn cell_text(cell: &Data) -> Option<String> {
+    let text = match cell {
+        Data::Empty | Data::Error(_) => return None,
+        Data::String(s) => s.trim().to_string(),
+        Data::Int(i) => i.to_string(),
+        Data::Float(f) => f.to_string(),
+        Data::Bool(b) => b.to_string(),
+        Data::DateTime(_) | Data::DateTimeIso(_) => match cell.as_datetime() {
+            Some(d) if d.time() == NaiveTime::MIN => d.format("%Y-%m-%d").to_string(),
+            Some(d) => d.format("%Y-%m-%d %H:%M:%S").to_string(),
+            None => cell.to_string(),
+        },
+        Data::DurationIso(s) => s.trim().to_string(),
+    };
+    (!text.is_empty()).then_some(text)
 }
 
 /// Build a typed array from string values, inferring Int64 → Float64 → Utf8

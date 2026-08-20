@@ -50,7 +50,13 @@ pub fn render(frame: &mut Frame, app: &mut App, tabs: &TabStrip) -> Result<()> {
     render_help(frame, help_area, app);
 
     if app.row_count() == 0 {
-        let msg = Paragraph::new("— no rows match the filter —")
+        // A sheet or file can legitimately hold only a header row, so say which
+        // kind of emptiness this is.
+        let text = match app.filter_query {
+            Some(_) => "— no rows match the filter —",
+            None => "— no rows —",
+        };
+        let msg = Paragraph::new(text)
             .style(Style::new().fg(Color::Yellow))
             .alignment(Alignment::Center);
         frame.render_widget(msg, body_area);
