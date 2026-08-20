@@ -8,6 +8,7 @@ use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::app::{App, InputKind, Mode, NumStyle, SortDir};
+use crate::browse::{Completions, VISIBLE};
 
 /// The full key reference shown by `?`, grouped into sections. Kept as data so
 /// the page can grow into tabbed pages later without touching the renderer.
@@ -57,6 +58,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Tab / Shift-Tab", "next / previous tab (a workbook opens one per sheet)"),
             ("o", "open another file in a new tab"),
+            ("  Tab", "in that prompt: list the folder, then ↑/↓ and Enter"),
             ("Ctrl-w", "close this tab; closing the last one quits"),
         ],
     ),
@@ -131,21 +133,91 @@ pub fn render(frame: &mut Frame, app: &mut App, tabs: &TabStrip) -> Result<()> {
             .style(Style::new().fg(Color::Yellow))
             .alignment(Alignment::Center);
         frame.render_widget(msg, body_area);
-        return Ok(());
+    } else {
+        // Keep the selected row inside the vertical viewport.
+        if app.selected_row < app.row_offset {
+            app.row_offset = app.selected_row;
+        } else if app.selected_row >= app.row_offset + app.viewport_rows {
+            app.row_offset = app.selected_row + 1 - app.viewport_rows;
+        }
+        let row_start = app.row_offset;
+        let row_end = (row_start + app.viewport_rows).min(app.row_count());
+        let visible_view: Vec<usize> = (row_start..row_end).collect();
+
+        render_table(frame, body_area, app, &visible_view)?;
     }
 
-    // Keep the selected row inside the vertical viewport.
-    if app.selected_row < app.row_offset {
-        app.row_offset = app.selected_row;
-    } else if app.selected_row >= app.row_offset + app.viewport_rows {
-        app.row_offset = app.selected_row + 1 - app.viewport_rows;
+    // The path picker sits over the table, just above its prompt.
+    if let Some(listing) = &app.completions {
+        render_completions(frame, body_area, listing);
     }
-    let row_start = app.row_offset;
-    let row_end = (row_start + app.viewport_rows).min(app.row_count());
-    let visible_view: Vec<usize> = (row_start..row_end).collect();
-
-    render_table(frame, body_area, app, &visible_view)?;
     Ok(())
+}
+
+/// The listed directory as a box title, trimmed from the *left* when it does
+/// not fit: the deep end of a path is the part that identifies it.
+fn dir_title(dir: &std::path::Path, width: u16) -> String {
+    let text = dir.display().to_string();
+    let budget = (width as usize).saturating_sub(4);
+    let len = text.chars().count();
+    if len <= budget {
+        return format!(" {text} ");
+    }
+    let tail: String = text.chars().skip(len + 1 - budget.max(1)).collect();
+    format!(" …{tail} ")
+}
+
+/// Draw the open prompt's path picker: the folder being listed and its entries,
+/// anchored to the bottom of the table so it sits right above the prompt.
+fn render_completions(frame: &mut Frame, area: Rect, listing: &Completions) {
+    let rows = if listing.is_empty() {
+        1
+    } else {
+        listing.entries.len().min(VISIBLE)
+    };
+    // Two lines of border, and never taller than the space available.
+    let height = (rows as u16 + 2).min(area.height);
+    let box_area = Rect {
+        x: area.x,
+        y: area.y + area.height - height,
+        width: area.width,
+        height,
+    };
+
+    let (start, visible) = listing.window(height.saturating_sub(2) as usize);
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(note) = &listing.note {
+        lines.push(Line::from(Span::styled(
+            format!(" {note}"),
+            Style::new().fg(Color::Yellow),
+        )));
+    }
+    for (i, entry) in visible.iter().enumerate() {
+        let selected = start + i == listing.selected;
+        let colour = if entry.is_dir { Color::Cyan } else { Color::White };
+        let mut style = Style::new().fg(colour);
+        if selected {
+            style = style.add_modifier(Modifier::REVERSED).bold();
+        }
+        lines.push(Line::from(Span::styled(format!(" {}", entry.label()), style)));
+    }
+
+    // Show how many entries are hidden, so a long folder doesn't mislead.
+    let counted = if listing.entries.len() > visible.len() {
+        format!(
+            " {}/{} ",
+            listing.selected + 1,
+            listing.entries.len()
+        )
+    } else {
+        String::new()
+    };
+    let block = Block::bordered()
+        .title(dir_title(&listing.dir, box_area.width))
+        .title_bottom(counted)
+        .border_style(Style::new().fg(Color::DarkGray));
+    frame.render_widget(Clear, box_area);
+    frame.render_widget(Paragraph::new(lines).block(block), box_area);
 }
 
 fn render_title(frame: &mut Frame, area: Rect, app: &App, tabs: &TabStrip) {
@@ -649,6 +721,10 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
 /// the selected column's info when info mode (`i`) is on.
 fn render_help(frame: &mut Frame, area: Rect, app: &App) {
     let line = match app.mode {
+        Mode::Input(InputKind::Open) => Line::from(Span::styled(
+            " Tab: list folder · ↑/↓: pick · Enter: open · Esc: back",
+            Style::new().dim(),
+        )),
         Mode::Input(_) => Line::from(Span::styled(
             " Enter: apply · Esc: cancel",
             Style::new().dim(),

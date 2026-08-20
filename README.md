@@ -4,11 +4,11 @@ A terminal viewer for parquet, CSV/TSV, and Excel files, in the manner of
 [csvlens](https://github.com/YS-L/csvlens).
 
 Opens one or more data files — each in its own tab — and lets you scroll around
-them in a TUI — a header row with
-column names, a row-number gutter, a status bar showing the selected cell's column
-name and Arrow type, and truncation of wide values. Null values render as a
-highlighted `NA`. Supports global regex search (`/`), column-scoped search
-(`-`), and row filtering (`&`).
+them in a TUI: a header row with column names, a row-number gutter, a status bar
+showing the selected cell's column name and Arrow type, and truncation of wide
+values. Null values render as a highlighted `NA`. Supports global regex search
+(`/`), column-scoped search (`-`), and row filtering (`&`). Press `?` for the
+full key reference.
 
 ## Usage
 
@@ -44,7 +44,7 @@ cargo run --release -- --no-header data.csv
 | `f` | Freeze columns `0..=selected` (pinned while scrolling); press again to unfreeze |
 | `t` | Transpose the table (first column becomes the headers); `t`/`Esc` to return |
 | `Tab` / `Shift-Tab` | Switch to the next / previous tab (wraps around) |
-| `o` | Open another file in a new tab (prompts for a path; `~/` is expanded) |
+| `o` | Open another file in a new tab; at the prompt `Tab` browses the folder |
 | `Ctrl-w` | Close the current tab; closing the last one quits |
 | `%` | Numeric column: toggle decimal-point alignment + colouring by log magnitude |
 | `<` / `>` | Decrease / increase displayed decimals (also aligns on the dot, no colouring) |
@@ -72,6 +72,29 @@ Every file passed on the command line opens in its own tab (an Excel workbook
 opens one per sheet), and `o` opens another one at any time (a path that fails to load leaves the tabs untouched
 and reports why). `Tab` and `Shift-Tab` cycle through them, `Ctrl-w` closes the
 current one, and closing the last tab quits.
+
+At the `o` prompt, `Tab` lists the folder of the file you are looking at, over
+the table:
+
+```
+┌ /data/cohort ─────────────────────┐
+│ nested/                           │
+│ alpha.csv                         │
+│ beta.tsv                          │
+└ 1/3 ──────────────────────────────┘
+open ▏
+```
+
+Directories come first and are marked with a `/`. `Tab` again (or `↑`/`↓`) walks
+the list, `Enter` steps into a directory or opens a file, and `Esc` puts the
+listing away without leaving the prompt. Typing narrows the list as you go, and
+`Tab` on a unique match completes it outright — so `bet` + `Tab` fills in
+`beta.tsv` and `Enter` opens it. Hidden files stay hidden until you type a
+leading `.`.
+
+Paths are taken relative to the folder of the file on screen — the one `Tab`
+lists — so a bare name means what the listing shows. `~/` expands, and absolute
+paths work as usual.
 
 Each tab holds its **own** view state — cursor, search, filter, sort, frozen
 columns, numeric styles, and its own stack of transposed views — so switching

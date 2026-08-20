@@ -1,4 +1,5 @@
 mod app;
+mod browse;
 mod data;
 mod interrupt;
 mod ui;
@@ -132,7 +133,8 @@ impl Tabs {
             self.current = (((self.current as isize + delta) % n + n) % n) as usize;
         }
         if let Some(path) = open {
-            let path = expand_home(&path);
+            // Relative to the folder on screen, matching what `Tab` listed.
+            let path = browse::resolve(&path, &self.app_mut().base_dir());
             let header = self.app_mut().data.header;
             match Dataset::load_all(&path, header) {
                 // A workbook lands as several tabs; the first one becomes current.
@@ -190,17 +192,6 @@ impl Tabs {
         let spec = HeaderSpec { skip, named: true };
         let msg = format!("header: row {}", spec.header_line());
         self.reload_header(spec, &msg);
-    }
-}
-
-/// Expand a leading `~/` in a path typed at the `o` prompt.
-fn expand_home(input: &str) -> PathBuf {
-    match input.strip_prefix("~/") {
-        Some(rest) => match std::env::var_os("HOME") {
-            Some(home) => PathBuf::from(home).join(rest),
-            None => PathBuf::from(input),
-        },
-        None => PathBuf::from(input),
     }
 }
 
@@ -411,6 +402,191 @@ mod tests {
         path.push(format!("lambris_test_book_{n}.xlsx"));
         workbook.save(&path).unwrap();
         path
+    }
+
+    /// A small directory tree to browse: a subfolder with one file inside, two
+    /// files beside it, and a hidden one. Returns the root.
+    fn browse_fixture() -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut root = std::env::temp_dir();
+        root.push(format!("lambris_test_browse_{n}"));
+        // A directory, unlike the file fixtures, would otherwise accumulate
+        // entries from earlier runs and change what the picker offers.
+        let _ = std::fs::remove_dir_all(&root);
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.join("alpha.csv"), "a,b\n1,2\n").unwrap();
+        std::fs::write(root.join("beta.tsv"), "a\tb\n1\t2\n").unwrap();
+        std::fs::write(root.join(".hidden.csv"), "a,b\n9,9\n").unwrap();
+        std::fs::write(nested.join("inner.csv"), "x,y\n3,4\n").unwrap();
+        root
+    }
+
+    /// Labels of the entries the picker is offering.
+    fn offered(app: &App) -> Vec<String> {
+        app.completions
+            .as_ref()
+            .map(|c| c.entries.iter().map(|e| e.label()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn open_prompt_lists_the_current_files_folder() {
+        let root = browse_fixture();
+        let mut tabs =
+            Tabs::open(&[root.join("alpha.csv")], HeaderSpec::default()).unwrap();
+
+        // Before Tab it is a plain prompt.
+        tabs.app_mut().handle_key(key('o'));
+        assert!(tabs.app_mut().completions.is_none());
+
+        // Tab lists the folder the open file lives in: directories first,
+        // dotfiles hidden until asked for.
+        tabs.app_mut().handle_key(code(KeyCode::Tab));
+        assert_eq!(offered(tabs.app_mut()), vec!["nested/", "alpha.csv", "beta.tsv"]);
+
+        // The listing is drawn over the table, headed by the folder.
+        let text = buffer_text(tabs.app_mut(), 90, 20);
+        assert!(text.contains("nested/"), "picker missing: {text}");
+        assert!(text.contains("Tab: list folder"), "legend missing: {text}");
+        let leaf = root.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(text.contains(&leaf), "folder name missing: {text}");
+        // Narrow: the title keeps the deep end of the path, not its head.
+        let text = buffer_text(tabs.app_mut(), 30, 20);
+        assert!(text.contains('…') && text.contains(&leaf[leaf.len() - 6..]));
+
+        // Tab again walks the list; arrows do too, and it wraps.
+        tabs.app_mut().handle_key(code(KeyCode::Tab));
+        assert_eq!(tabs.app_mut().completions.as_ref().unwrap().selected, 1);
+        tabs.app_mut().handle_key(code(KeyCode::Up));
+        assert_eq!(tabs.app_mut().completions.as_ref().unwrap().selected, 0);
+        tabs.app_mut().handle_key(code(KeyCode::Up));
+        assert_eq!(
+            tabs.app_mut().completions.as_ref().unwrap().selected,
+            2,
+            "wraps to the last entry"
+        );
+    }
+
+    #[test]
+    fn open_prompt_steps_into_a_folder_and_opens_a_file() {
+        let root = browse_fixture();
+        let mut tabs =
+            Tabs::open(&[root.join("alpha.csv")], HeaderSpec::default()).unwrap();
+        tabs.app_mut().handle_key(key('o'));
+        tabs.app_mut().handle_key(code(KeyCode::Tab));
+
+        // Enter on `nested/` steps inside and lists it, rather than opening it.
+        tabs.app_mut().handle_key(code(KeyCode::Enter));
+        assert!(tabs.step());
+        assert_eq!(tabs.tabs.len(), 1, "a folder is not a file to open");
+        assert!(tabs.app_mut().input.ends_with("nested/"));
+        assert_eq!(offered(tabs.app_mut()), vec!["inner.csv"]);
+
+        // Enter on the file opens it in a new tab.
+        tabs.app_mut().handle_key(code(KeyCode::Enter));
+        assert!(tabs.step());
+        assert_eq!(tabs.tabs.len(), 2);
+        assert_eq!(tabs.current, 1);
+        assert_eq!(tabs.app_mut().data.label, "inner.csv");
+        assert_eq!(tabs.app_mut().data.column_names, vec!["x", "y"]);
+        assert!(tabs.app_mut().completions.is_none(), "picker closed on open");
+    }
+
+    #[test]
+    fn open_prompt_completes_and_filters_as_you_type() {
+        let root = browse_fixture();
+        let mut tabs =
+            Tabs::open(&[root.join("alpha.csv")], HeaderSpec::default()).unwrap();
+
+        // A bare prefix narrows the same folder — Tab finishes a lone match.
+        tabs.app_mut().handle_key(key('o'));
+        type_str(tabs.app_mut(), "bet");
+        tabs.app_mut().handle_key(code(KeyCode::Tab));
+        assert!(
+            tabs.app_mut().completions.is_none(),
+            "a single file is a finished answer"
+        );
+        assert_eq!(tabs.app_mut().input, root.join("beta.tsv").to_string_lossy());
+        tabs.app_mut().handle_key(code(KeyCode::Enter));
+        assert!(tabs.step());
+        assert_eq!(tabs.app_mut().data.label, "beta.tsv");
+
+        // Typing with the picker up filters it, and Backspace widens it again.
+        tabs.app_mut().handle_key(key('o'));
+        tabs.app_mut().handle_key(code(KeyCode::Tab));
+        type_str(tabs.app_mut(), "n");
+        assert_eq!(offered(tabs.app_mut()), vec!["nested/"]);
+        tabs.app_mut().handle_key(code(KeyCode::Backspace));
+        assert_eq!(offered(tabs.app_mut()).len(), 3);
+
+        // A prefix matching nothing says so instead of closing.
+        type_str(tabs.app_mut(), "zzz");
+        assert!(offered(tabs.app_mut()).is_empty());
+        let note = tabs
+            .app_mut()
+            .completions
+            .as_ref()
+            .unwrap()
+            .note
+            .clone()
+            .unwrap_or_default();
+        assert!(note.contains("nothing starting with"), "unexpected: {note}");
+    }
+
+    #[test]
+    fn open_prompt_shows_hidden_files_only_when_asked() {
+        let root = browse_fixture();
+        let mut tabs =
+            Tabs::open(&[root.join("alpha.csv")], HeaderSpec::default()).unwrap();
+        tabs.app_mut().handle_key(key('o'));
+        tabs.app_mut().handle_key(code(KeyCode::Tab));
+        assert!(!offered(tabs.app_mut()).contains(&".hidden.csv".to_string()));
+        type_str(tabs.app_mut(), ".");
+        assert_eq!(offered(tabs.app_mut()), vec![".hidden.csv"]);
+    }
+
+    #[test]
+    fn open_prompt_esc_closes_the_picker_before_the_prompt() {
+        let root = browse_fixture();
+        let mut tabs =
+            Tabs::open(&[root.join("alpha.csv")], HeaderSpec::default()).unwrap();
+        tabs.app_mut().handle_key(key('o'));
+        tabs.app_mut().handle_key(code(KeyCode::Tab));
+        assert!(tabs.app_mut().completions.is_some());
+
+        // First Esc puts the listing away but keeps what was typed.
+        tabs.app_mut().handle_key(code(KeyCode::Esc));
+        assert!(tabs.app_mut().completions.is_none());
+        assert!(matches!(tabs.app_mut().mode, app::Mode::Input(_)));
+
+        // The second leaves the prompt without opening anything.
+        tabs.app_mut().handle_key(code(KeyCode::Esc));
+        assert!(matches!(tabs.app_mut().mode, app::Mode::Normal));
+        assert!(tabs.step());
+        assert_eq!(tabs.tabs.len(), 1);
+    }
+
+    #[test]
+    fn picker_scrolls_to_keep_the_highlight_visible() {
+        // More entries than the box shows: the window follows the highlight.
+        let root = browse_fixture();
+        for i in 0..20 {
+            std::fs::write(root.join(format!("f{i:02}.csv")), "a\n1\n").unwrap();
+        }
+        let listing = browse::Completions::for_input("", &root);
+        assert!(listing.entries.len() > browse::VISIBLE);
+        let (start, window) = listing.window(browse::VISIBLE);
+        assert_eq!((start, window.len()), (0, browse::VISIBLE));
+
+        let mut listing = listing;
+        let last = listing.entries.len() - 1;
+        listing.step(-1); // wrap to the end
+        assert_eq!(listing.selected, last);
+        let (start, window) = listing.window(browse::VISIBLE);
+        assert_eq!(start + window.len() - 1, last, "the last entry is on screen");
     }
 
     #[test]

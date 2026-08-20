@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use regex::{Regex, RegexBuilder};
 
+use crate::browse::Completions;
 use crate::data::Dataset;
 use crate::interrupt;
 
@@ -127,6 +128,8 @@ pub struct App {
     pub mode: Mode,
     /// Buffer backing the prompt while in `Mode::Input`.
     pub input: String,
+    /// Paths offered by `Tab` in the open prompt, while the picker is up.
+    pub completions: Option<Completions>,
     pub search: Option<Search>,
     pub filter_query: Option<String>,
     /// Transient message shown in the status bar (errors, match info).
@@ -184,6 +187,7 @@ impl App {
             render_error: None,
             mode: Mode::Normal,
             input: String::new(),
+            completions: None,
             search: None,
             filter_query: None,
             status_msg: None,
@@ -373,28 +377,121 @@ impl App {
     }
 
     fn handle_input(&mut self, key: KeyEvent, kind: InputKind) {
+        // The open prompt browses the filesystem; the others are plain text.
+        if let InputKind::Open = kind
+            && self.handle_open_key(key)
+        {
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 self.input.clear();
+                self.completions = None;
             }
             KeyCode::Enter => self.commit_input(kind),
             KeyCode::Backspace => {
                 self.input.pop();
+                self.refresh_completions();
             }
             // Goto only accepts digits; search/filter take any character.
             KeyCode::Char(c) => {
                 if !matches!(kind, InputKind::Goto) || c.is_ascii_digit() {
                     self.input.push(c);
+                    self.refresh_completions();
                 }
             }
             _ => {}
         }
     }
 
+    /// Keys specific to the open prompt. Returns `true` when the key was one of
+    /// them, so ordinary typing falls through to the shared handler.
+    fn handle_open_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            // First `Tab` lists the folder (completing as far as it can);
+            // afterwards it walks the list.
+            KeyCode::Tab => match self.completions.is_some() {
+                false => self.open_completions(true),
+                true => self.step_completion(1),
+            },
+            KeyCode::BackTab => self.step_completion(-1),
+            KeyCode::Down => self.step_completion(1),
+            KeyCode::Up => self.step_completion(-1),
+            KeyCode::Enter if self.completions.is_some() => self.accept_completion(),
+            // `Esc` puts the picker away first, leaving what was typed.
+            KeyCode::Esc if self.completions.is_some() => self.completions = None,
+            _ => return false,
+        }
+        true
+    }
+
+    /// The folder a bare name is taken against: where the file on screen lives.
+    pub fn base_dir(&self) -> std::path::PathBuf {
+        self.data
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    }
+
+    /// List the folder the typed path points into.
+    ///
+    /// `complete` is what `Tab` does on top of listing: extend the input by
+    /// whatever every candidate agrees on, and finish outright when a single
+    /// file matches. Stepping into a folder and typing both pass `false` — there
+    /// the listing is the point, and finishing the path under someone's fingers
+    /// would swallow the characters they type next.
+    fn open_completions(&mut self, complete: bool) {
+        let listing = Completions::for_input(&self.input, &self.base_dir());
+        if complete {
+            if let Some(common) = listing.common_prefix() {
+                self.input = common;
+            }
+            if listing.entries.len() == 1 && !listing.entries[0].is_dir {
+                self.completions = None;
+                return;
+            }
+        }
+        self.completions = Some(listing);
+    }
+
+    fn step_completion(&mut self, delta: isize) {
+        if let Some(listing) = &mut self.completions {
+            listing.step(delta);
+        }
+    }
+
+    /// Take the highlighted entry: step into a directory, or open a file.
+    fn accept_completion(&mut self) {
+        let Some(listing) = &self.completions else { return };
+        let Some(entry_is_dir) = listing.selected_entry().map(|e| e.is_dir) else {
+            return;
+        };
+        let Some(text) = listing.selected_input() else { return };
+        self.input = text;
+        if entry_is_dir {
+            self.open_completions(false); // list what is inside it
+        } else {
+            self.completions = None;
+            self.commit_input(InputKind::Open);
+        }
+    }
+
+    /// Re-list after the typed path changed, while the picker is up.
+    fn refresh_completions(&mut self) {
+        if self.completions.is_some() {
+            self.completions = None;
+            // Still typing: narrow the list, never finish the path for them.
+            self.open_completions(false);
+        }
+    }
+
     fn enter_input(&mut self, kind: InputKind) {
         self.mode = Mode::Input(kind);
         self.status_msg = None;
+        self.completions = None;
         self.input = match kind {
             InputKind::Search | InputKind::ColumnSearch => {
                 self.search.as_ref().map(|s| s.query.clone())
@@ -408,6 +505,7 @@ impl App {
     fn commit_input(&mut self, kind: InputKind) {
         let query = std::mem::take(&mut self.input);
         self.mode = Mode::Normal;
+        self.completions = None;
         // These two take the text literally rather than as a regex.
         match kind {
             InputKind::Goto => return self.goto_line(&query),
