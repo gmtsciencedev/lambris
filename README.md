@@ -44,6 +44,7 @@ cargo run --release -- --no-header data.csv
 | `S` | Sort by *part* of the selected column (see [Sorting by part of a column](#sorting-by-part-of-a-column)) |
 | `f` | Freeze columns `0..=selected` (pinned while scrolling); press again to unfreeze |
 | `x` | Hide the selected column |
+| `r` / `R` | Set this column's width / even out this one and every column to its right (`%` fits the values) |
 | `[` / `]` (or `Shift-←`/`Shift-→`) | Move the selected column left / right |
 | `u` | Put every hidden column back, in the file's own order |
 | `t` | Transpose the table (first column becomes the headers); `t`/`Esc` to return |
@@ -162,12 +163,64 @@ status bar) to match `sort -k`.
 ## Columns
 
 `x` hides the column under the cursor, `[` and `]` move it left and right
-(`Shift-←`/`Shift-→` do the same where the terminal sends them), and `u` puts
-everything back in the file's own order. The status bar counts what is hidden.
+(`Shift-←`/`Shift-→` do the same where the terminal sends them), `r` and `R` set
+widths (`%` inside either fits the values), and `u` puts everything back in the
+file's own order. The status bar
+counts what is hidden.
 
 Nothing is deleted — this is the *view*'s column order, held per tab, so the
 file is untouched and `u` always gets you back. It earns its keep after a join,
 where two tables' columns arrive together and only a few of them matter.
+
+### Widths
+
+Columns size themselves to their name and contents, up to 40 characters. `r`
+sets the selected column's width by hand; `R` does the same for that column and
+every column to its right. Both the arrows and `h`/`l`/`j`/`k` widen and narrow —
+neither pair is obviously the right one for a width, so both work. `Enter` keeps
+what you set, `Esc` puts back the widths you started with, and `u` forgets widths
+along with order and visibility.
+
+`R` **evens the block out**: every column it covers takes the *same* width, so a
+narrow column becomes wider rather than shrinking by the same amount as its
+neighbours. That is what makes it useful on a run of similar columns — and why it
+snaps them together the moment you press it, before you adjust anything:
+
+```
+a_long_name v                 x   y        as loaded
+a_long_name v           x           y      R  — all four at 11
+a_long_name   v             x             y    →→ — all four at 13
+```
+
+Two exceptions to "one width":
+
+- `%` fits each column to **its own values, ignoring the column name**, which is
+  often the longer of the two. With `R` that leaves the columns at different
+  widths — each as wide as its data needs. A name that no longer fits is not
+  lost: the status bar shows it whenever the cursor is on that column.
+- After `%` the columns hold their own sizes and an adjustment moves them all by
+  the same amount, rather than flattening them again. `0` returns to sizing by
+  name and content, and to evening out.
+
+A width set by hand runs from a single character up to 200 — the point of
+widening by hand is to see a long value, so it is not held to the 40 that
+content-derived widths are.
+
+### When something doesn't fit
+
+A clipped cell ends in `…`, which tells you something is missing but not what.
+So when the cell under the cursor is cut short, the **status bar shows it in
+full** in whatever room is left over, and the column's name follows if there is
+still space:
+
+```
+ row 1/2  col 1/2   = this is a really rather long cell value  a_very_long_col…
+```
+
+Content comes first and keeps the room: on a narrow terminal the column name
+gives way rather than the value. Info mode (`i`) already spells out the name,
+type and full value on its own line, so while it is on the status bar stops
+repeating them.
 
 Because it is what you are looking at, the rest of the viewer follows it:
 searching and filtering consider only the columns on display (so a hit can never

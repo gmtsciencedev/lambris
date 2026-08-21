@@ -1022,6 +1022,174 @@ mod tests {
     }
 
     #[test]
+    fn column_width_can_be_set_kept_and_reverted() {
+        let csv = "name,n\nalphabetical,1\nbetatestical,2\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        // Sized to its contents to begin with.
+        assert!(app.col_width(0).is_none());
+        assert!(buffer_line(&mut app, 40, 8, 2).contains("alphabetical"));
+
+        // `r` then ← narrows it, and the values clip to match.
+        app.handle_key(key('r'));
+        assert!(app.resize.is_some());
+        for _ in 0..6 {
+            app.handle_key(code(KeyCode::Left));
+        }
+        assert_eq!(app.col_width(0), Some(6));
+        let row = buffer_line(&mut app, 40, 8, 2);
+        assert!(row.contains("alpha…"), "not clipped to the set width: {row}");
+
+        // Enter keeps it; the mode ends.
+        app.handle_key(code(KeyCode::Enter));
+        assert!(app.resize.is_none());
+        assert_eq!(app.col_width(0), Some(6));
+
+        // `0` inside a resize goes back to sizing by content.
+        app.handle_key(key('r'));
+        app.handle_key(key('0'));
+        assert!(app.col_width(0).is_none());
+        app.handle_key(code(KeyCode::Enter));
+
+        // Esc puts back whatever the width was before that resize.
+        app.handle_key(key('r'));
+        for _ in 0..4 {
+            app.handle_key(code(KeyCode::Left));
+        }
+        assert!(app.col_width(0).is_some());
+        app.handle_key(code(KeyCode::Esc));
+        assert_eq!(app.col_width(0), None, "reverted to what it was");
+        assert_eq!(app.status_msg.as_deref(), Some("width unchanged"));
+
+        // A width cannot be narrowed away entirely.
+        app.handle_key(key('r'));
+        for _ in 0..80 {
+            app.handle_key(code(KeyCode::Left));
+        }
+        assert_eq!(app.col_width(0), Some(app::MIN_SET_WIDTH));
+        // Both key pairs adjust, since neither is the obvious one for a width.
+        app.handle_key(key('k'));
+        app.handle_key(key('l'));
+        assert_eq!(app.col_width(0), Some(app::MIN_SET_WIDTH + 2));
+    }
+
+    #[test]
+    fn capital_r_evens_out_every_column_to_the_right() {
+        // Deliberately uneven: an 11-wide name beside a column needing 3.
+        let csv = "aaaaaaaaaaa,b,c\n1,2,3\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        app.handle_key(key('R'));
+        assert_eq!(app.resize.as_ref().unwrap().count, 3);
+
+        // `R` evens them out straight away, so the narrow ones get *wider* —
+        // that is the point, not a matching reduction.
+        assert_eq!(app.col_width(0), Some(11));
+        assert_eq!(app.col_width(1), Some(11), "the narrow column widened");
+        assert_eq!(app.col_width(2), Some(11));
+
+        // Adjusting keeps them equal rather than preserving old differences.
+        app.handle_key(code(KeyCode::Left));
+        app.handle_key(code(KeyCode::Left));
+        assert_eq!(
+            (app.col_width(0), app.col_width(1), app.col_width(2)),
+            (Some(9), Some(9), Some(9))
+        );
+        app.handle_key(code(KeyCode::Enter));
+
+        // A single `r` leaves the columns beside it alone.
+        app.selected_pos = 1;
+        app.handle_key(key('r'));
+        app.handle_key(code(KeyCode::Right));
+        app.handle_key(code(KeyCode::Enter));
+        assert_eq!(app.col_width(1), Some(10));
+        assert_eq!(app.col_width(0), Some(9), "its neighbours are untouched");
+
+        // `u` forgets widths along with order and visibility.
+        app.handle_key(key('u'));
+        assert_eq!(app.col_width(0), None);
+        assert_eq!(app.col_width(1), None);
+    }
+
+    #[test]
+    fn percent_fits_each_column_to_its_values() {
+        // The names are the long part here; the values are not.
+        let csv = "a_long_name,v\n1,a_long_value_here\n2,b\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        app.handle_key(key('R'));
+        app.handle_key(key('%'));
+
+        // Each column now fits its own values, names aside — so unlike an
+        // adjustment, `%` leaves them at different widths.
+        assert_eq!(app.col_width(0), Some(1), "its values are one character");
+        assert_eq!(app.col_width(1), Some(17), "a_long_value_here");
+
+        // The name no longer fits, so the status bar carries it instead.
+        let status = buffer_line(&mut app, 90, 8, 6);
+        assert!(status.contains("a_long_name"), "clipped name missing: {status}");
+
+        // Adjusting after `%` keeps the fit and moves them together.
+        app.handle_key(code(KeyCode::Right));
+        assert_eq!((app.col_width(0), app.col_width(1)), (Some(2), Some(18)));
+
+        // `0` returns to sizing by name and content, and to evening out.
+        app.handle_key(key('0'));
+        assert_eq!(app.col_width(0), None);
+        app.handle_key(code(KeyCode::Left));
+        assert_eq!(
+            app.col_width(0),
+            app.col_width(1),
+            "back to one width for both"
+        );
+    }
+
+    #[test]
+    fn clipped_cell_and_title_spill_into_the_status_bar() {
+        let long_value = "this is a really rather long cell value";
+        let csv = format!("a_very_long_column_name,n\n{long_value},1\n");
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", &csv)).unwrap());
+
+        // The layout is title, body, status, hints — so the status bar is the
+        // second-to-last row and the hint line the last.
+        const H: u16 = 8;
+        const STATUS: u16 = H - 2;
+        const HINTS: u16 = H - 1;
+
+        // Nothing is clipped at full width, so nothing is reported.
+        let status = buffer_line(&mut app, 100, H, STATUS);
+        assert!(!status.contains('='), "nothing to report yet: {status}");
+
+        // Narrow it until both the value and the title have to be cut.
+        app.handle_key(key('r'));
+        for _ in 0..30 {
+            app.handle_key(code(KeyCode::Left));
+        }
+        app.handle_key(code(KeyCode::Enter));
+
+        // Wide terminal: the value comes first, then the column's name.
+        let status = buffer_line(&mut app, 110, H, STATUS);
+        assert!(status.contains(long_value), "value missing: {status}");
+        assert!(status.contains("a_very_long_column_name"), "title missing: {status}");
+        assert!(
+            status.find(long_value) < status.find("a_very_long_column_name"),
+            "content should come first: {status}"
+        );
+
+        // Tight terminal: the content keeps the room and the title gives way.
+        let status = buffer_line(&mut app, 62, H, STATUS);
+        assert!(status.contains("this is a really"), "value dropped: {status}");
+        assert!(
+            !status.contains("a_very_long_column_name"),
+            "title should have given way: {status}"
+        );
+
+        // Info mode already spells both out, so the status bar stops repeating.
+        app.handle_key(key('i'));
+        let status = buffer_line(&mut app, 110, H, STATUS);
+        assert!(!status.contains(long_value), "repeated in info mode: {status}");
+        let info = buffer_line(&mut app, 110, H, HINTS);
+        assert!(info.contains(long_value), "info line should have it: {info}");
+    }
+
+    #[test]
     fn columns_can_be_hidden_moved_and_restored() {
         let csv = "id,name,score\n1,alpha,3\n2,beta,4\n";
         let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
@@ -1632,6 +1800,20 @@ mod tests {
 
     fn buffer_text(app: &mut App, w: u16, h: u16) -> String {
         buffer_text_tabs(app, &ui::TabStrip::default(), w, h)
+    }
+
+    /// One row of the rendered frame, trailing blanks trimmed.
+    fn buffer_line(app: &mut App, w: u16, h: u16, y: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|f| ui::render(f, app, &ui::TabStrip::default(), None).unwrap())
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..w)
+            .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
     }
 
     /// Render `app` with a wizard banner on the bottom line.

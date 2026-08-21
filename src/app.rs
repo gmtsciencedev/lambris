@@ -19,6 +19,16 @@ pub struct NumStyle {
     pub decimals: Option<u8>,
 }
 
+/// Bounds on how wide a column is drawn. `MIN`/`MAX_COL_WIDTH` bound the width
+/// a column derives from its contents, so one wide column cannot push
+/// everything else off screen. A width set by hand (`r`/`R`) is bounded by
+/// `MIN`/`MAX_SET_WIDTH` instead, which is far more generous — the point of
+/// widening by hand is to see a long value.
+pub const MIN_COL_WIDTH: u16 = 3;
+pub const MAX_COL_WIDTH: u16 = 40;
+pub const MIN_SET_WIDTH: u16 = 1;
+pub const MAX_SET_WIDTH: u16 = 200;
+
 /// Consecutive same-direction move events landing within this window are
 /// treated as a held key and accelerate the scroll.
 const REPEAT_WINDOW: Duration = Duration::from_millis(150);
@@ -72,6 +82,30 @@ pub struct SortSpec {
     pub dir: SortDir,
     /// When set, sort by this slice of the field rather than the whole value.
     pub key: Option<SortKey>,
+}
+
+/// A width adjustment in progress (`r` for one column, `R` for the rest of the
+/// row too). Widths change as the keys are pressed, so `Esc` needs the previous
+/// ones to put back.
+///
+/// Adjusting gives every covered column the *same* width — the point of `R` is
+/// to even out a block of columns, so nudging them by a relative amount would
+/// leave them as uneven as they started. `%` is the exception: it fits each
+/// column to its own values, after which they keep their own sizes and move
+/// together.
+#[derive(Clone)]
+pub struct Resize {
+    /// First display position covered.
+    pub from: usize,
+    /// How many positions are being resized.
+    pub count: usize,
+    /// The one width every covered column takes while adjusting together.
+    target: u16,
+    /// Set by `%`: the columns now differ, so keep their sizes and move them
+    /// all by the same amount instead of flattening them again.
+    relative: bool,
+    /// What the covered columns' widths were before this started.
+    saved: Vec<(usize, Option<u16>)>,
 }
 
 /// The `S` wizard: choosing which slice of a column to sort by, with the
@@ -202,6 +236,11 @@ pub struct App {
     pub cancel_join: bool,
     /// The `S` sort-key wizard, while one is running.
     pub key_sort: Option<KeySort>,
+    /// Widths the user has set, keyed by dataset column. A column without one
+    /// is sized to its contents as usual.
+    col_widths: HashMap<usize, u16>,
+    /// The width adjustment in progress, if any.
+    pub resize: Option<Resize>,
     /// Whether the `?` key reference is covering the table.
     pub show_help: bool,
     /// First line of the key reference on screen, for scrolling it.
@@ -252,6 +291,8 @@ impl App {
             confirm: false,
             cancel_join: false,
             key_sort: None,
+            col_widths: HashMap::new(),
+            resize: None,
             show_help: false,
             help_offset: 0,
             frozen_cols: 0,
@@ -328,10 +369,11 @@ impl App {
         self.status_msg = Some(format!("hid {name} · u restores"));
     }
 
-    /// Put every column back, in the file's own order.
+    /// Put every column back: order, visibility and widths.
     fn restore_cols(&mut self) {
         let was = self.selected_col();
         self.cols = (0..self.data.ncols).collect();
+        self.col_widths.clear();
         self.selected_pos = was.min(self.last_col());
         self.status_msg = Some("all columns restored".into());
     }
@@ -349,6 +391,9 @@ impl App {
         }
         if self.key_sort.is_some() {
             return self.handle_key_sort(key);
+        }
+        if self.resize.is_some() {
+            return self.handle_resize(key);
         }
         match self.mode {
             Mode::Normal => self.handle_normal(key, now),
@@ -385,6 +430,168 @@ impl App {
     /// the transposed table without unbounded width on large files).
     pub fn view_rows(&self, max: usize) -> Vec<usize> {
         (0..self.row_count().min(max)).map(|i| self.orig_row(i)).collect()
+    }
+
+    /// The width set for `col`, if the user has chosen one.
+    pub fn col_width(&self, col: usize) -> Option<u16> {
+        self.col_widths.get(&col).copied()
+    }
+
+    /// Begin adjusting widths: this column, or this one and all those right of
+    /// it. The current widths are remembered so `Esc` can put them back.
+    fn start_resize(&mut self, rest_of_row: bool) {
+        if self.cols.is_empty() {
+            return;
+        }
+        let from = self.selected_pos;
+        let count = if rest_of_row {
+            self.cols.len() - from
+        } else {
+            1
+        };
+        let saved = self.cols[from..from + count]
+            .iter()
+            .map(|&col| (col, self.col_width(col)))
+            .collect();
+        let selected = self.selected_col();
+        let target = self
+            .col_width(selected)
+            .unwrap_or_else(|| self.natural_width(selected));
+        self.resize = Some(Resize {
+            from,
+            count,
+            target,
+            relative: false,
+            saved,
+        });
+        // `R` evens the block out at once, so what it does is visible before
+        // anything is adjusted. `r` leaves its one column sizing itself until
+        // asked otherwise.
+        if count > 1 {
+            self.set_uniform_width();
+        }
+    }
+
+    /// Give every covered column the resize's single width.
+    fn set_uniform_width(&mut self) {
+        let Some(target) = self.resize.as_ref().map(|r| r.target) else {
+            return;
+        };
+        for col in self.resizing() {
+            self.col_widths.insert(col, target);
+        }
+    }
+
+    /// The dataset columns a resize covers.
+    fn resizing(&self) -> Vec<usize> {
+        match &self.resize {
+            Some(r) => self.cols[r.from..(r.from + r.count).min(self.cols.len())].to_vec(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Adjust widths, put them back, or leave them be. Both the arrows and
+    /// `h`/`l`/`j`/`k` work, since neither pair is obviously the right one for
+    /// a width.
+    fn handle_resize(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return;
+        }
+        match key.code {
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Down | KeyCode::Char('j') => {
+                self.nudge_widths(-1)
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Up | KeyCode::Char('k') => {
+                self.nudge_widths(1)
+            }
+            // Fit the values and ignore the column's name, which is often the
+            // longer of the two — the status bar shows a clipped name anyway.
+            KeyCode::Char('%') => self.fit_widths_to_values(),
+            // Back to sizing by name and content together.
+            KeyCode::Char('0') | KeyCode::Char('=') => {
+                for col in self.resizing() {
+                    self.col_widths.remove(&col);
+                }
+                if let Some(resize) = &mut self.resize {
+                    resize.relative = false;
+                }
+                self.status_msg = Some("width: auto".into());
+            }
+            KeyCode::Enter => {
+                self.resize = None;
+                self.status_msg = Some("width kept".into());
+            }
+            KeyCode::Esc => {
+                // Put back exactly what was there before.
+                if let Some(resize) = self.resize.take() {
+                    for (col, width) in resize.saved {
+                        match width {
+                            Some(w) => self.col_widths.insert(col, w),
+                            None => self.col_widths.remove(&col),
+                        };
+                    }
+                }
+                self.status_msg = Some("width unchanged".into());
+            }
+            _ => {}
+        }
+    }
+
+    /// Widen or narrow the covered columns by one.
+    ///
+    /// Normally they all end up at the same width: `R` is for evening out a
+    /// block of columns, so a column narrower than the target gets *wider*.
+    /// After `%` they hold their own sizes and shift together instead.
+    fn nudge_widths(&mut self, delta: i16) {
+        let clamp = |w: i16| w.clamp(MIN_SET_WIDTH as i16, MAX_SET_WIDTH as i16) as u16;
+        let relative = self.resize.as_ref().is_some_and(|r| r.relative);
+        if relative {
+            for col in self.resizing() {
+                // Without an explicit width the column sizes itself, so start
+                // the nudge from whatever that came out as.
+                let current = self
+                    .col_width(col)
+                    .unwrap_or_else(|| self.natural_width(col));
+                let next = clamp(current as i16 + delta);
+                self.col_widths.insert(col, next);
+            }
+            return;
+        }
+        if let Some(resize) = &mut self.resize {
+            resize.target = clamp(resize.target as i16 + delta);
+        }
+        self.set_uniform_width();
+    }
+
+    /// Fit each covered column to its own values, ignoring the column name.
+    /// With `R` that leaves the columns at different widths — each one is as
+    /// wide as its data needs — which is the other thing you might want from a
+    /// block of columns.
+    fn fit_widths_to_values(&mut self) {
+        for col in self.resizing() {
+            let values = self.visible_width(col);
+            // A column with nothing on screen keeps enough room for its `NA`s.
+            let width = if values == 0 {
+                MIN_COL_WIDTH
+            } else {
+                (values as u16).clamp(MIN_SET_WIDTH, MAX_SET_WIDTH)
+            };
+            self.col_widths.insert(col, width);
+        }
+        if let Some(resize) = &mut self.resize {
+            resize.relative = true;
+        }
+        self.status_msg = Some("width: fitted to the values".into());
+    }
+
+    /// Roughly what a column sizes itself to: the widest of its name and the
+    /// values on screen, within the usual cap.
+    fn natural_width(&self, col: usize) -> u16 {
+        let name = self.data.column_names[col].chars().count();
+        let widest = self.visible_width(col);
+        (name.max(widest) as u16).clamp(MIN_COL_WIDTH, MAX_COL_WIDTH)
     }
 
     /// Start the `S` wizard on the selected column.
@@ -584,6 +791,10 @@ impl App {
             KeyCode::Char('<') => self.adjust_decimals(-1),
             KeyCode::Char('s') => self.cycle_sort(),
             KeyCode::Char('S') => self.start_key_sort(),
+            // `r` adjusts this column's width, `R` this one and every column
+            // to its right.
+            KeyCode::Char('r') => self.start_resize(false),
+            KeyCode::Char('R') => self.start_resize(true),
             KeyCode::Char('f') if !ctrl => self.toggle_freeze(),
             KeyCode::Char('/') => self.enter_input(InputKind::Search),
             // Column-scoped search. `-` is a direct, unshifted key on AZERTY;

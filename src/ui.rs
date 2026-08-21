@@ -7,7 +7,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use crate::app::{App, InputKind, KeySort, KeyStage, Mode, NumStyle, SortDir};
+use crate::app::{
+    App, InputKind, KeySort, KeyStage, Mode, NumStyle, SortDir, MAX_COL_WIDTH, MAX_SET_WIDTH,
+    MIN_COL_WIDTH, MIN_SET_WIDTH,
+};
 use crate::browse::{Completions, VISIBLE};
 
 /// The full key reference shown by `?`, grouped into sections. Kept as data so
@@ -42,6 +45,8 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("S", "sort by part of the column: pick the characters, then how"),
             ("f", "freeze columns up to the selected one"),
             ("x", "hide the selected column"),
+            ("r / R", "set this column's width / even out this one and all to its right"),
+            ("  %", "in a resize: fit each column to its values, name aside"),
             ("[ / ]", "move the selected column left / right (or Shift-←/→)"),
             ("u", "put every hidden column back, in the file's order"),
             ("t", "transpose the table (t or Esc to come back)"),
@@ -81,8 +86,6 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
 /// Column where the key descriptions line up on the help page.
 const HELP_KEY_WIDTH: usize = 30;
 
-const MAX_COL_WIDTH: u16 = 40;
-const MIN_COL_WIDTH: u16 = 3;
 const COL_SPACING: u16 = 1;
 const NA: &str = "NA";
 
@@ -93,6 +96,14 @@ const NA: &str = "NA";
 pub struct TabStrip {
     pub labels: Vec<String>,
     pub current: usize,
+}
+
+/// What the selected cell could not show in full, so the status bar can. Both
+/// are the untruncated text; `None` means it fitted.
+#[derive(Default)]
+struct Clipped {
+    title: Option<String>,
+    value: Option<String>,
 }
 
 /// Formatted cells for one column over the visible row window (`None` = null),
@@ -123,12 +134,15 @@ pub fn render(
     app.viewport_rows = viewport_rows.max(1);
 
     render_title(frame, title_area, app, tabs);
-    render_status(frame, status_area, app);
     render_help(frame, help_area, app, banner);
 
+    // The body is drawn before the status bar: what it had to clip is what the
+    // status bar reports.
+    let mut clipped = Clipped::default();
     // The key reference covers the table rather than sitting beside it.
     if app.show_help {
         render_help_page(frame, body_area, app);
+        render_status(frame, status_area, app, &clipped);
         return Ok(());
     }
 
@@ -154,8 +168,9 @@ pub fn render(
         let row_end = (row_start + app.viewport_rows).min(app.row_count());
         let visible_view: Vec<usize> = (row_start..row_end).collect();
 
-        render_table(frame, body_area, app, &visible_view)?;
+        clipped = render_table(frame, body_area, app, &visible_view)?;
     }
+    render_status(frame, status_area, app, &clipped);
 
     // The path picker sits over the table, just above its prompt.
     if let Some(listing) = &app.completions {
@@ -302,7 +317,8 @@ fn render_table(
     area: Rect,
     app: &mut App,
     visible_view: &[usize],
-) -> Result<()> {
+) -> Result<Clipped> {
+    let mut clipped = Clipped::default();
     // Original dataset row indices behind the visible view rows.
     let visible_orig: Vec<usize> = visible_view.iter().map(|&v| app.orig_row(v)).collect();
 
@@ -343,10 +359,11 @@ fn render_table(
             Some(s) if s.col == col && s.dir == SortDir::Desc => " ↓",
             _ => "",
         };
-        let label = truncate(
-            &format!("{}{arrow}", app.data.column_names[col]),
-            cache[&col].width,
-        );
+        let name = &app.data.column_names[col];
+        let label = truncate(&format!("{name}{arrow}"), cache[&col].width);
+        if pos == app.selected_pos && name.chars().count() > cache[&col].width as usize {
+            clipped.title = Some(name.clone());
+        }
         let base = if idx < frozen { Color::Magenta } else { Color::Cyan };
         let mut style = Style::new().bold().fg(base);
         if pos == app.selected_pos {
@@ -399,6 +416,9 @@ fn render_table(
                     } else {
                         Style::new()
                     };
+                    if sel_cell && s.chars().count() > width as usize {
+                        clipped.value = Some(s.clone());
+                    }
                     (truncate(s, width), base)
                 }
             };
@@ -435,7 +455,7 @@ fn render_table(
         .header(header)
         .column_spacing(COL_SPACING);
     frame.render_widget(table, area);
-    Ok(())
+    Ok(clipped)
 }
 
 /// Draw the `?` key reference over the table, scrolled to `app.help_offset`.
@@ -595,7 +615,11 @@ fn render_column(
         };
         width = width.max(cell_width);
     }
-    let width = width.clamp(MIN_COL_WIDTH, MAX_COL_WIDTH);
+    let width = match app.col_width(col) {
+        // Honoured as given: the user asked for this many characters.
+        Some(set) => set.clamp(MIN_SET_WIDTH, MAX_SET_WIDTH),
+        None => width.clamp(MIN_COL_WIDTH, MAX_COL_WIDTH),
+    };
     cache.insert(
         col,
         RenderedColumn {
@@ -688,7 +712,7 @@ fn gutter_width(app: &App) -> u16 {
     (max_row.to_string().len() as u16).max(2)
 }
 
-fn render_status(frame: &mut Frame, area: Rect, app: &App) {
+fn render_status(frame: &mut Frame, area: Rect, app: &App, clipped: &Clipped) {
     // In input mode the status bar becomes the search/filter prompt.
     if let Mode::Input(kind) = app.mode {
         let sigil = match kind {
@@ -781,6 +805,31 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     if let Some(msg) = &app.status_msg {
         spans.push(Span::styled(format!("  {msg}"), Style::new().fg(Color::Magenta)));
     }
+
+    // Whatever the table had to clip goes in the space that is left, so landing
+    // on a shortened cell shows what it actually says. Content comes before the
+    // column's name: it is what you were looking at. Info mode (`i`) already
+    // spells both out on its own line, so nothing is repeated here.
+    if !app.show_info {
+        let used = |spans: &[Span]| -> usize {
+            spans.iter().map(|s| s.content.chars().count()).sum()
+        };
+        for (text, style) in [
+            (clipped.value.as_ref().map(|v| format!("= {v}")), Style::new().fg(Color::White)),
+            (clipped.title.as_ref().cloned(), Style::new().fg(Color::Cyan)),
+        ] {
+            let Some(text) = text else { continue };
+            let room = (area.width as usize).saturating_sub(used(&spans) + 2);
+            // Below a handful of characters there is nothing worth showing.
+            if room < 6 {
+                break;
+            }
+            spans.push(Span::styled(
+                format!("  {}", truncate(&text, room as u16)),
+                style,
+            ));
+        }
+    }
     frame.render_widget(Line::from(spans), area);
 }
 
@@ -794,6 +843,28 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App, banner: Option<&str>) {
             banner.to_string(),
             Style::new().fg(Color::Black).bg(Color::Yellow).bold(),
         ));
+        frame.render_widget(line, area);
+        return;
+    }
+    if let Some(resize) = &app.resize {
+        let scope = match resize.count {
+            1 => "this column".to_string(),
+            n => format!("{n} columns"),
+        };
+        let width = match app.col_width(app.selected_col()) {
+            Some(w) => format!("{w}"),
+            None => "auto".to_string(),
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" width {width}: {scope} "),
+                Style::new().fg(Color::Black).bg(Color::Cyan).bold(),
+            ),
+            Span::styled(
+                " ←/→ adjust · % fit values · 0 auto · Enter keep · Esc revert",
+                Style::new().dim(),
+            ),
+        ]);
         frame.render_widget(line, area);
         return;
     }
