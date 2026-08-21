@@ -1,6 +1,7 @@
 mod app;
 mod browse;
 mod data;
+mod formula;
 mod pattern;
 mod interrupt;
 mod ui;
@@ -1204,6 +1205,286 @@ mod tests {
         assert_eq!(app.summary_at(1), Some(app::Summary::Auto), "round again");
     }
 
+    /// Walk the `a` wizard: kind, recipe, then the name (replacing what the
+    /// name prompt offers).
+    fn add_column(app: &mut App, kind: char, recipe: &str, name: &str) {
+        app.handle_key(key('a'));
+        app.handle_key(key(kind));
+        type_str(app, recipe);
+        app.handle_key(code(KeyCode::Enter));
+        let offered = app.input.chars().count();
+        for _ in 0..offered {
+            app.handle_key(code(KeyCode::Backspace));
+        }
+        type_str(app, name);
+        app.handle_key(code(KeyCode::Enter));
+    }
+
+    /// A column's values in view order.
+    fn values(app: &App, col: usize) -> Vec<String> {
+        app.data
+            .cells(col, &app.view_rows(usize::MAX))
+            .unwrap()
+            .into_iter()
+            .map(|v| v.unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn a_column_can_be_pulled_out_of_another_with_a_pattern() {
+        let tsv = "External ID\treads\n3-SSH0421\t4300\n7-SSH0422\t2500\nodd\t10\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("tsv", tsv)).unwrap());
+        // The source is the column under the cursor, so only the pattern is typed.
+        add_column(&mut app, 'e', "^[0-9]-SSH(.*)", "sample_name");
+
+        assert_eq!(app.data.ncols, 3);
+        assert_eq!(app.data.column_names[2], "sample_name");
+        assert_eq!(values(&app, 2), vec!["0421", "0422", ""]);
+        assert!(
+            app.data.is_null(2, 2),
+            "a row the pattern does not match has no value, rather than an empty one"
+        );
+        // The padding is kept: `0421` is a name, not the number 421.
+        assert_eq!(app.data.column_types[2], "Utf8");
+        // It lands on screen at the end, selected.
+        assert_eq!(app.visible_cols(), &[0, 1, 2]);
+        assert_eq!(app.selected_pos, 2);
+
+        // With no capture group, the whole match is kept. Back to the source
+        // column first: an extraction reads whatever the cursor is on, and it
+        // was left on the column just added.
+        app.selected_pos = 0;
+        add_column(&mut app, 'e', "SSH[0-9]+", "whole");
+        assert_eq!(values(&app, 3), vec!["SSH0421", "SSH0422", ""]);
+    }
+
+    #[test]
+    fn a_column_can_be_worked_out_by_formula() {
+        let tsv = "sample\treads\ttotal\nS1\t4300\t10000\nS2\t2500\t10000\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("tsv", tsv)).unwrap());
+
+        // Arithmetic over two columns, typed as a number.
+        add_column(&mut app, 'f', "{reads} / {total} * 100", "pct");
+        assert_eq!(values(&app, 3), vec!["43", "25"]);
+        assert!(app.data.is_numeric(3), "so it sorts and totals as a number");
+
+        // Text joining, and a reference to a column that was itself computed.
+        add_column(&mut app, 'f', "{sample} + \".sat\"", "sat");
+        assert_eq!(values(&app, 4), vec!["S1.sat", "S2.sat"]);
+        add_column(&mut app, 'f', "{sat} + \"/\" + {pct}", "both");
+        assert_eq!(values(&app, 5), vec!["S1.sat/43", "S2.sat/25"]);
+
+        // A literal alone is a constant column, which is `csvtk mutate3`.
+        add_column(&mut app, 'f', "\"2026-08-20\"", "analysis_date");
+        assert_eq!(values(&app, 6), vec!["2026-08-20", "2026-08-20"]);
+
+        // Precedence and parentheses.
+        add_column(&mut app, 'f', "({reads} + {total}) / 2", "mid");
+        assert_eq!(values(&app, 7), vec!["7150", "6250"]);
+    }
+
+    /// Type a formula and commit it, expecting it to be refused.
+    fn bad_formula(app: &mut App, recipe: &str) -> app::FormulaProblem {
+        app.handle_key(key('a'));
+        app.handle_key(key('f'));
+        type_str(app, recipe);
+        app.handle_key(code(KeyCode::Enter));
+        let problem = app
+            .formula_problem
+            .clone()
+            .unwrap_or_else(|| panic!("{recipe} should have been refused"));
+        // The prompt is still up, with the text still in it, so it can be fixed
+        // rather than typed again.
+        assert!(matches!(
+            app.mode,
+            app::Mode::Input(app::InputKind::Recipe)
+        ));
+        assert_eq!(app.input, recipe);
+        app.handle_key(code(KeyCode::Esc));
+        problem
+    }
+
+    #[test]
+    fn a_formula_that_will_not_do_is_shown_back_with_the_spot_marked() {
+        let tsv = "a\tb\n1\t2\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("tsv", tsv)).unwrap());
+
+        for (recipe, expected, caret) in [
+            ("{nope} + 1", "there is no column called nope", Some(0)),
+            ("{a} +", "stops here", Some(5)),
+            ("{a} @ 2", "not something a formula can use", Some(4)),
+            ("({a} + 1", "never closes", Some(0)),
+            ("{a} 2", "left over at the end", Some(4)),
+            ("* {a}", "needs a value before it", Some(0)),
+            ("nope({a})", "there is no function `nope`", Some(0)),
+            ("round()", "takes 1 or 2 arguments", Some(0)),
+        ] {
+            let problem = bad_formula(&mut app, recipe);
+            assert!(
+                problem.message.contains(expected),
+                "{recipe}: got {:?}",
+                problem.message
+            );
+            assert_eq!(problem.at, caret, "caret for {recipe}");
+            assert_eq!(app.data.ncols, 2, "nothing added for {recipe}");
+        }
+
+        // An empty prompt is not a mistake to complain about, it is a change of
+        // mind — as it is at every other prompt.
+        app.handle_key(key('a'));
+        app.handle_key(key('f'));
+        app.handle_key(code(KeyCode::Enter));
+        assert!(app.formula_problem.is_none());
+        assert!(app.new_column.is_none());
+        assert_eq!(app.status_msg.as_deref(), Some("no new column"));
+
+        // The complaint is drawn over the table, formula and caret and all.
+        app.handle_key(key('a'));
+        app.handle_key(key('f'));
+        type_str(&mut app, "{a} ** ");
+        app.handle_key(code(KeyCode::Enter));
+        let text = buffer_text(&mut app, 80, 16);
+        assert!(text.contains("{a} **"), "the formula is shown: {text}");
+        assert!(text.contains('↑'), "with the spot marked: {text}");
+        assert!(text.contains("stops here"), "and what is wrong: {text}");
+        // Editing it clears the complaint, rather than leaving a stale caret.
+        app.handle_key(code(KeyCode::Backspace));
+        assert!(app.formula_problem.is_none());
+        app.handle_key(code(KeyCode::Esc));
+
+        // A name already taken is refused at the naming step.
+        add_column(&mut app, 'f', "1", "a");
+        assert!(app.status_msg.as_deref().unwrap_or_default().contains("already"));
+        assert_eq!(app.data.ncols, 2);
+    }
+
+    #[test]
+    fn a_formula_can_do_powers_and_functions() {
+        let tsv = "n\tm\n2\t9\n3\t16\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("tsv", tsv)).unwrap());
+
+        add_column(&mut app, 'f', "{n} ** 2", "squared");
+        assert_eq!(values(&app, 2), vec!["4", "9"]);
+        // `^` says the same thing, for spreadsheet fingers.
+        add_column(&mut app, 'f', "{n} ^ 3", "cubed");
+        assert_eq!(values(&app, 3), vec!["8", "27"]);
+        // Powers bind tighter than `*` and go to the right.
+        add_column(&mut app, 'f', "2 * {n} ** 2", "twice_sq");
+        assert_eq!(values(&app, 4), vec!["8", "18"]);
+        add_column(&mut app, 'f', "2 ** 3 ** 2", "right_assoc");
+        assert_eq!(values(&app, 5), vec!["512", "512"]);
+        // …and unary minus applies after the power, as on paper.
+        add_column(&mut app, 'f', "-{n} ** 2", "neg_sq");
+        assert_eq!(values(&app, 6), vec!["-4", "-9"]);
+
+        add_column(&mut app, 'f', "sqrt({m})", "root");
+        assert_eq!(values(&app, 7), vec!["3", "4"]);
+        add_column(&mut app, 'f', "round(log({m}) * 100)", "log100");
+        assert_eq!(values(&app, 8), vec!["95", "120"]);
+        add_column(&mut app, 'f', "round(ln({m}), 2)", "ln2dp");
+        assert_eq!(values(&app, 9), vec!["2.2", "2.77"]);
+        add_column(&mut app, 'f', "max({n}, {m})", "bigger");
+        assert_eq!(values(&app, 10), vec!["9", "16"]);
+
+        // Anything that cannot be worked out leaves a gap, not an error.
+        add_column(&mut app, 'f', "sqrt(0 - {n})", "impossible");
+        assert_eq!(values(&app, 11), vec!["", ""]);
+        assert!(app.data.is_null(11, 0));
+    }
+
+    #[test]
+    fn a_computed_column_behaves_like_any_other() {
+        let tsv = "sample\treads\nS2\t2500\nS1\t4300\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("tsv", tsv)).unwrap());
+        add_column(&mut app, 'f', "{reads} / 100", "hundreds");
+
+        // Sorting by it orders numerically, not as text.
+        app.handle_key(key('s'));
+        assert_eq!(values(&app, 2), vec!["25", "43"]);
+        // The summary line counts it.
+        let (origin, mut tick) = (Instant::now(), 0);
+        tap_summary(&mut app, origin, &mut tick);
+        assert!(summary_line(&mut app, 60, 9).contains("68"), "25 + 43");
+        // Filtering sees it.
+        app.handle_key(key('&'));
+        type_str(&mut app, "^43$");
+        app.handle_key(code(KeyCode::Enter));
+        assert_eq!(app.row_count(), 1);
+        app.handle_key(code(KeyCode::Esc));
+        // And it can be hidden and brought back like any column.
+        app.selected_pos = 2;
+        app.handle_key(key('x'));
+        assert_eq!(app.visible_cols(), &[0, 1]);
+        app.handle_key(key('u'));
+        assert_eq!(app.visible_cols(), &[0, 1, 2]);
+    }
+
+    #[test]
+    fn adding_a_column_and_renaming_one_can_be_undone() {
+        let tsv = "sample\treads\nS1\t4300\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("tsv", tsv)).unwrap());
+        add_column(&mut app, 'f', "{reads} * 2", "double");
+        assert_eq!(app.data.ncols, 3);
+
+        app.handle_key(key('z'));
+        assert_eq!(app.status_msg.as_deref(), Some("undid new column"));
+        assert_eq!(app.data.ncols, 2, "the column is gone");
+        assert_eq!(app.visible_cols(), &[0, 1]);
+        app.handle_key(key('Z'));
+        assert_eq!(app.data.ncols, 3, "and comes back");
+        assert_eq!(values(&app, 2), vec!["8600"]);
+
+        // Renaming, and putting the name back.
+        app.selected_pos = 0;
+        app.handle_key(key('R'));
+        for _ in 0.."sample".len() {
+            app.handle_key(code(KeyCode::Backspace));
+        }
+        type_str(&mut app, "id");
+        app.handle_key(code(KeyCode::Enter));
+        assert_eq!(app.data.column_names[0], "id");
+        app.handle_key(key('z'));
+        assert_eq!(app.status_msg.as_deref(), Some("undid rename"));
+        assert_eq!(app.data.column_names[0], "sample");
+    }
+
+    #[test]
+    fn a_pattern_remembers_computed_columns_and_names() {
+        let store = store_path();
+        let tsv = "External ID\treads\n3-SSH0421\t4300\n7-SSH0422\t2500\n";
+        let file = write_text_fixture("tsv", tsv);
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        {
+            let mut tabs = Tabs::open(
+                std::slice::from_ref(&file),
+                HeaderSpec::default(),
+                Store::load_at(store.clone()),
+            )
+            .unwrap();
+            add_column(tabs.app_mut(), 'e', "^[0-9]-SSH(.*)", "sample_name");
+            add_column(tabs.app_mut(), 'f', "{sample_name} + \".sat\"", "sat");
+            tabs.app_mut().selected_pos = 0;
+            tabs.key(key('R'));
+            for _ in 0.."External ID".len() {
+                tabs.key(KeyEvent::from(KeyCode::Backspace));
+            }
+            type_str(tabs.app_mut(), "id");
+            tabs.key(KeyEvent::from(KeyCode::Enter));
+            save_pattern(&mut tabs, &name);
+        }
+        // Written by name, and readable.
+        let text = std::fs::read_to_string(&store).unwrap();
+        assert!(text.contains("\"sample_name\""), "{text}");
+        assert!(text.contains("^[0-9]-SSH(.*)"), "{text}");
+
+        let mut tabs =
+            Tabs::open(std::slice::from_ref(&file), HeaderSpec::default(), Store::load_at(store))
+                .unwrap();
+        let app = tabs.app_mut();
+        assert_eq!(app.data.column_names, vec!["id", "reads", "sample_name", "sat"]);
+        assert_eq!(values(app, 3), vec!["0421.sat", "0422.sat"]);
+    }
+
     #[test]
     fn a_scope_applies_a_column_command_to_a_block() {
         let csv = "name,a,b,c\nx,1.5,2.5,3.5\ny,2.5,3.5,4.5\n";
@@ -1234,10 +1515,9 @@ mod tests {
         // … but anything that is not a column command drops it.
         app.handle_key(key('j'));
         assert!(app.scope.is_none());
-        // `R` is gone — `( r` is the only way to resize a block — so it counts
-        // as any other key and drops a pending aim rather than doing something.
+        // A key that means nothing drops a pending aim rather than sitting on it.
         app.handle_key(key('('));
-        app.handle_key(key('R'));
+        app.handle_key(key('p'));
         assert!(app.scope.is_none(), "an unbound key drops the aim");
         assert!(app.resize.is_none(), "and starts nothing");
 

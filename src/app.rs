@@ -6,8 +6,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use regex::{Regex, RegexBuilder};
 
 use crate::browse::Completions;
-use crate::data::{ColumnStats, Dataset, HeaderSpec, SortKey, SortMethod};
-use crate::pattern::{Pattern, SavedHeader, SavedNumStyle, SavedSort, SavedSortKey};
+use crate::data::{ColumnStats, Dataset, Derived, HeaderSpec, Recipe, SortKey, SortMethod};
+use crate::formula::FormulaError;
+use crate::pattern::{
+    Pattern, SavedColumn, SavedHeader, SavedNumStyle, SavedSort, SavedSortKey,
+};
 use crate::interrupt;
 
 /// How a numeric column is displayed (set with `%`, `<`, `>`).
@@ -63,6 +66,43 @@ pub enum InputKind {
     Open,
     /// Name the file (or glob) a saved pattern is tied to.
     Pattern,
+    /// The pattern or formula a new column is worked out with.
+    Recipe,
+    /// What to call a column: a new one, or one being renamed.
+    ColumnName,
+}
+
+/// Adding a column (`a`), one step at a time. The source column is the one
+/// under the cursor when it starts, so a regex extraction needs no more than
+/// the pattern itself.
+#[derive(Clone)]
+pub struct NewColumn {
+    /// `None` until the kind has been chosen.
+    pub kind: Option<NewKind>,
+    /// The column the cursor was on, which an extraction reads.
+    pub source: usize,
+    /// The pattern or formula, once typed.
+    pub recipe: Option<String>,
+}
+
+/// A formula that would not do, kept with the text it came from so the trouble
+/// can be pointed at rather than described.
+#[derive(Clone)]
+pub struct FormulaProblem {
+    /// The formula as it was typed.
+    pub text: String,
+    /// Character offset of the trouble, when it is in one place.
+    pub at: Option<usize>,
+    pub message: String,
+    pub hint: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NewKind {
+    /// A capture from the selected column's text.
+    Extract,
+    /// An expression over the columns.
+    Formula,
 }
 
 /// How many steps `z` can walk back, and how many row indices the whole history
@@ -84,6 +124,9 @@ struct ViewState {
     cols: Vec<usize>,
     col_widths: HashMap<usize, u16>,
     num_styles: HashMap<usize, NumStyle>,
+    /// The computed columns and renames, which live on the dataset rather than
+    /// here — so undoing `a` or `R` means putting these back too.
+    derived: Derived,
     frozen_cols: usize,
     selected_row: usize,
     selected_pos: usize,
@@ -378,6 +421,10 @@ pub struct App {
     pub confirm: bool,
     /// Set by `Esc` while the wizard is running.
     pub cancel_join: bool,
+    /// Adding a column, while that is going on.
+    pub new_column: Option<NewColumn>,
+    /// Why the formula just typed would not do, while it is being shown.
+    pub formula_problem: Option<FormulaProblem>,
     /// The `S` sort-key wizard, while one is running.
     pub key_sort: Option<KeySort>,
     /// Widths the user has set, keyed by dataset column. A column without one
@@ -449,6 +496,8 @@ impl App {
             join_active: false,
             confirm: false,
             cancel_join: false,
+            new_column: None,
+            formula_problem: None,
             key_sort: None,
             col_widths: HashMap::new(),
             resize: None,
@@ -542,6 +591,32 @@ impl App {
                 HeaderSpec::At { skip, named } => Some(SavedHeader { skip, named }),
             },
             row_numbers: self.show_line_numbers,
+            computed: self
+                .data
+                .derived()
+                .recipes()
+                .into_iter()
+                .map(|(name, recipe)| match recipe {
+                    Recipe::Extract { source, pattern } => SavedColumn {
+                        name,
+                        from: Some(source),
+                        extract: Some(pattern),
+                        formula: None,
+                    },
+                    Recipe::Formula { expression } => SavedColumn {
+                        name,
+                        from: None,
+                        extract: None,
+                        formula: Some(expression),
+                    },
+                })
+                .collect(),
+            renamed: self
+                .data
+                .derived()
+                .renames_by_original(&self.data.original_names)
+                .into_iter()
+                .collect(),
             summary: self.summary.map(|s| s.name().to_string()),
             summaries: self
                 .summary_cols
@@ -558,6 +633,31 @@ impl App {
     /// gained — in neither list — stay visible at the end rather than vanishing
     /// because a pattern written before them did not mention them.
     pub fn apply_pattern(&mut self, pattern: &Pattern) {
+        // The computed columns and renames come first: everything after this
+        // refers to columns by name, including the ones made here.
+        for saved in &pattern.computed {
+            let recipe = match (&saved.from, &saved.extract, &saved.formula) {
+                (Some(from), Some(extract), _) => Recipe::Extract {
+                    source: from.clone(),
+                    pattern: extract.clone(),
+                },
+                (_, _, Some(formula)) => Recipe::Formula {
+                    expression: formula.clone(),
+                },
+                _ => continue,
+            };
+            // A recipe naming a column the file no longer has is skipped; the
+            // rest of the arrangement still applies.
+            let _ = self.data.add_computed(&saved.name, recipe);
+        }
+        for (was, now) in &pattern.renamed {
+            if let Some(col) = self.data.original_names.iter().position(|n| n == was) {
+                let _ = self.data.rename(col, now);
+            }
+        }
+        self.cols = (0..self.data.ncols).collect();
+        self.selected_pos = 0;
+
         let index_of = |wanted: &str| {
             self.data
                 .column_names
@@ -685,6 +785,7 @@ impl App {
             cols: self.cols.clone(),
             col_widths: self.col_widths.clone(),
             num_styles: self.num_styles.clone(),
+            derived: self.data.derived().clone(),
             frozen_cols: self.frozen_cols,
             selected_row: self.selected_row,
             selected_pos: self.selected_pos,
@@ -704,6 +805,8 @@ impl App {
         self.cols = state.cols;
         self.col_widths = state.col_widths;
         self.num_styles = state.num_styles;
+        // Before the cursor is clamped: this decides how many columns there are.
+        self.data.set_derived(state.derived);
         self.frozen_cols = state.frozen_cols;
         self.selected_row = state.selected_row.min(self.last_row());
         self.selected_pos = state.selected_pos.min(self.last_col());
@@ -913,6 +1016,11 @@ impl App {
         }
         if self.resize.is_some() {
             return self.handle_resize(key);
+        }
+        // Only while the kind is being chosen: the two prompts after that are
+        // ordinary input.
+        if matches!(&self.new_column, Some(new) if new.kind.is_none()) {
+            return self.handle_new_column_kind(key);
         }
         match self.mode {
             Mode::Normal => self.handle_normal(key, now),
@@ -1240,6 +1348,142 @@ impl App {
         (name.max(widest) as u16).clamp(MIN_COL_WIDTH, MAX_COL_WIDTH)
     }
 
+    /// Begin adding a column, worked out from the ones already there.
+    fn start_new_column(&mut self) {
+        if self.cols.is_empty() {
+            return;
+        }
+        self.new_column = Some(NewColumn {
+            kind: None,
+            source: self.selected_col(),
+            recipe: None,
+        });
+    }
+
+    /// Choose between a regex extraction and a formula.
+    fn handle_new_column_kind(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return;
+        }
+        let kind = match key.code {
+            KeyCode::Char('e') => NewKind::Extract,
+            KeyCode::Char('f') => NewKind::Formula,
+            KeyCode::Esc => {
+                self.new_column = None;
+                self.status_msg = Some("no new column".into());
+                return;
+            }
+            _ => return,
+        };
+        if let Some(new) = &mut self.new_column {
+            new.kind = Some(kind);
+        }
+        self.enter_input(InputKind::Recipe);
+    }
+
+    /// Take the pattern or formula, then ask what to call the column.
+    ///
+    /// Checked here rather than at the end: learning that a formula will not do
+    /// only after naming the column would mean typing the whole thing again.
+    fn take_recipe(&mut self, text: String) {
+        if text.trim().is_empty() {
+            self.new_column = None;
+            self.status_msg = Some("no new column".into());
+            return;
+        }
+        let Some(new) = self.new_column.as_ref() else { return };
+        let trial = match new.kind {
+            Some(NewKind::Extract) => Recipe::Extract {
+                source: self.data.column_names[new.source].clone(),
+                pattern: text.clone(),
+            },
+            _ => Recipe::Formula {
+                expression: text.clone(),
+            },
+        };
+        if let Err(e) = self.data.validate_recipe(&trial) {
+            // Back to the prompt with the text still there, and the trouble
+            // shown over the table until it is edited.
+            let detail = e.downcast_ref::<FormulaError>();
+            self.formula_problem = Some(FormulaProblem {
+                text: text.clone(),
+                at: detail.and_then(|d| d.at),
+                message: detail
+                    .map(|d| d.message.clone())
+                    .unwrap_or_else(|| format!("{e}")),
+                hint: detail.and_then(|d| d.hint.clone()),
+            });
+            self.mode = Mode::Input(InputKind::Recipe);
+            self.input = text;
+            return;
+        }
+        let suggestion = match self.new_column.as_mut() {
+            Some(new) => {
+                new.recipe = Some(text);
+                match new.kind {
+                    Some(NewKind::Extract) => {
+                        format!("{}_part", self.data.column_names[new.source])
+                    }
+                    _ => "computed".to_string(),
+                }
+            }
+            None => return,
+        };
+        self.mode = Mode::Input(InputKind::ColumnName);
+        self.input = suggestion;
+    }
+
+    /// Add the column, or rename the selected one — whichever this name is for.
+    fn take_column_name(&mut self, name: String) {
+        let Some(new) = self.new_column.take() else {
+            return self.rename_column(name);
+        };
+        let (Some(kind), Some(text)) = (new.kind, new.recipe) else {
+            return;
+        };
+        let recipe = match kind {
+            NewKind::Extract => Recipe::Extract {
+                source: self.data.column_names[new.source].clone(),
+                pattern: text,
+            },
+            NewKind::Formula => Recipe::Formula { expression: text },
+        };
+        self.record("new column");
+        match self.data.add_computed(&name, recipe) {
+            Ok(()) => {
+                // Shown at the end, where it was added.
+                let col = self.data.ncols - 1;
+                self.cols.push(col);
+                self.selected_pos = self.last_col();
+                self.refresh_stats();
+                self.status_msg = Some(format!("added {name}"));
+            }
+            Err(e) => {
+                self.discard_record();
+                self.status_msg = Some(format!("{e}"));
+            }
+        }
+    }
+
+    /// Rename the selected column.
+    fn rename_column(&mut self, name: String) {
+        if name.trim().is_empty() {
+            return;
+        }
+        let col = self.selected_col();
+        let was = self.data.column_names[col].clone();
+        self.record("rename");
+        match self.data.rename(col, &name) {
+            Ok(()) => self.status_msg = Some(format!("{was} → {name}")),
+            Err(e) => {
+                self.discard_record();
+                self.status_msg = Some(format!("{e}"));
+            }
+        }
+    }
+
     /// Start the `S` wizard on the selected column.
     fn start_key_sort(&mut self) {
         if self.row_count() == 0 {
@@ -1456,6 +1700,9 @@ impl App {
             // `=` turns the summary line on and cycles it; holding it down puts
             // the line away.
             KeyCode::Char('=') => self.cycle_summary(now),
+            // `a` adds a column worked out from the others; `R` renames one.
+            KeyCode::Char('a') => self.start_new_column(),
+            KeyCode::Char('R') => self.enter_input(InputKind::ColumnName),
             KeyCode::Char('z') => self.undo(),
             KeyCode::Char('Z') => self.redo(),
             KeyCode::Char('r') => self.start_resize(),
@@ -1515,6 +1762,11 @@ impl App {
     }
 
     fn handle_input(&mut self, key: KeyEvent, kind: InputKind) {
+        // Any edit clears the last complaint: it described text that has
+        // changed since, and a stale caret points at nothing.
+        if !matches!(key.code, KeyCode::Enter) {
+            self.formula_problem = None;
+        }
         // The open prompt browses the filesystem; the others are plain text.
         if let InputKind::Open = kind
             && self.handle_open_key(key)
@@ -1526,6 +1778,10 @@ impl App {
                 self.mode = Mode::Normal;
                 self.input.clear();
                 self.completions = None;
+                self.formula_problem = None;
+                if self.new_column.take().is_some() {
+                    self.status_msg = Some("no new column".into());
+                }
             }
             KeyCode::Enter => self.commit_input(kind),
             KeyCode::Backspace => {
@@ -1638,7 +1894,9 @@ impl App {
             // Offered pre-filled with the file's name, which is the binding
             // most patterns want — and editable into a glob for the rest.
             InputKind::Pattern => Some(self.pattern_bind()),
-            InputKind::Goto | InputKind::Open => None,
+            // Renaming starts from the name it has now.
+            InputKind::ColumnName => Some(self.data.column_names[self.selected_col()].clone()),
+            InputKind::Goto | InputKind::Open | InputKind::Recipe => None,
         }
         .unwrap_or_default();
     }
@@ -1654,6 +1912,8 @@ impl App {
                 self.save_pattern = Some(query.trim().to_string());
                 return;
             }
+            InputKind::Recipe => return self.take_recipe(query),
+            InputKind::ColumnName => return self.take_column_name(query),
             InputKind::Open => {
                 let path = query.trim();
                 if !path.is_empty() {
@@ -1667,7 +1927,11 @@ impl App {
             match kind {
                 InputKind::Search | InputKind::ColumnSearch => self.search = None,
                 InputKind::Filter => self.clear_filter(),
-                InputKind::Goto | InputKind::Open | InputKind::Pattern => unreachable!(),
+                InputKind::Goto
+                | InputKind::Open
+                | InputKind::Pattern
+                | InputKind::Recipe
+                | InputKind::ColumnName => unreachable!(),
             }
             return;
         }
@@ -1682,7 +1946,11 @@ impl App {
             InputKind::Search => self.apply_search(query, re, None),
             InputKind::ColumnSearch => self.apply_search(query, re, Some(self.selected_col())),
             InputKind::Filter => self.apply_filter(query, re),
-            InputKind::Goto | InputKind::Open | InputKind::Pattern => unreachable!(),
+            InputKind::Goto
+                | InputKind::Open
+                | InputKind::Pattern
+                | InputKind::Recipe
+                | InputKind::ColumnName => unreachable!(),
         }
     }
 

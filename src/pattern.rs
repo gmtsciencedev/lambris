@@ -60,10 +60,33 @@ pub struct Pattern {
     /// Columns showing something other than that, by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub summaries: BTreeMap<String, String>,
+    /// Columns worked out from the others, in the order they were added — a
+    /// later one may refer to an earlier one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub computed: Vec<SavedColumn>,
+    /// Columns renamed, from the name the file gives them to the new one.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub renamed: BTreeMap<String, String>,
 }
 
 fn yes() -> bool {
     true
+}
+
+/// A computed column: its name and how it is worked out. Exactly one of
+/// `extract` (with `from`) or `formula` is set.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SavedColumn {
+    pub name: String,
+    /// The column an extraction reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// The regex whose first capture becomes the value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extract: Option<String>,
+    /// An expression over the columns: `{a} + "x"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formula: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]

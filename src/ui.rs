@@ -8,8 +8,8 @@ use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::app::{
-    App, InputKind, KeySort, KeyStage, Mode, NumStyle, SortDir, MAX_COL_WIDTH, MAX_SET_WIDTH,
-    MIN_COL_WIDTH, MIN_SET_WIDTH,
+    App, FormulaProblem, InputKind, KeySort, KeyStage, Mode, NewKind, NumStyle, SortDir,
+    MAX_COL_WIDTH, MAX_SET_WIDTH, MIN_COL_WIDTH, MIN_SET_WIDTH,
 };
 use crate::browse::{Completions, VISIBLE};
 
@@ -49,6 +49,9 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         "Columns",
         &[
             ("( / )", "aim the next column command at every column right / left"),
+            ("a", "add a column: pulled out of this one, or worked out by formula"),
+            ("", "  formula: {col} + \"x\" · {a}/{b}*100 · {x}**2 · sqrt log round …"),
+            ("R", "rename it"),
             ("x", "hide it"),
             ("[ / ]", "move it left / right (or Shift-←/→)"),
             ("r", "set its width — `( r` evens out a whole block of them"),
@@ -202,6 +205,10 @@ pub fn render(
     // The path picker sits over the table, just above its prompt.
     if let Some(listing) = &app.completions {
         render_completions(frame, body_area, listing);
+    }
+    // A formula that would not do is shown over the table, with the spot marked.
+    if let Some(problem) = &app.formula_problem {
+        render_formula_problem(frame, body_area, problem);
     }
     Ok(())
 }
@@ -495,6 +502,68 @@ fn render_table(
     }
     frame.render_widget(table, area);
     Ok(clipped)
+}
+
+/// A box of `width` × `height` in the middle of `area`, or as much of one as
+/// there is room for.
+fn centred(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
+/// Show a formula that would not do, with a caret under the spot and a word
+/// about what was expected there. Saying *where* is most of what makes a
+/// formula fixable, and a single status-bar line has nowhere to put it.
+fn render_formula_problem(frame: &mut Frame, area: Rect, problem: &FormulaProblem) {
+    let text: Vec<char> = problem.text.chars().collect();
+    let box_width = (problem.text.chars().count().max(40) as u16 + 6).min(area.width);
+    let room = box_width.saturating_sub(4) as usize;
+
+    // Keep the marked spot on screen even when the formula is longer than the
+    // box: the window ends at the caret rather than starting at the beginning.
+    let caret = problem.at.unwrap_or(0).min(text.len());
+    let from = caret.saturating_sub(room.saturating_sub(2));
+    let shown: String = text.iter().skip(from).take(room).collect();
+    let elided = from > 0;
+    let formula = match elided {
+        true => format!("…{shown}"),
+        false => shown,
+    };
+    let marker_at = caret - from + elided as usize;
+
+    let mut lines = vec![Line::from(Span::styled(
+        formula,
+        Style::new().fg(Color::White),
+    ))];
+    if problem.at.is_some() {
+        lines.push(Line::from(Span::styled(
+            format!("{}↑", " ".repeat(marker_at)),
+            Style::new().fg(Color::Red).bold(),
+        )));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        problem.message.clone(),
+        Style::new().fg(Color::Yellow).bold(),
+    )));
+    if let Some(hint) = &problem.hint {
+        lines.push(Line::from(Span::styled(hint.clone(), Style::new().dim())));
+    }
+
+    let height = lines.len() as u16 + 2;
+    let box_area = centred(area, box_width, height);
+    let block = Block::bordered()
+        .title(" formula ")
+        .title_bottom(" keep typing to fix it · Esc gives up ")
+        .border_style(Style::new().fg(Color::Red));
+    frame.render_widget(Clear, box_area);
+    frame.render_widget(Paragraph::new(lines).block(block), box_area);
 }
 
 /// Draw the `?` key reference over the table, scrolled to `app.help_offset`.
@@ -798,6 +867,11 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App, clipped: &Clipped) {
             InputKind::Goto => ":",
             InputKind::Open => "open ",
             InputKind::Pattern => "pattern ",
+            InputKind::Recipe => match app.new_column.as_ref().and_then(|n| n.kind) {
+                Some(NewKind::Extract) => "extract ",
+                _ => "formula ",
+            },
+            InputKind::ColumnName => "name ",
         };
         let line = Line::from(vec![
             Span::styled(
@@ -929,6 +1003,21 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App, banner: Option<&str>) {
         frame.render_widget(line, area);
         return;
     }
+    // Choosing what kind of column to add.
+    if matches!(&app.new_column, Some(new) if new.kind.is_none()) {
+        let line = Line::from(vec![
+            Span::styled(
+                " new column ",
+                Style::new().fg(Color::Black).bg(Color::Yellow).bold(),
+            ),
+            Span::styled(
+                " e: pull it out of this column with a pattern · f: work it out with a formula · Esc",
+                Style::new().dim(),
+            ),
+        ]);
+        frame.render_widget(line, area);
+        return;
+    }
     if app.scope.is_some() {
         let (from, to) = app.scoped_span();
         let line = Line::from(vec![
@@ -986,6 +1075,22 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App, banner: Option<&str>) {
         return;
     }
     let line = match app.mode {
+        Mode::Input(InputKind::Recipe) => {
+            match app.new_column.as_ref().and_then(|n| n.kind) {
+                Some(NewKind::Extract) => Line::from(Span::styled(
+                    " a regex over this column · the first (group) is kept, or the whole match",
+                    Style::new().dim(),
+                )),
+                _ => Line::from(Span::styled(
+                    " {column} + \"text\" · {a}/{b}*100 · {x}**2 · log sqrt round min … · + - * / ( )",
+                    Style::new().dim(),
+                )),
+            }
+        }
+        Mode::Input(InputKind::ColumnName) => Line::from(Span::styled(
+            " what to call it · Enter accepts · Esc cancels",
+            Style::new().dim(),
+        )),
         Mode::Input(InputKind::Pattern) => Line::from(Span::styled(
             " name or glob this view is remembered for · Enter saves · empty forgets · Esc cancels",
             Style::new().dim(),

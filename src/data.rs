@@ -18,6 +18,8 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use flate2::read::MultiGzDecoder;
+
+use crate::formula::{Formula, FormulaError, Value};
 // `DataType` is imported anonymously: it carries the cell accessors we need
 // (`as_datetime`), and the name would collide with Arrow's own `DataType`.
 use calamine::{open_workbook_auto, Data, DataType as _, Range, Reader};
@@ -142,6 +144,71 @@ impl SortMethod {
     }
 }
 
+/// How a computed column is worked out. Kept as the text the user typed, so it
+/// can be shown, saved in a pattern and read back.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Recipe {
+    /// The first capture of a regex over another column — or the whole match,
+    /// when the pattern has no capture group. `csvtk mutate -p`.
+    Extract { source: String, pattern: String },
+    /// An expression over the columns. `csvtk mutate2 -e`.
+    Formula { expression: String },
+}
+
+/// A column worked out from the others rather than read from the file.
+///
+/// The rule is evaluated when a chunk is decoded and the result appended to it,
+/// so a computed column is an ordinary column everywhere above this layer:
+/// sortable, filterable, summable, hideable, and part of a transpose or a join.
+/// Nothing is materialised, so this works on a file far too large to hold.
+#[derive(Clone)]
+struct Computed {
+    name: String,
+    recipe: Recipe,
+    rule: Rule,
+    /// Settled when the column is made, so every chunk builds the same type and
+    /// the schema stays put.
+    dtype: DataType,
+}
+
+#[derive(Clone)]
+enum Rule {
+    Extract { source: usize, re: Regex },
+    Formula { formula: Formula, refs: Vec<usize> },
+}
+
+/// The columns worked out here rather than read from the file, and any names
+/// the user has changed. Held together so it can be put back in one go by undo.
+#[derive(Clone, Default)]
+pub struct Derived {
+    computed: Vec<Computed>,
+    /// Names the user changed, by column index.
+    renames: HashMap<usize, String>,
+}
+
+impl Derived {
+    /// What each computed column is called and how it is worked out, for saving.
+    pub fn recipes(&self) -> Vec<(String, Recipe)> {
+        self.computed
+            .iter()
+            .map(|c| (c.name.clone(), c.recipe.clone()))
+            .collect()
+    }
+
+    /// The names that have been changed, by the name they had at load.
+    pub fn renames_by_original<'a>(
+        &'a self,
+        original: &'a [String],
+    ) -> Vec<(String, String)> {
+        self.renames
+            .iter()
+            .filter_map(|(&col, name)| {
+                original.get(col).map(|was| (was.clone(), name.clone()))
+            })
+            .collect()
+    }
+}
+
 /// A lazily-loaded view of one table: a parquet or CSV/TSV file, or a single
 /// worksheet of an Excel workbook. For the lazy formats only the schema, some
 /// metadata, and a bounded LRU cache of decoded chunks live in memory and cells
@@ -161,7 +228,15 @@ pub struct Dataset {
     /// header row — used up none of the file's rows.
     comment_header: bool,
     backend: Backend,
+    /// The schema as the file gives it, which is what a chunk is decoded with.
+    base_schema: SchemaRef,
+    /// What the viewer shows: the file's columns, renamed if asked, plus any
+    /// computed ones.
     schema: SchemaRef,
+    /// The file's own column names, kept so a rename can be undone or saved
+    /// against the name the file uses.
+    pub original_names: Vec<String>,
+    derived: Derived,
     pub column_names: Vec<String>,
     pub column_types: Vec<String>,
     pub nrows: usize,
@@ -222,7 +297,8 @@ impl Dataset {
             // into memory, so there is no lazy backend to set up here.
             Source::Excel => unreachable!("workbooks are opened per sheet"),
         };
-        let column_names = schema.fields().iter().map(|f| f.name().clone()).collect();
+        let column_names: Vec<String> =
+            schema.fields().iter().map(|f| f.name().clone()).collect();
         let column_types = schema
             .fields()
             .iter()
@@ -237,6 +313,9 @@ impl Dataset {
             header,
             comment_header,
             backend,
+            base_schema: schema.clone(),
+            original_names: column_names.clone(),
+            derived: Derived::default(),
             schema,
             column_names,
             column_types,
@@ -261,6 +340,208 @@ impl Dataset {
             }
             source => Dataset::from_source(&self.path, source, header),
         }
+    }
+
+    /// The columns worked out here and the names that have been changed, so the
+    /// lot can be put back by undo or written into a pattern.
+    pub fn derived(&self) -> &Derived {
+        &self.derived
+    }
+
+    /// Put back a remembered set of computed columns and renames. The chunk
+    /// cache goes with it: what is in there was built for the old columns.
+    pub fn set_derived(&mut self, derived: Derived) {
+        self.derived = derived;
+        self.cache.lock().unwrap().clear();
+        self.refresh_schema();
+    }
+
+    /// Add a column worked out from the others. The type is settled now, from a
+    /// sample, so every chunk builds the same one.
+    pub fn add_computed(&mut self, name: &str, recipe: Recipe) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            anyhow::bail!("a column needs a name");
+        }
+        if self.column_names.iter().any(|n| n == name) {
+            anyhow::bail!("there is already a column called {name}");
+        }
+        let rule = self.compile(&recipe)?;
+        // Worked out over the first rows to settle the type, exactly as the
+        // delimited reader settles a file's types from a sample.
+        let mut trial = self.derived.clone();
+        trial.computed.push(Computed {
+            name: name.to_string(),
+            recipe: recipe.clone(),
+            rule: rule.clone(),
+            dtype: DataType::Utf8,
+        });
+        let sample = self.sample_computed(&trial)?;
+        // Text that only looks like a number stays text. `0421` pulled out of a
+        // sample id must not come back as `421`: the padding is part of the
+        // name, and a computed column is the one place we know the values were
+        // text to begin with.
+        let dtype = if sample.iter().flatten().any(|v| looks_padded(v)) {
+            DataType::Utf8
+        } else {
+            infer_array(&sample).data_type().clone()
+        };
+
+        self.derived.computed.push(Computed {
+            name: name.to_string(),
+            recipe,
+            rule,
+            dtype,
+        });
+        self.cache.lock().unwrap().clear();
+        self.refresh_schema();
+        Ok(())
+    }
+
+    /// Rename a column. The file's own name is kept, so this can be undone and
+    /// saved against a name that does not move.
+    pub fn rename(&mut self, col: usize, name: &str) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            anyhow::bail!("a column needs a name");
+        }
+        if self
+            .column_names
+            .iter()
+            .enumerate()
+            .any(|(i, n)| i != col && n == name)
+        {
+            anyhow::bail!("there is already a column called {name}");
+        }
+        self.derived.renames.insert(col, name.to_string());
+        // Names live in the schema, which the cached batches carry.
+        self.cache.lock().unwrap().clear();
+        self.refresh_schema();
+        Ok(())
+    }
+
+    /// Check a recipe without adding anything, so the wizard can complain about
+    /// a formula while it is still on screen to be fixed.
+    pub fn validate_recipe(&self, recipe: &Recipe) -> Result<()> {
+        self.compile(recipe).map(|_| ())
+    }
+
+    /// Turn a recipe into something that can be run over a chunk, resolving the
+    /// column names it mentions.
+    fn compile(&self, recipe: &Recipe) -> Result<Rule> {
+        let index_of = |name: &str| {
+            self.column_names
+                .iter()
+                .position(|n| n == name)
+                .with_context(|| format!("there is no column called {name}"))
+        };
+        Ok(match recipe {
+            Recipe::Extract { source, pattern } => Rule::Extract {
+                source: index_of(source)?,
+                re: Regex::new(pattern)
+                    .with_context(|| format!("{pattern} is not a valid pattern"))?,
+            },
+            Recipe::Formula { expression } => {
+                let formula = Formula::parse(expression)?;
+                // A name the table hasn't got is reported where it appears, so
+                // the formula can be shown back with the spot marked.
+                let mut refs = Vec::with_capacity(formula.refs.len());
+                for (name, at) in &formula.refs {
+                    match self.column_names.iter().position(|n| n == name) {
+                        Some(col) => refs.push(col),
+                        None => {
+                            return Err(FormulaError {
+                                at: Some(*at),
+                                message: format!("there is no column called {name}"),
+                                hint: Some(format!(
+                                    "the ones there are: {}",
+                                    self.column_names.join(", ")
+                                )),
+                            }
+                            .into())
+                        }
+                    }
+                }
+                Rule::Formula { formula, refs }
+            }
+        })
+    }
+
+    /// The new column's values over the first chunk, for settling its type.
+    fn sample_computed(&self, trial: &Derived) -> Result<Vec<Option<String>>> {
+        let mut probe = Dataset {
+            path: self.path.clone(),
+            label: self.label.clone(),
+            sheet: self.sheet.clone(),
+            header: self.header,
+            comment_header: self.comment_header,
+            backend: Backend::Memory(Arc::new(RecordBatch::new_empty(
+                self.base_schema.clone(),
+            ))),
+            base_schema: self.base_schema.clone(),
+            original_names: self.original_names.clone(),
+            derived: trial.clone(),
+            schema: self.schema.clone(),
+            column_names: self.column_names.clone(),
+            column_types: self.column_types.clone(),
+            nrows: 0,
+            ncols: self.ncols,
+            cache: Mutex::new(ChunkCache::new(1)),
+        };
+        probe.refresh_schema();
+        let base = self.load_chunk(0)?;
+        let with_new = probe.with_computed(base)?;
+        let last = with_new.num_columns() - 1;
+        let array = with_new.column(last);
+        let options = FormatOptions::default().with_null("");
+        let text = ArrayFormatter::try_new(array, &options)?;
+        Ok((0..array.len())
+            .map(|r| (!array.is_null(r)).then(|| text.value(r).to_string()))
+            .collect())
+    }
+
+    /// Rebuild what the viewer shows from the file's schema plus the derived
+    /// columns and renames.
+    fn refresh_schema(&mut self) {
+        let mut fields: Vec<Field> = self
+            .base_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let name = self
+                    .derived
+                    .renames
+                    .get(&i)
+                    .cloned()
+                    .unwrap_or_else(|| f.name().clone());
+                Field::new(name, f.data_type().clone(), f.is_nullable())
+            })
+            .collect();
+        let base = fields.len();
+        for (i, computed) in self.derived.computed.iter().enumerate() {
+            let name = self
+                .derived
+                .renames
+                .get(&(base + i))
+                .cloned()
+                .unwrap_or_else(|| computed.name.clone());
+            fields.push(Field::new(name, computed.dtype.clone(), true));
+        }
+        self.schema = Arc::new(Schema::new(fields));
+        self.column_names = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        self.column_types = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.data_type().to_string())
+            .collect();
+        self.ncols = self.schema.fields().len();
     }
 
     /// The worksheet this came from, when the file is a workbook.
@@ -296,7 +577,8 @@ impl Dataset {
         header: HeaderSpec,
     ) -> Self {
         let schema = batch.schema();
-        let column_names = schema.fields().iter().map(|f| f.name().clone()).collect();
+        let column_names: Vec<String> =
+            schema.fields().iter().map(|f| f.name().clone()).collect();
         let column_types = schema
             .fields()
             .iter()
@@ -311,6 +593,9 @@ impl Dataset {
             header,
             comment_header: false,
             backend: Backend::Memory(Arc::new(batch)),
+            base_schema: schema.clone(),
+            original_names: column_names.clone(),
+            derived: Derived::default(),
             schema,
             column_names,
             column_types,
@@ -496,13 +781,98 @@ impl Dataset {
     }
 
     /// Fetch chunk `k` (rows `k*CHUNK..`), loading and caching it if needed.
+    ///
+    /// Computed columns are worked out here and appended, so everything above
+    /// this layer sees them as ordinary columns. The cache holds the finished
+    /// batch, so a rule runs once per chunk residency rather than once per look.
     fn chunk(&self, k: usize) -> Result<Arc<RecordBatch>> {
         if let Some(batch) = self.cache.lock().unwrap().get(k) {
             return Ok(batch);
         }
-        let batch = Arc::new(self.load_chunk(k)?);
+        let batch = Arc::new(self.with_computed(self.load_chunk(k)?)?);
         self.cache.lock().unwrap().put(k, batch.clone());
         Ok(batch)
+    }
+
+    /// Work out each computed column over `batch` and append it, in order — so
+    /// a later rule may refer to an earlier one, the way a pipeline of `mutate`
+    /// calls does.
+    fn with_computed(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        if self.derived.computed.is_empty() {
+            // Still rebuilt, so a rename reaches the batch's own field names.
+            return RecordBatch::try_new(self.schema.clone(), batch.columns().to_vec())
+                .context("naming columns");
+        }
+        let rows = batch.num_rows();
+        let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+        let options = FormatOptions::default().with_null("");
+        for computed in &self.derived.computed {
+            let values: Vec<Option<String>> = match &computed.rule {
+                Rule::Extract { source, re } => {
+                    let array = columns
+                        .get(*source)
+                        .with_context(|| format!("column {source} has gone"))?;
+                    let text = ArrayFormatter::try_new(array, &options)?;
+                    (0..rows)
+                        .map(|r| {
+                            if array.is_null(r) {
+                                return None;
+                            }
+                            let cell = text.value(r).to_string();
+                            let caught = re.captures(&cell)?;
+                            // Group 1 if the pattern has one, else the whole
+                            // match — which is what `csvtk mutate -p` does.
+                            let piece = caught.get(1).or_else(|| caught.get(0))?;
+                            Some(piece.as_str().to_string())
+                        })
+                        .collect()
+                }
+                Rule::Formula { formula, refs } => {
+                    // One formatter per referenced column, and whether it holds
+                    // numbers: a reference to a numeric column is a number, so
+                    // arithmetic works and text is never quietly renumbered.
+                    let mut sources = Vec::with_capacity(refs.len());
+                    for &col in refs {
+                        let array = columns
+                            .get(col)
+                            .with_context(|| format!("column {col} has gone"))?
+                            .clone();
+                        let numeric = self.is_numeric(col);
+                        sources.push((array, numeric));
+                    }
+                    let formatters: Vec<ArrayFormatter> = sources
+                        .iter()
+                        .map(|(array, _)| ArrayFormatter::try_new(array, &options))
+                        .collect::<std::result::Result<_, _>>()?;
+                    (0..rows)
+                        .map(|r| {
+                            let slots: Vec<Value> = sources
+                                .iter()
+                                .zip(&formatters)
+                                .map(|((array, numeric), text)| {
+                                    if array.is_null(r) {
+                                        return Value::Empty;
+                                    }
+                                    let cell = text.value(r).to_string();
+                                    match numeric {
+                                        true => cell
+                                            .trim()
+                                            .parse::<f64>()
+                                            .map(Value::Number)
+                                            .unwrap_or(Value::Empty),
+                                        false => Value::Text(cell),
+                                    }
+                                })
+                                .collect();
+                            formula.eval(&slots).text()
+                        })
+                        .collect()
+                }
+            };
+            columns.push(typed_array(&values, &computed.dtype));
+        }
+        RecordBatch::try_new(self.schema.clone(), columns)
+            .context("adding the computed columns")
     }
 
     fn load_chunk(&self, k: usize) -> Result<RecordBatch> {
@@ -517,7 +887,7 @@ impl Dataset {
             Backend::Memory(batch) => {
                 let start = k * CHUNK;
                 if start >= batch.num_rows() {
-                    return Ok(RecordBatch::new_empty(self.schema.clone()));
+                    return Ok(RecordBatch::new_empty(self.base_schema.clone()));
                 }
                 let len = CHUNK.min(batch.num_rows() - start);
                 Ok(batch.slice(start, len))
@@ -538,7 +908,7 @@ impl Dataset {
         for batch in reader {
             batches.push(batch.context("decoding parquet chunk")?);
         }
-        concat(&self.schema, &batches)
+        concat(&self.base_schema, &batches)
     }
 
     fn load_csv_chunk(
@@ -549,7 +919,7 @@ impl Dataset {
         text: &Path,
     ) -> Result<RecordBatch> {
         let Some(&start) = offsets.get(k) else {
-            return Ok(RecordBatch::new_empty(self.schema.clone()));
+            return Ok(RecordBatch::new_empty(self.base_schema.clone()));
         };
         let mut file = File::open(text)?;
         file.seek(SeekFrom::Start(start))?;
@@ -571,7 +941,7 @@ impl Dataset {
         let format = CsvFormat::default()
             .with_header(false)
             .with_delimiter(delimiter);
-        let reader = CsvReaderBuilder::new(self.schema.clone())
+        let reader = CsvReaderBuilder::new(self.base_schema.clone())
             .with_format(format)
             .with_batch_size(CHUNK)
             .build(Cursor::new(bytes))
@@ -580,7 +950,7 @@ impl Dataset {
         for batch in reader {
             batches.push(batch.context("decoding CSV chunk")?);
         }
-        concat(&self.schema, &batches)
+        concat(&self.base_schema, &batches)
     }
 
     /// Whether a column holds a numeric Arrow type (int, uint, float, decimal).
@@ -1091,6 +1461,11 @@ impl ChunkCache {
             }
         }
         self.touch(k);
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
     }
 
     fn touch(&mut self, k: usize) {
@@ -1772,6 +2147,38 @@ fn cell_text(cell: &Data) -> Option<String> {
         Data::DurationIso(s) => s.trim().to_string(),
     };
     (!text.is_empty()).then_some(text)
+}
+
+/// Whether text is a number written with padding that reading it as a number
+/// would throw away — `0421`, but not `0.5` or `0`.
+fn looks_padded(text: &str) -> bool {
+    let digits = text.trim().trim_start_matches('-');
+    digits.len() > 1 && digits.starts_with('0') && !digits.starts_with("0.")
+}
+
+/// Build an array of exactly `dtype` from text, leaving anything that will not
+/// parse as a null. The type is settled once when a computed column is made, so
+/// every chunk agrees and the schema stays put.
+fn typed_array(values: &[Option<String>], dtype: &DataType) -> ArrayRef {
+    let cleaned = || {
+        values
+            .iter()
+            .map(|v| v.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+    };
+    match dtype {
+        DataType::Int64 => {
+            let a: Int64Array = cleaned().map(|v| v.and_then(|s| s.parse().ok())).collect();
+            Arc::new(a)
+        }
+        DataType::Float64 => {
+            let a: Float64Array = cleaned().map(|v| v.and_then(|s| s.parse().ok())).collect();
+            Arc::new(a)
+        }
+        _ => {
+            let a: StringArray = cleaned().collect();
+            Arc::new(a)
+        }
+    }
 }
 
 /// Build a typed array from string values, inferring Int64 → Float64 → Utf8

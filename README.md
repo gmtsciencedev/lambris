@@ -49,6 +49,8 @@ cargo run --release -- --no-pattern data.csv
 | `s` | Sort by the selected column: cycles ascending → descending → unsorted |
 | `S` | Sort by *part* of the selected column (see [Sorting by part of a column](#sorting-by-part-of-a-column)) |
 | `f` | Freeze columns `0..=selected` (pinned while scrolling); press again to unfreeze |
+| `a` | Add a column worked out from the others (see [Computed columns](#computed-columns)) |
+| `R` | Rename the selected column |
 | `(` / `)` | Aim the next column command at every column to the right / left (see [Several columns at once](#several-columns-at-once)) |
 | `x` | Hide the selected column |
 | `r` | Set this column's width; `( r` evens out a whole block (`%` fits the values) |
@@ -207,7 +209,8 @@ A tuned view is worth keeping. `w` remembers the current arrangement and it is
 applied the next time that file is opened — the status bar says which pattern
 matched. `--no-pattern` opens files as they come.
 
-What is remembered: which columns are shown and in what order, which are hidden,
+What is remembered: computed columns and renamed ones, which columns are shown
+and in what order, which are hidden,
 widths, numeric styles, the sort (including a keyed `S` sort), the frozen prefix,
 the row filter, the row-number gutter, the summary line and what each column
 shows on it, and **how the top of the file is read** —
@@ -228,6 +231,11 @@ Everything is stored by **column name**, never by position:
   "frozen_through": "sample",
   "header": { "skip": 0, "named": true },
   "row_numbers": true,
+  "computed": [
+    { "name": "sample_name", "from": "External ID", "extract": "^[0-9]-SSH(.*)" },
+    { "name": "sat", "formula": "{sample_name} + \".sat\"" }
+  ],
+  "renamed": { "External ID": "id" },
   "summary": "auto",
   "summaries": { "reads": "mean" }
 }
@@ -330,6 +338,87 @@ counts what is hidden.
 Nothing is deleted — this is the *view*'s column order, held per tab, so the
 file is untouched and `u` always gets you back. It earns its keep after a join,
 where two tables' columns arrive together and only a few of them matter.
+
+### Computed columns
+
+`a` adds a column worked out from the ones already there — `csvtk mutate`, from
+inside the viewer. It asks which kind:
+
+**`e` — pull it out of this column.** Type a regex; the column gets the first
+`(group)`, or the whole match if the pattern has no group. The source is the
+column under the cursor, so there is no field to name:
+
+```
+#  External ID reads               #  External ID reads sample_name
+1  3-SSH0421   4300      a e       1  3-SSH0421   4300  0421
+2  7-SSH0422   2500   ^[0-9]-SSH(.*)  7-SSH0422   2500  0422
+3  odd         10                  3  odd         10    NA
+```
+
+A row the pattern does not match gets no value — `NA`, not an empty string.
+And `0421` stays `0421`: text that only looks like a number keeps its padding,
+because a padded sample number is a name rather than a quantity.
+
+**`f` — work it out with a formula.** `{column}` refers to a column by name,
+so a name with spaces or accents needs no escaping:
+
+| Formula | Result |
+| --- | --- |
+| `{sample} + ".sat"` | `S1.sat` — `+` joins when either side is text |
+| `{reads} / {total} * 100` | `43` — and the column is *typed* as a number |
+| `{n} ** 2` | a power; `^` says the same thing |
+| `round(ln({m}), 2)` | `2.77` |
+| `({a} + {b}) / 2` | parentheses and the usual precedence |
+| `"2026-08-20"` | a constant column |
+
+The whole language is `{columns}`, `"text"`, numbers, `+ - * / **`, parentheses,
+unary minus, and these functions:
+
+```
+ln  log  log2  exp  sqrt  abs  round(x[, places])  floor  ceil
+sin  cos  tan  min(a, b)  max(a, b)
+```
+
+`log` is base 10 and `ln` is natural — spelt out rather than left to be guessed.
+`**` binds tighter than `*` and associates to the right, so `2**3**2` is 512,
+and unary minus applies after it, so `-{n}**2` is `-({n}**2)` as it is written
+on paper.
+
+A reference to a numeric column is a number, so arithmetic works; a reference to
+a text column is text, so nothing is quietly renumbered. **A gap stays a gap**:
+anything touching a null comes out null, as does dividing by zero, taking the
+root of a negative, or doing arithmetic on text — one unworkable cell leaves one
+hole rather than spoiling the column.
+
+When a formula will not do, it is shown back with the spot marked, and the
+prompt stays open so it can be fixed rather than typed again:
+
+```
+┌ formula ───────────────────────────────────┐
+│log({other}) + {missing_column}             │
+│               ↑                            │
+│                                            │
+│there is no column called missing_column    │
+│the ones there are: col, other, squared     │
+└ keep typing to fix it · Esc gives up ──────┘
+```
+
+Formulas may refer to columns that were themselves computed, so a chain of them
+works the way a pipeline of `mutate` calls does.
+
+`R` renames the selected column, which is the other half of tidying up a file
+with headers like `ACTE DE PRÉLÈVEMENT - Date de prélèvement`.
+
+Both are remembered by `w`, recorded **by name** like everything else in a
+[pattern](#patterns), so a file always opens with its computed columns already
+there. Both are undoable with `z`.
+
+Nothing is materialised: the rule is worked out when a chunk of rows is decoded
+and appended to it, so a computed column is an ordinary column everywhere —
+sortable, filterable, searchable, part of the summary line, hideable,
+transposable, joinable — and this works on a file far too large to hold in
+memory. Its type is settled once, from the first rows, so the column keeps one
+type throughout.
 
 ### Several columns at once
 
@@ -571,9 +660,9 @@ data could be misread as a header.
 
 Core viewer plus regex search, row filtering, type-aware sorting (whole column
 or a slice of one), column freeze, hiding, reordering and resizing columns,
-undo/redo over all of it, a per-column summary line, saved per-file
-arrangements, a transposed view, joins between tabs, and tabs over several open
-files or workbook sheets. Nulls are shown as a highlighted `NA`. Sort
+undo/redo over all of it, computed and renamed columns, a per-column summary
+line, saved per-file arrangements, a transposed view, joins between tabs, and
+tabs over several open files or workbook sheets. Nulls are shown as a highlighted `NA`. Sort
 composes with the active filter, and the cursor stays on the same record across
 a re-sort.
 
