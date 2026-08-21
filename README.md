@@ -40,6 +40,7 @@ cargo run --release -- --no-header data.csv
 | `-` | Column search — same as `/` but confined to the selected column |
 | `n` / `N` | Jump to next / previous search match (within scope) |
 | `&` | Filter rows to those with a cell matching a regex |
+| `z` / `Z` | Undo / redo the last change to the view (see [Undo](#undo)) |
 | `s` | Sort by the selected column: cycles ascending → descending → unsorted |
 | `S` | Sort by *part* of the selected column (see [Sorting by part of a column](#sorting-by-part-of-a-column)) |
 | `f` | Freeze columns `0..=selected` (pinned while scrolling); press again to unfreeze |
@@ -116,6 +117,40 @@ ones.
 Since a transposed view is itself just a table on that tab's stack, transposing
 in one tab leaves the others alone, and `t`/`Esc` pops only that tab's view
 rather than closing the tab.
+
+## Undo
+
+`z` steps back through changes to the view and `Z` steps forward again, each
+saying what it did (`undid sort`, `redid filter`). It covers the changes that
+have no obvious way back:
+
+- sorting, including a keyed `S` sort — `s` only cycles ascending → descending →
+  off, and cannot clear a keyed sort at all
+- filters and searches, including clearing them
+- hiding, moving and resizing columns — and `u`, which throws away every one of
+  those arrangements in a single press
+- numeric styles, decimals, and frozen columns
+
+One press puts back a whole `u`, or a whole resize, since a resize is recorded
+as the one change it looks like rather than one per keypress. Restoring a filter
+or a sort is instant: the row order is *remembered*, not recomputed, so undoing
+a filter over a large file costs nothing. The cursor goes back to where it was
+too — undo puts the view back as it stood, not as you left it.
+
+Changes that already reverse themselves are deliberately left out, since a
+second press of the same key is the way back: `t` leaves a transposed view, `T`
+toggles the header reading, `H` again puts a promoted header back, and `Ctrl-w`
+closes a tab that `o` or `J` opened. History is per tab, so undoing in one tab
+never disturbs another.
+
+Note that `T` and `H` re-read the file, which starts the tab from a fresh view —
+so they clear its history along with its filter and sort. Undo cannot reach back
+past one of those.
+
+A cancelled change leaves nothing behind — abandoning a resize with `Esc`, or
+interrupting a slow sort with `Ctrl-C`, does not consume an undo step. The
+history keeps the last 32 changes, and drops the oldest early if they are
+holding on to too many rows between them.
 
 ## Sorting by part of a column
 
@@ -373,8 +408,9 @@ data could be misread as a header.
 ## Scope
 
 Core viewer plus regex search, row filtering, type-aware sorting (whole column
-or a slice of one), column freeze, hiding and reordering columns, a transposed
-view, joins between tabs, and tabs over several open files or workbook sheets. Nulls are shown as a highlighted `NA`. Sort
+or a slice of one), column freeze, hiding, reordering and resizing columns,
+undo/redo over all of it, a transposed view, joins between tabs, and tabs over
+several open files or workbook sheets. Nulls are shown as a highlighted `NA`. Sort
 composes with the active filter, and the cursor stays on the same record across
 a re-sort.
 

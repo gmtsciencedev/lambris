@@ -1022,6 +1022,158 @@ mod tests {
     }
 
     #[test]
+    fn undo_and_redo_walk_back_and_forth() {
+        let csv = "id,name\n3,c\n1,a\n2,b\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        let order = |app: &App| -> Vec<String> {
+            app.data
+                .cells(0, &app.view_rows(usize::MAX))
+                .unwrap()
+                .into_iter()
+                .flatten()
+                .collect()
+        };
+        assert_eq!(order(&app), vec!["3", "1", "2"]);
+
+        // Sort, filter, then hide a column.
+        app.handle_key(key('s'));
+        assert_eq!(order(&app), vec!["1", "2", "3"]);
+        app.handle_key(key('&'));
+        type_str(&mut app, "a");
+        app.handle_key(code(KeyCode::Enter));
+        assert_eq!(app.row_count(), 1);
+        app.handle_key(key('x'));
+        assert_eq!(app.visible_cols(), &[1]);
+
+        // `z` walks back through each of them, saying what it undid.
+        app.handle_key(key('z'));
+        assert_eq!(app.status_msg.as_deref(), Some("undid hide column"));
+        assert_eq!(app.visible_cols(), &[0, 1]);
+        app.handle_key(key('z'));
+        assert_eq!(app.status_msg.as_deref(), Some("undid filter"));
+        assert_eq!(app.row_count(), 3);
+        assert_eq!(order(&app), vec!["1", "2", "3"], "still sorted");
+        app.handle_key(key('z'));
+        assert_eq!(app.status_msg.as_deref(), Some("undid sort"));
+        assert_eq!(order(&app), vec!["3", "1", "2"], "back to the file's order");
+        assert!(app.sort.is_none());
+
+        // And `Z` walks forward again.
+        app.handle_key(key('Z'));
+        assert_eq!(app.status_msg.as_deref(), Some("redid sort"));
+        assert_eq!(order(&app), vec!["1", "2", "3"]);
+        app.handle_key(key('Z'));
+        assert_eq!(app.row_count(), 1);
+        app.handle_key(key('Z'));
+        assert_eq!(app.visible_cols(), &[1]);
+
+        // Nothing left in either direction is said, not silently ignored.
+        app.handle_key(key('Z'));
+        assert_eq!(app.status_msg.as_deref(), Some("nothing to redo"));
+        for _ in 0..4 {
+            app.handle_key(key('z'));
+        }
+        assert_eq!(app.status_msg.as_deref(), Some("nothing to undo"));
+    }
+
+    #[test]
+    fn undo_brings_back_what_u_threw_away() {
+        // `u` restores every column at once, which can discard a lot of work.
+        let csv = "a,b,c,d\n1,2,3,4\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        app.selected_pos = 3;
+        app.handle_key(key('x')); // hide d
+        app.selected_pos = 0;
+        app.handle_key(key(']')); // a and b swap
+        app.handle_key(key('r')); // and a width
+        app.handle_key(code(KeyCode::Left));
+        app.handle_key(code(KeyCode::Enter));
+        let arranged = app.visible_cols().to_vec();
+        let width = app.col_width(app.selected_col());
+        assert_eq!(arranged, vec![1, 0, 2]);
+        assert!(width.is_some());
+
+        app.handle_key(key('u'));
+        assert_eq!(app.visible_cols(), &[0, 1, 2, 3]);
+        assert_eq!(app.col_width(0), None);
+
+        // One `z` puts the whole arrangement back.
+        app.handle_key(key('z'));
+        assert_eq!(app.status_msg.as_deref(), Some("undid restore columns"));
+        assert_eq!(app.visible_cols(), arranged);
+        assert_eq!(app.col_width(app.selected_col()), width);
+    }
+
+    #[test]
+    fn undo_puts_back_a_sort_on_the_wrong_column() {
+        // The other case that is hard to undo by hand: `s` cycles asc → desc →
+        // off, so a mis-aimed sort takes three presses to clear — and a keyed
+        // sort cannot be cleared by `s` at all without re-running the wizard.
+        let csv = "id,name\n3,c\n1,a\n2,b\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        app.selected_pos = 1;
+        app.handle_key(key('S'));
+        app.handle_key(code(KeyCode::Enter));
+        app.handle_key(code(KeyCode::Enter));
+        app.handle_key(key('a'));
+        assert!(app.sort.unwrap().key.is_some());
+        // `c` sorts last of a/b/c, and the cursor went with its record.
+        assert_eq!(app.selected_row, 2);
+
+        app.handle_key(key('z'));
+        assert!(app.sort.is_none(), "the keyed sort is gone in one press");
+        assert_eq!(app.selected_row, 0, "and the cursor is back where it was");
+    }
+
+    #[test]
+    fn a_cancelled_change_leaves_no_step_behind() {
+        let csv = "a,b\n1,2\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        // A resize abandoned with Esc changes nothing, so there is nothing to
+        // undo — pressing `z` must not consume an unrelated step.
+        app.handle_key(key('f')); // one real change: freeze
+        app.handle_key(key('r'));
+        app.handle_key(code(KeyCode::Left));
+        app.handle_key(code(KeyCode::Esc));
+        app.handle_key(key('z'));
+        assert_eq!(app.status_msg.as_deref(), Some("undid freeze"));
+        assert_eq!(app.frozen_cols, 0);
+    }
+
+    #[test]
+    fn doing_something_new_drops_the_forward_history() {
+        let csv = "a\n1\n2\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        app.handle_key(key('s'));
+        app.handle_key(key('z'));
+        assert!(app.sort.is_none());
+        // A new change replaces what `Z` would have gone forward to.
+        app.handle_key(key('f'));
+        app.handle_key(key('Z'));
+        assert_eq!(app.status_msg.as_deref(), Some("nothing to redo"));
+        assert_eq!(app.frozen_cols, 1, "the new change stands");
+    }
+
+    #[test]
+    fn the_history_has_a_bottom() {
+        let csv = "a\n1\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        // Comfortably more changes than the history keeps.
+        for _ in 0..app::MAX_UNDO_STEPS + 8 {
+            app.handle_key(key('f'));
+        }
+        let mut undone = 0;
+        for _ in 0..app::MAX_UNDO_STEPS + 8 {
+            app.handle_key(key('z'));
+            if app.status_msg.as_deref() == Some("nothing to undo") {
+                break;
+            }
+            undone += 1;
+        }
+        assert_eq!(undone, app::MAX_UNDO_STEPS, "the oldest steps are dropped");
+    }
+
+    #[test]
     fn column_width_can_be_set_kept_and_reverted() {
         let csv = "name,n\nalphabetical,1\nbetatestical,2\n";
         let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());

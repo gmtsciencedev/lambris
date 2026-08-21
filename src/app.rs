@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -61,7 +62,51 @@ pub enum InputKind {
     Open,
 }
 
+/// How many steps `z` can walk back, and how many row indices the whole history
+/// may hold. Views are shared, so the usual cost of a step is a handful of
+/// pointers; the row budget is what stops a run of filters or sorts over a huge
+/// file from pinning every intermediate row list in memory.
+pub const MAX_UNDO_STEPS: usize = 32;
+const MAX_UNDO_ROWS: usize = 8_000_000;
+
+/// Everything `z` puts back: the view, how it is drawn, and where the cursor
+/// was. Cheap to clone — the row lists inside are shared.
+#[derive(Clone)]
+struct ViewState {
+    filter: Option<Arc<Vec<usize>>>,
+    filter_query: Option<String>,
+    view: View,
+    sort: Option<SortSpec>,
+    search: Option<Search>,
+    cols: Vec<usize>,
+    col_widths: HashMap<usize, u16>,
+    num_styles: HashMap<usize, NumStyle>,
+    frozen_cols: usize,
+    selected_row: usize,
+    selected_pos: usize,
+    row_offset: usize,
+    col_offset: usize,
+}
+
+impl ViewState {
+    /// Row indices this state holds on to, for the history's budget.
+    fn rows_held(&self) -> usize {
+        match &self.view {
+            View::All => 0,
+            View::Rows(rows) => rows.len(),
+        }
+    }
+}
+
+/// One step back: what the view was, and the name of the change that left it.
+struct Step {
+    /// What was about to happen, so undo can say what it undid.
+    label: &'static str,
+    state: ViewState,
+}
+
 /// An active search: the raw query, its compiled regex, and its scope.
+#[derive(Clone)]
 pub struct Search {
     pub query: String,
     pub re: Regex,
@@ -139,9 +184,12 @@ pub enum KeyStage {
 /// `All` is the identity view over `0..nrows` and stores nothing, so an
 /// unfiltered, unsorted view of a billion-row file costs no memory. Only a
 /// filter or sort materialises an explicit `Rows` permutation.
+#[derive(Clone)]
 enum View {
     All,
-    Rows(Vec<usize>),
+    /// Shared, so remembering a view for undo costs a pointer rather than a
+    /// copy of every row index.
+    Rows(Arc<Vec<usize>>),
 }
 
 impl View {
@@ -173,7 +221,7 @@ impl View {
 pub struct App {
     pub data: Dataset,
     /// Original row indices matching the active filter (`None` = all rows).
-    filter: Option<Vec<usize>>,
+    filter: Option<Arc<Vec<usize>>>,
     /// The current display order, derived from `filter` and `sort`.
     view: View,
     pub row_offset: usize,
@@ -253,6 +301,10 @@ pub struct App {
     pub num_styles: HashMap<usize, NumStyle>,
     /// State for held-key scroll acceleration.
     repeat: Option<Repeat>,
+    /// Views to go back to, oldest first.
+    undo: Vec<Step>,
+    /// Views to go forward to, cleared as soon as anything new happens.
+    redo: Vec<Step>,
 }
 
 impl App {
@@ -299,7 +351,102 @@ impl App {
             sort: None,
             num_styles: HashMap::new(),
             repeat: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
         }
+    }
+
+    /// Take a copy of everything `z` can restore.
+    fn snapshot(&self) -> ViewState {
+        ViewState {
+            filter: self.filter.clone(),
+            filter_query: self.filter_query.clone(),
+            view: self.view.clone(),
+            sort: self.sort,
+            search: self.search.clone(),
+            cols: self.cols.clone(),
+            col_widths: self.col_widths.clone(),
+            num_styles: self.num_styles.clone(),
+            frozen_cols: self.frozen_cols,
+            selected_row: self.selected_row,
+            selected_pos: self.selected_pos,
+            row_offset: self.row_offset,
+            col_offset: self.col_offset,
+        }
+    }
+
+    /// Put a remembered view back, clamped in case the data no longer reaches
+    /// that far.
+    fn restore(&mut self, state: ViewState) {
+        self.filter = state.filter;
+        self.filter_query = state.filter_query;
+        self.view = state.view;
+        self.sort = state.sort;
+        self.search = state.search;
+        self.cols = state.cols;
+        self.col_widths = state.col_widths;
+        self.num_styles = state.num_styles;
+        self.frozen_cols = state.frozen_cols;
+        self.selected_row = state.selected_row.min(self.last_row());
+        self.selected_pos = state.selected_pos.min(self.last_col());
+        self.row_offset = state.row_offset;
+        self.col_offset = state.col_offset;
+    }
+
+    /// Remember the current view before changing it. `label` names the change
+    /// that is about to happen, so `z` can say what it undid.
+    ///
+    /// Anything newly done invalidates the forward history, as everywhere else.
+    fn record(&mut self, label: &'static str) {
+        self.undo.push(Step {
+            label,
+            state: self.snapshot(),
+        });
+        self.redo.clear();
+        // Oldest steps go first, by count and by how many rows they pin.
+        let mut held: usize = self.undo.iter().map(|s| s.state.rows_held()).sum();
+        while self.undo.len() > MAX_UNDO_STEPS
+            || (held > MAX_UNDO_ROWS && self.undo.len() > 1)
+        {
+            let dropped = self.undo.remove(0);
+            held = held.saturating_sub(dropped.state.rows_held());
+        }
+    }
+
+    /// Drop the last recorded step, for a change that turned out not to happen
+    /// (cancelled, or reverted by the operation itself).
+    fn discard_record(&mut self) {
+        self.undo.pop();
+    }
+
+    /// Step back to the view before the last change.
+    fn undo(&mut self) {
+        let Some(step) = self.undo.pop() else {
+            self.status_msg = Some("nothing to undo".into());
+            return;
+        };
+        let current = self.snapshot();
+        self.restore(step.state);
+        self.redo.push(Step {
+            label: step.label,
+            state: current,
+        });
+        self.status_msg = Some(format!("undid {}", step.label));
+    }
+
+    /// Step forward again.
+    fn redo(&mut self) {
+        let Some(step) = self.redo.pop() else {
+            self.status_msg = Some("nothing to redo".into());
+            return;
+        };
+        let current = self.snapshot();
+        self.restore(step.state);
+        self.undo.push(Step {
+            label: step.label,
+            state: current,
+        });
+        self.status_msg = Some(format!("redid {}", step.label));
     }
 
     pub fn row_count(&self) -> usize {
@@ -347,6 +494,7 @@ impl App {
             return;
         }
         let to = to as usize;
+        self.record("column move");
         self.cols.swap(self.selected_pos, to);
         self.selected_pos = to;
         self.status_msg = Some(format!(
@@ -364,6 +512,7 @@ impl App {
             return;
         }
         let name = self.data.column_names[self.selected_col()].clone();
+        self.record("hide column");
         self.cols.remove(self.selected_pos);
         self.selected_pos = self.selected_pos.min(self.last_col());
         self.status_msg = Some(format!("hid {name} · u restores"));
@@ -371,6 +520,7 @@ impl App {
 
     /// Put every column back: order, visibility and widths.
     fn restore_cols(&mut self) {
+        self.record("restore columns");
         let was = self.selected_col();
         self.cols = (0..self.data.ncols).collect();
         self.col_widths.clear();
@@ -453,6 +603,7 @@ impl App {
             .iter()
             .map(|&col| (col, self.col_width(col)))
             .collect();
+        self.record("resize");
         let selected = self.selected_col();
         let target = self
             .col_width(selected)
@@ -524,7 +675,9 @@ impl App {
                 self.status_msg = Some("width kept".into());
             }
             KeyCode::Esc => {
-                // Put back exactly what was there before.
+                // Put back exactly what was there before — which is what the
+                // step recorded on entry holds, so that step goes too.
+                self.discard_record();
                 if let Some(resize) = self.resize.take() {
                     for (col, width) in resize.saved {
                         match width {
@@ -711,6 +864,7 @@ impl App {
             method,
         };
         let previous = self.sort;
+        self.record("sort");
         self.sort = Some(SortSpec {
             col: wizard.col,
             dir: SortDir::Asc,
@@ -718,6 +872,7 @@ impl App {
         });
         if !self.rebuild_view() {
             interrupt::take();
+            self.discard_record();
             self.sort = previous;
             self.status_msg = Some("sort cancelled".into());
             return;
@@ -743,7 +898,9 @@ impl App {
             KeyCode::Esc => {
                 if self.join_active {
                     self.cancel_join = true;
-                } else if self.search.take().is_some() {
+                } else if self.search.is_some() {
+                    self.record("clear search");
+                    self.search = None;
                     self.status_msg = Some("search cleared".into());
                 } else if self.filter_query.is_some() {
                     self.clear_filter();
@@ -793,6 +950,8 @@ impl App {
             KeyCode::Char('S') => self.start_key_sort(),
             // `r` adjusts this column's width, `R` this one and every column
             // to its right.
+            KeyCode::Char('z') => self.undo(),
+            KeyCode::Char('Z') => self.redo(),
             KeyCode::Char('r') => self.start_resize(false),
             KeyCode::Char('R') => self.start_resize(true),
             KeyCode::Char('f') if !ctrl => self.toggle_freeze(),
@@ -1035,16 +1194,18 @@ impl App {
     }
 
     fn apply_search(&mut self, query: String, re: Regex, scope: Option<usize>) {
+        self.record("search");
         self.search = Some(Search { query, re, scope });
         // Land on the first match from the current position (inclusive-ish).
         self.jump_match(true);
     }
 
     fn apply_filter(&mut self, query: String, re: Regex) {
+        self.record("filter");
         match self.data.filter_rows(self.visible_cols(), &re, interrupt::requested) {
             Ok(Some(rows)) => {
                 let n = rows.len();
-                self.filter = Some(rows);
+                self.filter = Some(Arc::new(rows));
                 self.filter_query = Some(query);
                 self.selected_row = 0;
                 self.row_offset = 0;
@@ -1058,13 +1219,18 @@ impl App {
             }
             Ok(None) => {
                 interrupt::take();
+                self.discard_record();
                 self.status_msg = Some("filter cancelled".into());
             }
-            Err(e) => self.status_msg = Some(format!("filter failed: {e}")),
+            Err(e) => {
+                self.discard_record();
+                self.status_msg = Some(format!("filter failed: {e}"));
+            }
         }
     }
 
     fn clear_filter(&mut self) {
+        self.record("clear filter");
         self.filter_query = None;
         self.filter = None;
         if self.rebuild_view() {
@@ -1100,10 +1266,12 @@ impl App {
         };
         // Cycling the direction of a keyed sort keeps its slice.
         let key = self.sort.filter(|s| s.col == col).and_then(|s| s.key);
+        self.record("sort");
         self.sort = next.map(|dir| SortSpec { col, dir, key });
         if !self.rebuild_view() {
             // Sort aborted; restore the previous ordering (the view is untouched).
             interrupt::take();
+            self.discard_record();
             self.sort = prev;
             self.status_msg = Some("sort cancelled".into());
             return;
@@ -1126,6 +1294,7 @@ impl App {
             self.status_msg = Some("column is not numeric".into());
             return;
         }
+        self.record("numeric style");
         let mut st = self.num_styles.get(&col).copied().unwrap_or_default();
         st.log = !st.log;
         st.align = st.log || st.decimals.is_some();
@@ -1153,6 +1322,7 @@ impl App {
             self.status_msg = Some("column is not numeric".into());
             return;
         }
+        self.record("decimals");
         let mut st = self.num_styles.get(&col).copied().unwrap_or_default();
         let current = st.decimals.unwrap_or(2) as isize;
         let n = (current + delta).clamp(0, 10) as u8;
@@ -1167,6 +1337,7 @@ impl App {
         if self.data.ncols == 0 {
             return;
         }
+        self.record("freeze");
         let want = self.selected_pos + 1;
         if self.frozen_cols == want {
             self.frozen_cols = 0;
@@ -1192,7 +1363,7 @@ impl App {
             (Some(f), None) => View::Rows(f.clone()),
             (filter, Some(s)) => {
                 let base: Vec<usize> = match filter {
-                    Some(f) => f.clone(),
+                    Some(f) => f.as_ref().clone(),
                     None => (0..self.data.nrows).collect(),
                 };
                 let descending = s.dir == SortDir::Desc;
@@ -1210,7 +1381,7 @@ impl App {
                     }
                 };
                 match ordered {
-                    Ok(Some(rows)) => View::Rows(rows),
+                    Ok(Some(rows)) => View::Rows(Arc::new(rows)),
                     Ok(None) => return false, // cancelled; leave the view as it was
                     Err(e) => {
                         // Rare (e.g. incomparable type): drop the sort, show why.

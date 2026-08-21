@@ -41,6 +41,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     (
         "Shaping",
         &[
+            ("z / Z", "undo / redo the last change to the view"),
             ("s", "sort by the selected column: ascending → descending → off"),
             ("S", "sort by part of the column: pick the characters, then how"),
             ("f", "freeze columns up to the selected one"),
