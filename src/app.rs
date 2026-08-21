@@ -1457,12 +1457,6 @@ impl App {
             KeyCode::Char('z') => self.undo(),
             KeyCode::Char('Z') => self.redo(),
             KeyCode::Char('r') => self.start_resize(),
-            // `R` is `(` then `r`, kept because evening out the columns to the
-            // right is the common case.
-            KeyCode::Char('R') => {
-                self.scope = Some(Scope::Rightward);
-                self.start_resize();
-            }
             KeyCode::Char('f') if !ctrl => self.toggle_freeze(),
             KeyCode::Char('/') => self.enter_input(InputKind::Search),
             // Column-scoped search. `-` is a direct, unshifted key on AZERTY;
@@ -2002,7 +1996,7 @@ fn format_stat(value: f64, decimals: Option<u8>) -> String {
 fn is_column_command(code: KeyCode) -> bool {
     matches!(
         code,
-        KeyCode::Char('(' | ')' | 'r' | 'R' | '%' | '<' | '>' | '=' | 'x')
+        KeyCode::Char('(' | ')' | 'r' | '%' | '<' | '>' | '=' | 'x')
     )
 }
 

@@ -1225,6 +1225,12 @@ mod tests {
         // … but anything that is not a column command drops it.
         app.handle_key(key('j'));
         assert!(app.scope.is_none());
+        // `R` is gone — `( r` is the only way to resize a block — so it counts
+        // as any other key and drops a pending aim rather than doing something.
+        app.handle_key(key('('));
+        app.handle_key(key('R'));
+        assert!(app.scope.is_none(), "an unbound key drops the aim");
+        assert!(app.resize.is_none(), "and starts nothing");
 
         // `)` covers this column and everything to its left.
         app.selected_pos = 1;
@@ -1266,18 +1272,15 @@ mod tests {
         assert!(app.status_msg.as_deref().unwrap_or_default().contains("one kept"));
         app.handle_key(key('u'));
 
-        // `R` is `(` then `r`, and a resize spends the scope on the way in.
+        // A resize spends the scope on the way in, since it is a whole
+        // interaction rather than a repeatable keypress.
         app.selected_pos = 1;
-        app.handle_key(key('R'));
+        app.handle_key(key('('));
+        app.handle_key(key('r'));
         assert_eq!(app.resize.as_ref().unwrap().count, 3, "b, c and d");
         assert!(app.scope.is_none(), "the resize took it");
         app.handle_key(code(KeyCode::Enter));
 
-        // `( r` says the same thing the long way round.
-        app.handle_key(key('('));
-        app.handle_key(key('r'));
-        assert_eq!(app.resize.as_ref().unwrap().count, 3);
-        app.handle_key(code(KeyCode::Esc));
         // And a plain `r` is one column.
         app.handle_key(key('r'));
         assert_eq!(app.resize.as_ref().unwrap().count, 1);
@@ -1806,11 +1809,12 @@ mod tests {
     }
 
     #[test]
-    fn capital_r_evens_out_every_column_to_the_right() {
+    fn a_scoped_resize_evens_out_the_whole_block() {
         // Deliberately uneven: an 11-wide name beside a column needing 3.
         let csv = "aaaaaaaaaaa,b,c\n1,2,3\n";
         let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
-        app.handle_key(key('R'));
+        app.handle_key(key('('));
+        app.handle_key(key('r'));
         assert_eq!(app.resize.as_ref().unwrap().count, 3);
 
         // `R` evens them out straight away, so the narrow ones get *wider* —
@@ -1847,7 +1851,8 @@ mod tests {
         // The names are the long part here; the values are not.
         let csv = "a_long_name,v\n1,a_long_value_here\n2,b\n";
         let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
-        app.handle_key(key('R'));
+        app.handle_key(key('('));
+        app.handle_key(key('r'));
         app.handle_key(key('%'));
 
         // Each column now fits its own values, names aside — so unlike an

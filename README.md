@@ -51,7 +51,7 @@ cargo run --release -- --no-pattern data.csv
 | `f` | Freeze columns `0..=selected` (pinned while scrolling); press again to unfreeze |
 | `(` / `)` | Aim the next column command at every column to the right / left (see [Several columns at once](#several-columns-at-once)) |
 | `x` | Hide the selected column |
-| `r` / `R` | Set this column's width / even out this one and every column to its right (`%` fits the values) |
+| `r` | Set this column's width; `( r` evens out a whole block (`%` fits the values) |
 | `[` / `]` (or `Shift-←`/`Shift-→`) | Move the selected column left / right |
 | `u` | Put every hidden column back, in the file's own order |
 | `t` | Transpose the table (first column becomes the headers); `t`/`Esc` to return |
@@ -322,9 +322,9 @@ status bar) to match `sort -k`.
 ## Columns
 
 `x` hides the column under the cursor, `[` and `]` move it left and right
-(`Shift-←`/`Shift-→` do the same where the terminal sends them), `r` and `R` set
-widths (`%` inside either fits the values), and `u` puts everything back in the
-file's own order. The status bar
+(`Shift-←`/`Shift-→` do the same where the terminal sends them), `r` sets widths
+(`%` inside a resize fits the values), and `u` puts everything back in the file's
+own order. The status bar
 counts what is hidden.
 
 Nothing is deleted — this is the *view*'s column order, held per tab, so the
@@ -355,35 +355,34 @@ movement, `Esc` — drops it, so it can never quietly apply to a command typed m
 later. `r` is the exception: a resize is a whole interaction rather than a
 repeatable keypress, so it spends the aim on the way in.
 
-`R` is `(` then `r`, kept because evening out the columns to the right is the
-common case. Sorting deliberately has no scoped form: sorting by several columns
+Sorting deliberately has no scoped form: sorting by several columns
 is a *composite key* — by A, then by B within it — which is a different thing
 from doing one command to several columns.
 
 ### Widths
 
 Columns size themselves to their name and contents, up to 40 characters. `r`
-sets the selected column's width by hand; `R` does the same for that column and
-every column to its right. Both the arrows and `h`/`l`/`j`/`k` widen and narrow —
+sets the selected column's width by hand, and `( r` does the same for that column
+and every column to its right. Both the arrows and `h`/`l`/`j`/`k` widen and narrow —
 neither pair is obviously the right one for a width, so both work. `Enter` keeps
 what you set, `Esc` puts back the widths you started with, and `u` forgets widths
 along with order and visibility.
 
-`R` **evens the block out**: every column it covers takes the *same* width, so a
-narrow column becomes wider rather than shrinking by the same amount as its
-neighbours. That is what makes it useful on a run of similar columns — and why it
-snaps them together the moment you press it, before you adjust anything:
+A scoped resize **evens the block out**: every column it covers takes the *same*
+width, so a narrow column becomes wider rather than shrinking by the same amount
+as its neighbours. That is what makes it useful on a run of similar columns — and
+why it snaps them together the moment you press `r`, before you adjust anything:
 
 ```
 a_long_name v                 x   y        as loaded
-a_long_name v           x           y      R  — all four at 11
-a_long_name   v             x             y    →→ — all four at 13
+a_long_name v           x           y      ( r  — all four at 11
+a_long_name   v             x             y     →→  — all four at 13
 ```
 
 Two exceptions to "one width":
 
 - `%` fits each column to **its own values, ignoring the column name**, which is
-  often the longer of the two. With `R` that leaves the columns at different
+  often the longer of the two. Over a block that leaves the columns at different
   widths — each as wide as its data needs. A name that no longer fits is not
   lost: the status bar shows it whenever the cursor is on that column.
 - After `%` the columns hold their own sizes and an adjustment moves them all by

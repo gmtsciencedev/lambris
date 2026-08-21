@@ -51,7 +51,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("( / )", "aim the next column command at every column right / left"),
             ("x", "hide it"),
             ("[ / ]", "move it left / right (or Shift-←/→)"),
-            ("r / R", "set its width / even out the ones right of it (= `( r`)"),
+            ("r", "set its width — `( r` evens out a whole block of them"),
             ("  %", "in a resize: fit each column to its values, name aside"),
             ("%", "numeric: align on the dot, colour by magnitude"),
             ("< / >", "fewer / more decimals"),
