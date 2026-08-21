@@ -492,6 +492,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::time::{Duration, Instant};
     use parquet::arrow::ArrowWriter;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -1139,6 +1140,232 @@ mod tests {
         type_str(tabs.app_mut(), bind);
         tabs.key(KeyEvent::from(KeyCode::Enter));
         assert!(tabs.step());
+    }
+
+    /// Press `=` the way a person taps it: far enough apart not to look like a
+    /// held key. `tick` has to keep counting up across calls, or successive
+    /// taps land at the same moment and are read as a hold.
+    fn tap_summary(app: &mut App, origin: Instant, tick: &mut u64) {
+        *tick += 1;
+        app.handle_key_at(key('='), origin + Duration::from_millis(*tick * 400));
+    }
+
+    /// The summary line as drawn, trailing blanks trimmed.
+    fn summary_line(app: &mut App, w: u16, h: u16) -> String {
+        // It is the last line of the body: title, header, rows, summary.
+        buffer_line(app, w, h, h - 3)
+    }
+
+    #[test]
+    fn the_summary_line_totals_and_averages() {
+        // `depth` is read on a log scale, where a total means little.
+        let csv = "sample,reads,depth\nS1,1000,10.5\nS2,3000,20.25\nS3,2000,\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        assert!(summary_line(&mut app, 60, 9).trim().is_empty(), "off to begin with");
+        let (origin, mut tick) = (Instant::now(), 0);
+
+        app.selected_pos = 2;
+        app.handle_key(key('%')); // log styling on depth
+        app.selected_pos = 1; // and cycle `reads`
+        tap_summary(&mut app, origin, &mut tick);
+        assert_eq!(app.summary, Some(app::Summary::Auto));
+        // Auto totals the plain column and averages the log one.
+        let line = summary_line(&mut app, 60, 9);
+        assert!(line.contains("6000"), "reads should be totalled: {line}");
+        assert!(line.contains("15.38"), "depth should be averaged: {line}");
+        assert!(line.starts_with("Σμ"), "the gutter marks the mode: {line}");
+        // A non-numeric column is left blank, and a null is simply not counted.
+        assert!(!line.contains("S1"));
+
+        // Cycling moves the *selected* column on and leaves the rest alone.
+        for _ in 0..3 {
+            tap_summary(&mut app, origin, &mut tick);
+        }
+        assert_eq!(app.summary_at(1), Some(app::Summary::Stddev));
+        assert_eq!(app.summary_at(2), Some(app::Summary::Auto), "depth untouched");
+        let line = summary_line(&mut app, 60, 9);
+        assert!(line.contains("1000"), "reads' spread: {line}");
+        assert!(line.contains("15.38"), "depth still averaged: {line}");
+
+        // `mean±sd` is given room rather than clipped to something misleading.
+        tap_summary(&mut app, origin, &mut tick);
+        let line = summary_line(&mut app, 60, 9);
+        assert!(line.contains("2000±1000"), "mean and spread together: {line}");
+        tap_summary(&mut app, origin, &mut tick);
+        assert_eq!(app.summary_at(1), Some(app::Summary::Auto), "round again");
+    }
+
+    #[test]
+    fn a_scope_applies_a_column_command_to_a_block() {
+        let csv = "name,a,b,c\nx,1.5,2.5,3.5\ny,2.5,3.5,4.5\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        let (origin, mut tick) = (Instant::now(), 0);
+
+        // `(` aims the next column command at this column and those right of it.
+        app.selected_pos = 2; // b
+        app.handle_key(key('('));
+        assert_eq!(app.scope, Some(app::Scope::Rightward));
+        assert_eq!(app.scoped_span(), (2, 3));
+        app.handle_key(key('%'));
+        assert!(app.num_styles.contains_key(&2) && app.num_styles.contains_key(&3));
+        assert!(!app.num_styles.contains_key(&1), "the column to the left is not");
+        assert!(
+            app.status_msg.as_deref().unwrap_or_default().contains("2 columns"),
+            "unexpected: {:?}",
+            app.status_msg
+        );
+
+        // The scope lasts for a run of column commands …
+        app.handle_key(key('>'));
+        assert_eq!(app.num_styles[&2].decimals, app.num_styles[&3].decimals);
+        // … and a scoped command evens the block out rather than nudging each
+        // column from wherever it was.
+        assert_eq!(app.num_styles[&3].decimals, Some(3));
+
+        // … but anything that is not a column command drops it.
+        app.handle_key(key('j'));
+        assert!(app.scope.is_none());
+
+        // `)` covers this column and everything to its left.
+        app.selected_pos = 1;
+        app.handle_key(key(')'));
+        assert_eq!(app.scoped_span(), (0, 1));
+
+        // Summary cycling takes the block too, all to the same thing.
+        app.handle_key(key('u')); // clear the styling first
+        tap_summary(&mut app, origin, &mut tick); // line on
+        app.selected_pos = 1;
+        app.handle_key(key('('));
+        tap_summary(&mut app, origin, &mut tick);
+        assert_eq!(app.summary_at(1), Some(app::Summary::Total));
+        assert_eq!(app.summary_at(3), Some(app::Summary::Total), "and the block");
+        // Cycling again keeps the scope, without pressing `(` a second time.
+        tap_summary(&mut app, origin, &mut tick);
+        assert_eq!(app.summary_at(1), Some(app::Summary::Mean));
+        assert_eq!(app.summary_at(3), Some(app::Summary::Mean));
+    }
+
+    #[test]
+    fn a_scope_hides_a_block_and_resizes_one() {
+        let csv = "a,b,c,d\n1,2,3,4\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+
+        // `( x` trims everything from here rightwards — the useful one after a
+        // join has left too many columns.
+        app.selected_pos = 2;
+        app.handle_key(key('('));
+        app.handle_key(key('x'));
+        assert_eq!(app.visible_cols(), &[0, 1]);
+        assert!(app.status_msg.as_deref().unwrap_or_default().contains("2 columns"));
+        // One column always survives, however wide the scope.
+        app.handle_key(key('u'));
+        app.selected_pos = 0;
+        app.handle_key(key('('));
+        app.handle_key(key('x'));
+        assert_eq!(app.visible_cols().len(), 1, "the last column stays");
+        assert!(app.status_msg.as_deref().unwrap_or_default().contains("one kept"));
+        app.handle_key(key('u'));
+
+        // `R` is `(` then `r`, and a resize spends the scope on the way in.
+        app.selected_pos = 1;
+        app.handle_key(key('R'));
+        assert_eq!(app.resize.as_ref().unwrap().count, 3, "b, c and d");
+        assert!(app.scope.is_none(), "the resize took it");
+        app.handle_key(code(KeyCode::Enter));
+
+        // `( r` says the same thing the long way round.
+        app.handle_key(key('('));
+        app.handle_key(key('r'));
+        assert_eq!(app.resize.as_ref().unwrap().count, 3);
+        app.handle_key(code(KeyCode::Esc));
+        // And a plain `r` is one column.
+        app.handle_key(key('r'));
+        assert_eq!(app.resize.as_ref().unwrap().count, 1);
+    }
+
+    #[test]
+    fn holding_the_summary_key_puts_the_line_away() {
+        use std::time::{Duration, Instant};
+        let csv = "n\n1\n2\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        let (t0, mut tick) = (Instant::now(), 0);
+        tap_summary(&mut app, t0, &mut tick);
+        assert!(app.summary.is_some());
+
+        // Auto-repeat: presses far faster than anyone taps.
+        for i in 0..8 {
+            app.handle_key_at(key('='), t0 + Duration::from_millis(5_000 + i * 30));
+        }
+        assert!(app.summary.is_none(), "holding it removes the line");
+        assert_eq!(app.status_msg.as_deref(), Some("summary off"));
+
+        // Releasing and pressing again brings it back, rather than the run
+        // continuing to toggle it.
+        app.handle_key_at(key('='), t0 + Duration::from_millis(9_000));
+        assert_eq!(app.summary, Some(app::Summary::Auto));
+    }
+
+    #[test]
+    fn the_summary_counts_only_the_rows_on_display() {
+        let csv = "grp,n\na,1\nb,10\na,100\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        let (origin, mut tick) = (Instant::now(), 0);
+        tap_summary(&mut app, origin, &mut tick);
+        assert!(summary_line(&mut app, 40, 9).contains("111"));
+
+        // Filtering changes what is counted …
+        app.handle_key(key('&'));
+        type_str(&mut app, "^a$");
+        app.handle_key(code(KeyCode::Enter));
+        assert_eq!(app.row_count(), 2);
+        assert!(summary_line(&mut app, 40, 9).contains("101"), "filtered total");
+
+        // … while sorting only changes the order, so the total stands.
+        app.handle_key(code(KeyCode::Esc)); // clear the filter
+        app.selected_pos = 1;
+        app.handle_key(key('s'));
+        assert!(summary_line(&mut app, 40, 9).contains("111"), "unchanged by a sort");
+
+        // And undo restores the total along with the rows it counted.
+        app.handle_key(key('&'));
+        type_str(&mut app, "^a$");
+        app.handle_key(code(KeyCode::Enter));
+        assert!(summary_line(&mut app, 40, 9).contains("101"));
+        app.handle_key(key('z'));
+        assert!(summary_line(&mut app, 40, 9).contains("111"), "after undo");
+    }
+
+    #[test]
+    fn a_pattern_remembers_the_summary() {
+        let store = store_path();
+        let file = write_text_fixture("csv", "n\n1\n2\n3\n");
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        {
+            let mut tabs = Tabs::open(
+                std::slice::from_ref(&file),
+                HeaderSpec::default(),
+                Store::load_at(store.clone()),
+            )
+            .unwrap();
+            // auto → total → mean
+            let (origin, mut tick) = (Instant::now(), 0);
+            for _ in 0..3 {
+                tap_summary(tabs.app_mut(), origin, &mut tick);
+            }
+            let col = tabs.app_mut().selected_col();
+            assert_eq!(tabs.app_mut().summary_at(col), Some(app::Summary::Mean));
+            save_pattern(&mut tabs, &name);
+        }
+        let mut tabs =
+            Tabs::open(std::slice::from_ref(&file), HeaderSpec::default(), Store::load_at(store))
+                .unwrap();
+        let col = tabs.app_mut().selected_col();
+        assert_eq!(
+            tabs.app_mut().summary_at(col),
+            Some(app::Summary::Mean),
+            "the column's own mode came back, not just the line"
+        );
+        assert!(summary_line(tabs.app_mut(), 40, 9).contains('2'), "the mean of 1..3");
     }
 
     #[test]
@@ -2005,11 +2232,11 @@ mod tests {
         app.handle_key(key('?'));
         assert!(app.show_help);
         let text = buffer_text(&mut app, 100, 44);
-        // Sections and keys that the one-line hint has no room for.
-        for expected in ["Moving", "Finding", "The first row", "Tabs", "keys"] {
+        // The page opens on the first sections; the rest are a scroll away.
+        for expected in ["Moving", "Finding", "Sorting", "Columns", "keys"] {
             assert!(text.contains(expected), "help missing {expected}: {text}");
         }
-        assert!(text.contains("make the selected row the header"));
+        assert!(text.contains("aim the next column command"));
         assert!(!text.contains("item_0000"), "table should be covered: {text}");
 
         // Keys drive the page, not the table behind it.
@@ -2024,6 +2251,7 @@ mod tests {
         }
         let text = buffer_text(&mut app, 100, 24);
         assert!(text.contains("q / Ctrl-c"), "last section unreachable: {text}");
+        assert!(text.contains("View"), "…and the section it belongs to: {text}");
 
         // And it closes without quitting.
         app.handle_key(key('?'));
@@ -2606,7 +2834,6 @@ mod tests {
 
     #[test]
     fn held_key_accelerates_scroll() {
-        use std::time::{Duration, Instant};
         let t0 = Instant::now();
 
         // Ten rapid `j` presses (10ms apart) — inside the repeat window.

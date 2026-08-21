@@ -39,22 +39,31 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
-        "Shaping",
+        "Sorting",
         &[
-            ("w", "remember this arrangement for the file (or a glob of files)"),
-            ("z / Z", "undo / redo the last change to the view"),
-            ("s", "sort by the selected column: ascending → descending → off"),
-            ("S", "sort by part of the column: pick the characters, then how"),
-            ("f", "freeze columns up to the selected one"),
-            ("x", "hide the selected column"),
-            ("r / R", "set this column's width / even out this one and all to its right"),
+            ("s", "by the selected column: ascending → descending → off"),
+            ("S", "by part of it: pick the characters, then how to compare"),
+        ],
+    ),
+    (
+        "Columns",
+        &[
+            ("( / )", "aim the next column command at every column right / left"),
+            ("x", "hide it"),
+            ("[ / ]", "move it left / right (or Shift-←/→)"),
+            ("r / R", "set its width / even out the ones right of it (= `( r`)"),
             ("  %", "in a resize: fit each column to its values, name aside"),
-            ("[ / ]", "move the selected column left / right (or Shift-←/→)"),
-            ("u", "put every hidden column back, in the file's order"),
-            ("t", "transpose the table (t or Esc to come back)"),
-            ("J", "join two tabs on a key column: Enter on each side"),
-            ("%", "numeric column: align on the dot, colour by magnitude"),
+            ("%", "numeric: align on the dot, colour by magnitude"),
             ("< / >", "fewer / more decimals"),
+            ("f", "freeze the columns up to this one"),
+            ("u", "put every hidden column back, in the file's order"),
+        ],
+    ),
+    (
+        "Summary line",
+        &[
+            ("=", "turn it on, then cycle this column: total, mean, sd, mean±sd"),
+            ("", "hold it down to remove the line"),
         ],
     ),
     (
@@ -66,12 +75,26 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "Other tables",
+        &[
+            ("t", "transpose the table (t or Esc to come back)"),
+            ("J", "join two tabs on a key column: Enter on each side"),
+        ],
+    ),
+    (
         "Tabs",
         &[
             ("Tab / Shift-Tab", "next / previous tab (a workbook opens one per sheet)"),
             ("o", "open another file in a new tab"),
             ("  Tab", "in that prompt: list the folder, then ↑/↓ and Enter"),
             ("Ctrl-w", "close this tab; closing the last one quits"),
+        ],
+    ),
+    (
+        "Keeping and undoing",
+        &[
+            ("w", "remember this arrangement for the file (or a glob of files)"),
+            ("z / Z", "undo / redo the last change to the view"),
         ],
     ),
     (
@@ -131,8 +154,10 @@ pub fn render(
     ])
     .areas(frame.area());
 
-    // Body has one header row; the rest is scrollable data.
-    let viewport_rows = body_area.height.saturating_sub(1) as usize;
+    // Body has one header row, plus a summary line when it is on; the rest is
+    // scrollable data.
+    let chrome = 1 + app.summary.is_some() as u16;
+    let viewport_rows = body_area.height.saturating_sub(chrome) as usize;
     app.viewport_rows = viewport_rows.max(1);
 
     render_title(frame, title_area, app, tabs);
@@ -368,6 +393,13 @@ fn render_table(
         }
         let base = if idx < frozen { Color::Magenta } else { Color::Cyan };
         let mut style = Style::new().bold().fg(base);
+        // A pending `(`/`)` shows which columns the next command will take.
+        if app.scope.is_some() {
+            let (from, to) = app.scoped_span();
+            if (from..=to).contains(&pos) {
+                style = style.bg(Color::Rgb(60, 60, 20));
+            }
+        }
         if pos == app.selected_pos {
             style = style.add_modifier(Modifier::REVERSED);
         }
@@ -453,9 +485,14 @@ fn render_table(
         widths.push(Constraint::Length(cache[&data_col(pos)].width));
     }
 
-    let table = Table::new(rows, widths)
+    let mut table = Table::new(rows, widths)
         .header(header)
         .column_spacing(COL_SPACING);
+    // The summary sits at the foot of the table, where it stays put while the
+    // rows scroll past above it.
+    if app.summary.is_some() {
+        table = table.footer(summary_row(app, &visible_pos, divider_at, gutter > 0));
+    }
     frame.render_widget(table, area);
     Ok(clipped)
 }
@@ -497,6 +534,38 @@ fn render_help_page(frame: &mut Frame, area: Rect, app: &mut App) {
             .scroll((app.help_offset as u16, 0)),
         area,
     );
+}
+
+/// The summary line: one figure per numeric column on display, and the mode's
+/// marker where the row number would be.
+fn summary_row(
+    app: &App,
+    visible_pos: &[usize],
+    divider_at: Option<usize>,
+    gutter: bool,
+) -> Row<'static> {
+    let style = Style::new().fg(Color::Green).bold();
+    let mut cells = Vec::with_capacity(visible_pos.len() + 1);
+    if gutter {
+        let marker = app
+            .summary_at(app.selected_col())
+            .map(|s| s.marker())
+            .unwrap_or_default();
+        cells.push(Cell::from(marker).style(Style::new().fg(Color::Green).dim()));
+    }
+    for (idx, &pos) in visible_pos.iter().enumerate() {
+        if divider_at == Some(idx) {
+            cells.push(divider_cell());
+        }
+        let col = app.visible_cols()[pos];
+        let width = app.col_width(col).unwrap_or(u16::MAX);
+        let text = app
+            .summary_of(col)
+            .map(|text| truncate(&text, width))
+            .unwrap_or_default();
+        cells.push(Cell::from(text).style(style));
+    }
+    Row::new(cells).style(Style::new().underlined())
 }
 
 /// One cell with the wizard's slice picked out, so the same character offsets
@@ -616,6 +685,11 @@ fn render_column(
             None => NA.len() as u16,
         };
         width = width.max(cell_width);
+    }
+    // A summary is part of what the column has to show, so it gets room too —
+    // otherwise `mean±sd` would arrive clipped to something misleading.
+    if let Some(summary) = app.summary_of(col) {
+        width = width.max(summary.chars().count() as u16);
     }
     let width = match app.col_width(col) {
         // Honoured as given: the user asked for this many characters.
@@ -750,6 +824,12 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App, clipped: &Clipped) {
         ),
         Style::new().bg(Color::DarkGray).fg(Color::White),
     )];
+    if let Some(summary) = app.summary_at(app.selected_col()) {
+        spans.push(Span::styled(
+            format!("  {} {}", summary.marker(), summary.label()),
+            Style::new().fg(Color::Green),
+        ));
+    }
     if app.hidden_count() > 0 {
         spans.push(Span::styled(
             format!("  {} hidden", app.hidden_count()),
@@ -846,6 +926,21 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App, banner: Option<&str>) {
             banner.to_string(),
             Style::new().fg(Color::Black).bg(Color::Yellow).bold(),
         ));
+        frame.render_widget(line, area);
+        return;
+    }
+    if app.scope.is_some() {
+        let (from, to) = app.scoped_span();
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" columns {}-{} ", from + 1, to + 1),
+                Style::new().fg(Color::Black).bg(Color::Yellow).bold(),
+            ),
+            Span::styled(
+                " the next column command takes all of them · r % < > = x",
+                Style::new().dim(),
+            ),
+        ]);
         frame.render_widget(line, area);
         return;
     }

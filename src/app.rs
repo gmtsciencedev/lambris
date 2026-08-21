@@ -6,7 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use regex::{Regex, RegexBuilder};
 
 use crate::browse::Completions;
-use crate::data::{Dataset, HeaderSpec, SortKey, SortMethod};
+use crate::data::{ColumnStats, Dataset, HeaderSpec, SortKey, SortMethod};
 use crate::pattern::{Pattern, SavedHeader, SavedNumStyle, SavedSort, SavedSortKey};
 use crate::interrupt;
 
@@ -131,6 +131,95 @@ pub struct SortSpec {
     /// When set, sort by this slice of the field rather than the whole value.
     pub key: Option<SortKey>,
 }
+
+/// Which columns the next column command applies to, set by `(` or `)`.
+///
+/// A scoped command works out what the *selected* column should become and
+/// gives every covered column the same — the point of asking for a block is to
+/// even it out, not to nudge each column from wherever it happened to be.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scope {
+    /// The selected column and every column to its right.
+    Rightward,
+    /// The selected column and every column to its left.
+    Leftward,
+}
+
+/// What the summary line shows. `Auto` is what the line opens as: a total,
+/// except where a column is being read on a log scale (`%`), for which a total
+/// rarely means anything and an average does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Summary {
+    Auto,
+    Total,
+    Mean,
+    Stddev,
+    MeanStddev,
+}
+
+impl Summary {
+    /// The order `=` walks through.
+    fn next(self) -> Self {
+        match self {
+            Summary::Auto => Summary::Total,
+            Summary::Total => Summary::Mean,
+            Summary::Mean => Summary::Stddev,
+            Summary::Stddev => Summary::MeanStddev,
+            Summary::MeanStddev => Summary::Auto,
+        }
+    }
+
+    /// Short marker for the gutter, where the row number would be.
+    pub fn marker(self) -> &'static str {
+        match self {
+            Summary::Auto => "Σμ",
+            Summary::Total => "Σ",
+            Summary::Mean => "μ",
+            Summary::Stddev => "σ",
+            Summary::MeanStddev => "±",
+        }
+    }
+
+    /// What the status bar calls it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Summary::Auto => "auto",
+            Summary::Total => "total",
+            Summary::Mean => "mean",
+            Summary::Stddev => "sd",
+            Summary::MeanStddev => "mean±sd",
+        }
+    }
+
+    /// The name a pattern stores, and the one it reads back.
+    pub fn name(self) -> &'static str {
+        match self {
+            Summary::Auto => "auto",
+            Summary::Total => "total",
+            Summary::Mean => "mean",
+            Summary::Stddev => "sd",
+            Summary::MeanStddev => "mean-sd",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "auto" => Summary::Auto,
+            "total" => Summary::Total,
+            "mean" => Summary::Mean,
+            "sd" => Summary::Stddev,
+            "mean-sd" => Summary::MeanStddev,
+            _ => return None,
+        })
+    }
+}
+
+/// How many repeats of `=` count as holding it down, which puts the line away.
+/// Key auto-repeat fires far faster than anyone presses deliberately, so a run
+/// this long inside [`REPEAT_WINDOW`] means the key is down.
+const SUMMARY_HOLD: usize = 4;
+/// Identifies `=` in the held-key tracker, so it doesn't disturb scrolling.
+const SUMMARY_REPEAT_ID: u8 = 20;
 
 /// A width adjustment in progress (`r` for one column, `R` for the rest of the
 /// row too). Widths change as the keys are pressed, so `Esc` needs the previous
@@ -296,6 +385,16 @@ pub struct App {
     col_widths: HashMap<usize, u16>,
     /// The width adjustment in progress, if any.
     pub resize: Option<Resize>,
+    /// A pending `(`/`)`: which columns the next column command covers.
+    pub scope: Option<Scope>,
+    /// Whether the summary line is on, and what a column shows unless it says
+    /// otherwise.
+    pub summary: Option<Summary>,
+    /// Columns showing something other than the default.
+    summary_cols: HashMap<usize, Summary>,
+    /// Totals worked out per dataset column for the rows on display. Kept until
+    /// the set of rows changes, so cycling `=` costs nothing.
+    stats: HashMap<usize, ColumnStats>,
     /// Whether the `?` key reference is covering the table.
     pub show_help: bool,
     /// First line of the key reference on screen, for scrolling it.
@@ -353,6 +452,10 @@ impl App {
             key_sort: None,
             col_widths: HashMap::new(),
             resize: None,
+            scope: None,
+            summary: None,
+            summary_cols: HashMap::new(),
+            stats: HashMap::new(),
             show_help: false,
             help_offset: 0,
             frozen_cols: 0,
@@ -437,6 +540,13 @@ impl App {
                 named: self.data.header.named,
             }),
             row_numbers: self.show_line_numbers,
+            summary: self.summary.map(|s| s.name().to_string()),
+            summaries: self
+                .summary_cols
+                .iter()
+                .filter(|(_, mode)| Some(**mode) != self.summary)
+                .map(|(&col, mode)| (name(col), mode.name().to_string()))
+                .collect(),
         }
     }
 
@@ -532,12 +642,22 @@ impl App {
                 }),
             });
         }
+        let default = pattern.summary.as_deref().and_then(Summary::from_name);
+        // Worked out here, while the name lookup is still in hand.
+        let modes: HashMap<usize, Summary> = pattern
+            .summaries
+            .iter()
+            .filter_map(|(name, mode)| index_of(name).zip(Summary::from_name(mode)))
+            .collect();
+        self.summary = default;
+        self.summary_cols = modes;
         if !self.rebuild_view() {
             // Interrupted while sorting: keep the arrangement, drop the sort.
             interrupt::take();
             self.sort = None;
             self.rebuild_view();
         }
+        self.invalidate_stats();
         // A pattern is the starting point, not a change to walk back from.
         self.undo.clear();
         self.redo.clear();
@@ -587,6 +707,8 @@ impl App {
         self.selected_pos = state.selected_pos.min(self.last_col());
         self.row_offset = state.row_offset;
         self.col_offset = state.col_offset;
+        // A remembered view may have counted a different set of rows.
+        self.invalidate_stats();
     }
 
     /// Remember the current view before changing it. `label` names the change
@@ -654,6 +776,39 @@ impl App {
         &self.cols
     }
 
+    /// The display positions a column command covers: just the selected one,
+    /// or the block a pending `(`/`)` asked for.
+    pub fn scoped_span(&self) -> (usize, usize) {
+        let pos = self.selected_pos.min(self.last_col());
+        match self.scope {
+            Some(Scope::Rightward) => (pos, self.last_col()),
+            Some(Scope::Leftward) => (0, pos),
+            None => (pos, pos),
+        }
+    }
+
+    /// The dataset columns a column command covers, in display order.
+    fn scoped_cols(&self) -> Vec<usize> {
+        let (from, to) = self.scoped_span();
+        self.cols.get(from..=to).unwrap_or_default().to_vec()
+    }
+
+    /// How many columns that is, for a message.
+    fn scoped_count(&self) -> usize {
+        let (from, to) = self.scoped_span();
+        to.saturating_sub(from) + 1
+    }
+
+    /// Note the block a command applied to, when it was more than one column.
+    fn note_scope(&mut self, what: &str) {
+        let count = self.scoped_count();
+        self.status_msg = Some(if count > 1 {
+            format!("{what} · {count} columns")
+        } else {
+            what.to_string()
+        });
+    }
+
     /// The dataset column under the cursor.
     pub fn selected_col(&self) -> usize {
         self.cols.get(self.selected_pos).copied().unwrap_or(0)
@@ -707,20 +862,36 @@ impl App {
             self.status_msg = Some("the last column stays".into());
             return;
         }
+        let going = self.scoped_cols();
+        // Never hide everything: a table with no columns is nothing to look at,
+        // so one stays however wide the scope was.
+        let all_of_them = going.len() >= self.cols.len();
         let name = self.data.column_names[self.selected_col()].clone();
+        let (from, _) = self.scoped_span();
         self.record("hide column");
-        self.cols.remove(self.selected_pos);
-        self.selected_pos = self.selected_pos.min(self.last_col());
-        self.status_msg = Some(format!("hid {name} · u restores"));
+        self.cols.retain(|c| !going.contains(c));
+        if self.cols.is_empty() {
+            self.cols = vec![going[0]];
+        }
+        self.selected_pos = from.min(self.last_col());
+        let count = going.len();
+        self.status_msg = Some(if count > 1 {
+            let kept = if all_of_them { " (one kept)" } else { "" };
+            format!("hid {count} columns{kept} · u restores")
+        } else {
+            format!("hid {name} · u restores")
+        });
     }
 
-    /// Put every column back: order, visibility and widths.
+    /// Put every column back: order, visibility and widths. Columns coming back
+    /// into view may need totals of their own.
     fn restore_cols(&mut self) {
         self.record("restore columns");
         let was = self.selected_col();
         self.cols = (0..self.data.ncols).collect();
         self.col_widths.clear();
         self.selected_pos = was.min(self.last_col());
+        self.refresh_stats();
         self.status_msg = Some("all columns restored".into());
     }
 
@@ -778,6 +949,131 @@ impl App {
         (0..self.row_count().min(max)).map(|i| self.orig_row(i)).collect()
     }
 
+    /// Turn the summary line on, or move it to the next thing it can show.
+    /// A run of rapid repeats means the key is held, which puts the line away
+    /// rather than spinning through the cycle.
+    fn cycle_summary(&mut self, now: Instant) {
+        let held = match &self.repeat {
+            Some(r) if r.id == SUMMARY_REPEAT_ID => {
+                now.saturating_duration_since(r.last) <= REPEAT_WINDOW
+            }
+            _ => false,
+        };
+        let count = match &self.repeat {
+            Some(r) if held => r.count + 1,
+            _ => 0,
+        };
+        self.repeat = Some(Repeat {
+            id: SUMMARY_REPEAT_ID,
+            last: now,
+            count,
+        });
+        // Holding the key down runs through the cycle and then puts the line
+        // away. Every press still moves it on, so tapping quickly is not
+        // mistaken for a hold and left doing nothing.
+        if count >= SUMMARY_HOLD {
+            // Keep the run going: while the key stays down every further
+            // repeat lands here and the line stays away, rather than being
+            // switched back on by the next one.
+            self.summary = None;
+            self.summary_cols.clear();
+            self.status_msg = Some("summary off".into());
+            return;
+        }
+        // Turning the line on, and putting it away, are about the line rather
+        // than any one column, so they take the whole of it either way.
+        let Some(default) = self.summary else {
+            self.summary = Some(Summary::Auto);
+            self.summary_cols.clear();
+            self.refresh_stats();
+            self.status_msg = Some(format!("summary: {}", Summary::Auto.label()));
+            return;
+        };
+        // Cycling is per column: the selected one moves on, and a pending
+        // `(`/`)` brings the rest of the block along to the same thing.
+        let next = self.summary_at(self.selected_col()).unwrap_or(default).next();
+        for col in self.scoped_cols() {
+            self.summary_cols.insert(col, next);
+        }
+        self.refresh_stats();
+        self.note_scope(&format!("summary: {}", next.label()));
+    }
+
+    /// What `col` is set to show, before `Auto` is resolved.
+    pub fn summary_at(&self, col: usize) -> Option<Summary> {
+        let default = self.summary?;
+        Some(self.summary_cols.get(&col).copied().unwrap_or(default))
+    }
+
+    /// Work out the totals for any column on display that hasn't got them yet.
+    /// Cheap once they are in hand, which is what makes cycling `=` free.
+    fn refresh_stats(&mut self) {
+        if self.summary.is_none() {
+            return;
+        }
+        let rows = self.filter.clone();
+        let rows = rows.as_deref().map(Vec::as_slice);
+        let missing: Vec<usize> = self
+            .cols
+            .iter()
+            .copied()
+            .filter(|c| !self.stats.contains_key(c) && self.data.is_numeric(*c))
+            .collect();
+        for col in missing {
+            match self.data.column_stats(col, rows, interrupt::requested) {
+                Ok(Some(stats)) => {
+                    self.stats.insert(col, stats);
+                }
+                // Interrupted, or unreadable: leave it out and say nothing more
+                // than the line already shows.
+                Ok(None) => {
+                    interrupt::take();
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// Forget the totals: the rows they were worked out over have changed.
+    fn invalidate_stats(&mut self) {
+        self.stats.clear();
+        self.refresh_stats();
+    }
+
+    /// What the summary line shows for `col`, if anything.
+    pub fn summary_of(&self, col: usize) -> Option<String> {
+        let summary = self.summary_at(col)?;
+        let stats = self.stats.get(&col)?;
+        if stats.count == 0 {
+            return None;
+        }
+        // `Auto` averages a log-scaled column, where a total says little.
+        let mode = match summary {
+            Summary::Auto => {
+                let logged = self.num_styles.get(&col).is_some_and(|s| s.log);
+                if logged {
+                    Summary::Mean
+                } else {
+                    Summary::Total
+                }
+            }
+            other => other,
+        };
+        let decimals = self.num_styles.get(&col).and_then(|s| s.decimals);
+        let show = |v: f64| format_stat(v, decimals);
+        match mode {
+            Summary::Total => Some(show(stats.sum)),
+            Summary::Mean => stats.mean().map(show),
+            Summary::Stddev => stats.stddev().map(show),
+            Summary::MeanStddev => {
+                let (mean, sd) = (stats.mean()?, stats.stddev()?);
+                Some(format!("{}±{}", show(mean), show(sd)))
+            }
+            Summary::Auto => unreachable!("resolved above"),
+        }
+    }
+
     /// The width set for `col`, if the user has chosen one.
     pub fn col_width(&self, col: usize) -> Option<u16> {
         self.col_widths.get(&col).copied()
@@ -785,22 +1081,21 @@ impl App {
 
     /// Begin adjusting widths: this column, or this one and all those right of
     /// it. The current widths are remembered so `Esc` can put them back.
-    fn start_resize(&mut self, rest_of_row: bool) {
+    fn start_resize(&mut self) {
         if self.cols.is_empty() {
             return;
         }
-        let from = self.selected_pos;
-        let count = if rest_of_row {
-            self.cols.len() - from
-        } else {
-            1
-        };
+        let (from, to) = self.scoped_span();
+        let count = to - from + 1;
+        // A resize is a whole interaction rather than a repeatable keypress, so
+        // it spends the scope on the way in.
+        self.scope = None;
         let saved = self.cols[from..from + count]
             .iter()
             .map(|&col| (col, self.col_width(col)))
             .collect();
         self.record("resize");
-        let selected = self.selected_col();
+        let selected = self.cols[self.selected_pos.min(self.cols.len() - 1)];
         let target = self
             .col_width(selected)
             .unwrap_or_else(|| self.natural_width(selected));
@@ -857,7 +1152,7 @@ impl App {
             // longer of the two — the status bar shows a clipped name anyway.
             KeyCode::Char('%') => self.fit_widths_to_values(),
             // Back to sizing by name and content together.
-            KeyCode::Char('0') | KeyCode::Char('=') => {
+            KeyCode::Char('0') => {
                 for col in self.resizing() {
                     self.col_widths.remove(&col);
                 }
@@ -1086,6 +1381,12 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let page = self.viewport_rows.max(1) as isize;
         self.status_msg = None;
+        // A pending scope lasts for a run of column commands — `( % > =` all
+        // land on the same block — and is dropped by anything else, so it can
+        // never quietly apply to a command typed much later.
+        if !is_column_command(key.code) {
+            self.scope = None;
+        }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('c') if ctrl => self.should_quit = true,
@@ -1140,6 +1441,9 @@ impl App {
                     self.promote_header = true;
                 }
             }
+            // `(` and `)` aim the next column command at a block of columns.
+            KeyCode::Char('(') => self.scope = Some(Scope::Rightward),
+            KeyCode::Char(')') => self.scope = Some(Scope::Leftward),
             KeyCode::Char('%') => self.toggle_numeric(),
             KeyCode::Char('>') => self.adjust_decimals(1),
             KeyCode::Char('<') => self.adjust_decimals(-1),
@@ -1147,10 +1451,18 @@ impl App {
             KeyCode::Char('S') => self.start_key_sort(),
             // `r` adjusts this column's width, `R` this one and every column
             // to its right.
+            // `=` turns the summary line on and cycles it; holding it down puts
+            // the line away.
+            KeyCode::Char('=') => self.cycle_summary(now),
             KeyCode::Char('z') => self.undo(),
             KeyCode::Char('Z') => self.redo(),
-            KeyCode::Char('r') => self.start_resize(false),
-            KeyCode::Char('R') => self.start_resize(true),
+            KeyCode::Char('r') => self.start_resize(),
+            // `R` is `(` then `r`, kept because evening out the columns to the
+            // right is the common case.
+            KeyCode::Char('R') => {
+                self.scope = Some(Scope::Rightward);
+                self.start_resize();
+            }
             KeyCode::Char('f') if !ctrl => self.toggle_freeze(),
             KeyCode::Char('/') => self.enter_input(InputKind::Search),
             // Column-scoped search. `-` is a direct, unshifted key on AZERTY;
@@ -1413,6 +1725,7 @@ impl App {
                 self.filter_query = Some(query);
                 self.selected_row = 0;
                 self.row_offset = 0;
+                self.invalidate_stats();
                 if self.rebuild_view() {
                     self.status_msg = Some(format!("{n} rows matched"));
                 } else {
@@ -1437,6 +1750,7 @@ impl App {
         self.record("clear filter");
         self.filter_query = None;
         self.filter = None;
+        self.invalidate_stats();
         if self.rebuild_view() {
             self.status_msg = Some("filter cleared".into());
         } else {
@@ -1487,53 +1801,57 @@ impl App {
         });
     }
 
+    /// Style the selected column, and every column a pending `(`/`)` covers,
+    /// the same way. Columns that hold no numbers are passed over.
     fn toggle_numeric(&mut self) {
-        self.toggle_numeric_col(self.selected_col());
-    }
-
-    /// Toggle decimal-aligned, log-coloured numeric display on `col`. Turning
-    /// the colour off with no fixed decimals reverts to plain.
-    fn toggle_numeric_col(&mut self, col: usize) {
-        if !self.data.is_numeric(col) {
+        let selected = self.selected_col();
+        if !self.data.is_numeric(selected) {
             self.status_msg = Some("column is not numeric".into());
             return;
         }
+        let mut style = self.num_styles.get(&selected).copied().unwrap_or_default();
+        style.log = !style.log;
+        style.align = style.log || style.decimals.is_some();
         self.record("numeric style");
-        let mut st = self.num_styles.get(&col).copied().unwrap_or_default();
-        st.log = !st.log;
-        st.align = st.log || st.decimals.is_some();
-        if st.align {
-            self.status_msg = Some(if st.log {
-                "numeric + log colour".into()
+        self.apply_num_style(style);
+        let what = match (style.align, style.log) {
+            (false, _) => "plain",
+            (_, true) => "numeric + log colour",
+            _ => "numeric",
+        };
+        self.note_scope(what);
+    }
+
+    /// Give every covered numeric column this style, or clear it when the style
+    /// is doing nothing.
+    fn apply_num_style(&mut self, style: NumStyle) {
+        for col in self.scoped_cols() {
+            if !self.data.is_numeric(col) {
+                continue;
+            }
+            if style.align {
+                self.num_styles.insert(col, style);
             } else {
-                "numeric".into()
-            });
-            self.num_styles.insert(col, st);
-        } else {
-            self.num_styles.remove(&col);
-            self.status_msg = Some("plain".into());
+                self.num_styles.remove(&col);
+            }
         }
     }
 
+    /// Set the decimals shown, on the selected column and any block with it.
     fn adjust_decimals(&mut self, delta: isize) {
-        self.adjust_decimals_col(self.selected_col(), delta);
-    }
-
-    /// Adjust the fixed decimal count on `col`, enabling decimal alignment
-    /// (but not colouring).
-    fn adjust_decimals_col(&mut self, col: usize, delta: isize) {
-        if !self.data.is_numeric(col) {
+        let selected = self.selected_col();
+        if !self.data.is_numeric(selected) {
             self.status_msg = Some("column is not numeric".into());
             return;
         }
+        let mut style = self.num_styles.get(&selected).copied().unwrap_or_default();
+        let current = style.decimals.unwrap_or(2) as isize;
+        let places = (current + delta).clamp(0, 10) as u8;
+        style.decimals = Some(places);
+        style.align = true;
         self.record("decimals");
-        let mut st = self.num_styles.get(&col).copied().unwrap_or_default();
-        let current = st.decimals.unwrap_or(2) as isize;
-        let n = (current + delta).clamp(0, 10) as u8;
-        st.decimals = Some(n);
-        st.align = true;
-        self.num_styles.insert(col, st);
-        self.status_msg = Some(format!("{n} decimals"));
+        self.apply_num_style(style);
+        self.note_scope(&format!("{places} decimals"));
     }
 
     /// Pin columns `0..=selected` to the left, or unfreeze if already there.
@@ -1660,6 +1978,32 @@ impl App {
         self.selected_pos =
             (self.selected_pos as isize + delta).clamp(0, self.last_col() as isize) as usize;
     }
+}
+
+/// A statistic as text: whole numbers plainly, otherwise enough decimals to be
+/// worth reading, or the column's own fixed decimals when it has them.
+fn format_stat(value: f64, decimals: Option<u8>) -> String {
+    if let Some(n) = decimals {
+        return format!("{value:.*}", n as usize);
+    }
+    if value == value.trunc() && value.abs() < 1e15 {
+        return format!("{value:.0}");
+    }
+    // Big numbers do not need fractions; small ones are mostly fraction.
+    let places = match value.abs() {
+        v if v >= 1e6 => 0,
+        v if v >= 1.0 => 2,
+        _ => 4,
+    };
+    format!("{value:.*}", places)
+}
+
+/// Whether a `(`/`)` scope applies to this key, and so survives it.
+fn is_column_command(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::Char('(' | ')' | 'r' | 'R' | '%' | '<' | '>' | '=' | 'x')
+    )
 }
 
 /// Compile a user query as a case-insensitive regex (csvlens-style search).

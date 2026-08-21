@@ -43,11 +43,13 @@ cargo run --release -- --no-pattern data.csv
 | `-` | Column search — same as `/` but confined to the selected column |
 | `n` / `N` | Jump to next / previous search match (within scope) |
 | `&` | Filter rows to those with a cell matching a regex |
+| `=` | Summary line: total, mean, sd, mean±sd — hold it to remove (see [Summary line](#summary-line)) |
 | `w` | Remember this arrangement for the file, or for a glob of files (see [Patterns](#patterns)) |
 | `z` / `Z` | Undo / redo the last change to the view (see [Undo](#undo)) |
 | `s` | Sort by the selected column: cycles ascending → descending → unsorted |
 | `S` | Sort by *part* of the selected column (see [Sorting by part of a column](#sorting-by-part-of-a-column)) |
 | `f` | Freeze columns `0..=selected` (pinned while scrolling); press again to unfreeze |
+| `(` / `)` | Aim the next column command at every column to the right / left (see [Several columns at once](#several-columns-at-once)) |
 | `x` | Hide the selected column |
 | `r` / `R` | Set this column's width / even out this one and every column to its right (`%` fits the values) |
 | `[` / `]` (or `Shift-←`/`Shift-→`) | Move the selected column left / right |
@@ -156,6 +158,49 @@ interrupting a slow sort with `Ctrl-C`, does not consume an undo step. The
 history keeps the last 32 changes, and drops the oldest early if they are
 holding on to too many rows between them.
 
+## Summary line
+
+`=` puts a line at the foot of the table, below the rows and staying put as they
+scroll:
+
+```
+#  sample reads depth
+1  S1     1000  10.5
+2  S2     3000  20.25
+3  S3     2000  NA
+Σμ        6000  15.38
+```
+
+It opens on **auto**: a total for each numeric column, except where a column is
+being read on a log scale (`%`), which is averaged instead — a total of
+log-scaled measurements rarely means anything.
+
+After that, `=` moves the **selected column** on through `total`, `mean`, `sd`
+and `mean±sd`, and round to auto again, so different columns can show different
+things. `( =` takes a whole block of columns at once and keeps the aim while you
+cycle, which is how to move them all together. Turning the line on and putting it
+away are about the line rather than any one column, so they take the whole of it
+either way: the first `=` turns it on and **holding `=` down** removes it. The
+gutter marks what the selected column is showing (`Σμ`, `Σ`, `μ`, `σ`, `±`) and
+the status bar names it.
+
+- Only numeric columns get a figure; the rest are left blank, and nulls are not
+  counted rather than counting as zero.
+- It counts **the rows on display**, so a filter changes the totals — and a sort
+  does not, since it only changes their order.
+- `sd` is the sample standard deviation (the `n − 1` one, as spreadsheets and R
+  use), and needs at least two values.
+- A column widens if it has to, so `mean±sd` arrives whole rather than clipped to
+  something that reads like a total.
+- A column with fixed decimals (`<`/`>`) has its figure shown to the same
+  number, so the line matches the column above it.
+
+The figures are worked out once for the rows on display and kept, so moving
+through the cycle costs nothing; they are worked out again when a filter changes
+what is counted. They are read a chunk at a time and never build a row list, so
+summarising an unfiltered file of any size costs memory-free passes rather than
+an index. The line is part of an arrangement, so `w` remembers it.
+
 ## Patterns
 
 A tuned view is worth keeping. `w` remembers the current arrangement and it is
@@ -164,7 +209,8 @@ matched. `--no-pattern` opens files as they come.
 
 What is remembered: which columns are shown and in what order, which are hidden,
 widths, numeric styles, the sort (including a keyed `S` sort), the frozen prefix,
-the row filter, the row-number gutter, and **how the top of the file is read** —
+the row filter, the row-number gutter, the summary line and what each column
+shows on it, and **how the top of the file is read** —
 so a spreadsheet with two junk rows above its real header opens correctly for
 good, rather than needing `H` every time.
 
@@ -181,7 +227,9 @@ Everything is stored by **column name**, never by position:
             "key": { "from": 1, "to": 2, "method": "nat" } },
   "frozen_through": "sample",
   "header": { "skip": 0, "named": true },
-  "row_numbers": true
+  "row_numbers": true,
+  "summary": "auto",
+  "summaries": { "reads": "mean" }
 }
 ```
 
@@ -282,6 +330,35 @@ counts what is hidden.
 Nothing is deleted — this is the *view*'s column order, held per tab, so the
 file is untouched and `u` always gets you back. It earns its keep after a join,
 where two tables' columns arrive together and only a few of them matter.
+
+### Several columns at once
+
+A column command normally acts on the column under the cursor. `(` aims the next
+one at **this column and every column to its right**, and `)` at **this column
+and everything to its left**. The covered headers are marked and the bottom line
+names the range while the aim is pending:
+
+```
+#  name a   b     c
+ columns 2-4  the next column command takes all of them · r % < > = x
+```
+
+It applies to `r` (width), `%` (numeric styling), `<`/`>` (decimals), `=`
+(summary) and `x` (hide). A scoped command works out what the **selected**
+column should become and gives every covered column the same — the point of
+asking for a block is to even it out, not to nudge each column from wherever it
+happened to be. Columns that hold no numbers are passed over by the numeric ones.
+
+The aim lasts for a **run** of column commands, so `( % > =` all land on the
+same block and `( = = =` cycles it without pressing `(` again. Anything else — a
+movement, `Esc` — drops it, so it can never quietly apply to a command typed much
+later. `r` is the exception: a resize is a whole interaction rather than a
+repeatable keypress, so it spends the aim on the way in.
+
+`R` is `(` then `r`, kept because evening out the columns to the right is the
+common case. Sorting deliberately has no scoped form: sorting by several columns
+is a *composite key* — by A, then by B within it — which is a different thing
+from doing one command to several columns.
 
 ### Widths
 
@@ -485,8 +562,9 @@ data could be misread as a header.
 
 Core viewer plus regex search, row filtering, type-aware sorting (whole column
 or a slice of one), column freeze, hiding, reordering and resizing columns,
-undo/redo over all of it, saved per-file arrangements, a transposed view, joins
-between tabs, and tabs over several open files or workbook sheets. Nulls are shown as a highlighted `NA`. Sort
+undo/redo over all of it, a per-column summary line, saved per-file
+arrangements, a transposed view, joins between tabs, and tabs over several open
+files or workbook sheets. Nulls are shown as a highlighted `NA`. Sort
 composes with the active filter, and the cursor stays on the same record across
 a re-sort.
 

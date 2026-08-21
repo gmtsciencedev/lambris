@@ -53,6 +53,13 @@ pub struct Pattern {
     /// Whether the row-number gutter is shown.
     #[serde(default = "yes")]
     pub row_numbers: bool,
+    /// Whether the summary line is on, and what a column shows unless it says
+    /// otherwise: `auto`, `total`, `mean`, `sd` or `mean-sd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Columns showing something other than that, by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub summaries: BTreeMap<String, String>,
 }
 
 fn yes() -> bool {

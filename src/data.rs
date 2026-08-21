@@ -7,9 +7,10 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use arrow::array::{
-    make_comparator, Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array,
-    StringArray, TimestampMillisecondArray, UInt32Array,
+    make_comparator, Array, ArrayRef, AsArray, BooleanArray, Date32Array, Float64Array,
+    Int64Array, StringArray, TimestampMillisecondArray, UInt32Array,
 };
+use arrow::datatypes::Float64Type;
 use arrow::compute::SortOptions;
 use arrow::csv::reader::Format as CsvFormat;
 use arrow::csv::ReaderBuilder as CsvReaderBuilder;
@@ -706,6 +707,71 @@ impl Dataset {
         Ok(Some(out))
     }
 
+    /// Total, mean and spread of `col`, over `rows` if given and over the whole
+    /// column otherwise.
+    ///
+    /// A statistic depends on *which* rows are counted, not what order they are
+    /// in, so this takes the filter rather than the view: an unfiltered table
+    /// needs no row list at all, which is what keeps a summary over a very large
+    /// file from having to build one. Read a chunk at a time, so no column is
+    /// ever fully resident. `None` if `cancel` fires.
+    pub fn column_stats(
+        &self,
+        col: usize,
+        rows: Option<&[usize]>,
+        cancel: impl Fn() -> bool,
+    ) -> Result<Option<ColumnStats>> {
+        if !self.is_numeric(col) {
+            return Ok(Some(ColumnStats::default()));
+        }
+        // One cast per chunk, so every numeric width is read the same way.
+        let numbers = |batch: &RecordBatch| -> Result<ArrayRef> {
+            arrow::compute::cast(batch.column(col), &DataType::Float64)
+                .with_context(|| format!("reading column {}", self.column_names[col]))
+        };
+        let mut stats = ColumnStats::default();
+        match rows {
+            None => {
+                for k in 0..self.num_chunks() {
+                    if cancel() {
+                        return Ok(None);
+                    }
+                    let batch = self.chunk(k)?;
+                    let values = numbers(&batch)?;
+                    let values = values.as_primitive::<Float64Type>();
+                    for off in 0..values.len() {
+                        if values.is_valid(off) {
+                            stats.push(values.value(off));
+                        }
+                    }
+                }
+            }
+            // Filter results come out in ascending order, so this walks each
+            // chunk once. Out of order it would only re-read chunks, not
+            // miscount.
+            Some(rows) => {
+                let mut i = 0;
+                while i < rows.len() {
+                    if cancel() {
+                        return Ok(None);
+                    }
+                    let k = rows[i] / CHUNK;
+                    let batch = self.chunk(k)?;
+                    let values = numbers(&batch)?;
+                    let values = values.as_primitive::<Float64Type>();
+                    while i < rows.len() && rows[i] / CHUNK == k {
+                        let off = rows[i] % CHUNK;
+                        if values.is_valid(off) {
+                            stats.push(values.value(off));
+                        }
+                        i += 1;
+                    }
+                }
+            }
+        }
+        Ok(Some(stats))
+    }
+
     /// Return the original row indices where any (non-null) cell matches `re`.
     /// Streams the file one chunk at a time; returns `None` if `cancel` fires.
     pub fn filter_rows(
@@ -806,6 +872,45 @@ impl Dataset {
             }
         }
         None
+    }
+}
+
+/// What a column's numbers add up to over some set of rows.
+///
+/// Kept as a running mean and second moment (Welford) rather than a sum of
+/// squares: subtracting one large number from another is where a naive variance
+/// loses its precision, and a column of timestamps or genome coordinates is
+/// exactly that.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ColumnStats {
+    /// How many values were present — nulls and unparseable cells are skipped.
+    pub count: usize,
+    pub sum: f64,
+    mean: f64,
+    /// Sum of squared deviations from the running mean.
+    m2: f64,
+}
+
+impl ColumnStats {
+    fn push(&mut self, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
+        self.count += 1;
+        self.sum += value;
+        let delta = value - self.mean;
+        self.mean += delta / self.count as f64;
+        self.m2 += delta * (value - self.mean);
+    }
+
+    pub fn mean(&self) -> Option<f64> {
+        (self.count > 0).then_some(self.mean)
+    }
+
+    /// Sample standard deviation (the `n - 1` one, as spreadsheets and R use).
+    /// `None` until there are two values to spread apart.
+    pub fn stddev(&self) -> Option<f64> {
+        (self.count > 1).then(|| (self.m2 / (self.count - 1) as f64).sqrt())
     }
 }
 
