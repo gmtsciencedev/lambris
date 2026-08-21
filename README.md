@@ -367,17 +367,32 @@ so a name with spaces or accents needs no escaping:
 | `{sample} + ".sat"` | `S1.sat` — `+` joins when either side is text |
 | `{reads} / {total} * 100` | `43` — and the column is *typed* as a number |
 | `{n} ** 2` | a power; `^` says the same thing |
+| `{col}[:-2]` | all but the last two characters |
+| `float({col}[6:]) ** 2` | slice, then count with it |
 | `round(ln({m}), 2)` | `2.77` |
 | `({a} + {b}) / 2` | parentheses and the usual precedence |
 | `"2026-08-20"` | a constant column |
 
 The whole language is `{columns}`, `"text"`, numbers, `+ - * / **`, parentheses,
-unary minus, and these functions:
+unary minus, `[slices]`, and these functions:
 
 ```
 ln  log  log2  exp  sqrt  abs  round(x[, places])  floor  ceil
-sin  cos  tan  min(a, b)  max(a, b)
+sin  cos  tan  min(a, b)  max(a, b)  float  int  str
 ```
+
+**Slices are Python's**, since that is the notation everyone already knows:
+`[a:b]`, `[:b]`, `[a:]`, `[:]` for a range and `[i]` for one character, negative
+counting from the end, and they chain. They count **characters**, so a name with
+accents slices where it looks like it should. A range reaching past the end is
+clamped (`{col}[5:99]`) while a single index past it is a gap — the same
+asymmetry Python has between a slice and an index.
+
+A slice is text by definition, so `float()` is what makes one countable —
+`float({col}[6:]) ** 2`. `int()` cuts towards zero and is forgiving where Python
+refuses: `int("3.7")` is `3` rather than an error, because a viewer should read
+what is there. `str()` goes the other way. Anything unconvertible is a gap, not
+a zero.
 
 `log` is base 10 and `ln` is natural — spelt out rather than left to be guessed.
 `**` binds tighter than `*` and associates to the right, so `2**3**2` is 512,

@@ -68,6 +68,12 @@ pub enum Func {
     Tan,
     Min,
     Max,
+    /// Text as a number, so a slice can be worked with.
+    Float,
+    /// Text as a whole number, cut towards zero.
+    Int,
+    /// A number as text.
+    Str,
 }
 
 impl Func {
@@ -87,6 +93,9 @@ impl Func {
             "tan" => Func::Tan,
             "min" => Func::Min,
             "max" => Func::Max,
+            "float" => Func::Float,
+            "int" => Func::Int,
+            "str" => Func::Str,
             _ => return None,
         })
     }
@@ -101,9 +110,16 @@ impl Func {
         }
     }
 
+    /// Whether it works on any value rather than only on numbers — the
+    /// conversions do, which is how a slice of text becomes something to count
+    /// with.
+    fn takes_any(self) -> bool {
+        matches!(self, Func::Float | Func::Int | Func::Str)
+    }
+
     /// Every name a formula may call, for the help text.
     pub const NAMES: &'static str =
-        "ln log log2 exp sqrt abs round floor ceil sin cos tan min max";
+        "ln log log2 exp sqrt abs round floor ceil sin cos tan min max float int str";
 }
 
 /// One cell's worth of value while a formula is being worked out.
@@ -181,6 +197,14 @@ enum Expr {
     Neg(Box<Expr>),
     Binary(Op, Box<Expr>, Box<Expr>),
     Call(Func, Vec<Expr>),
+    /// `value[from:to]`, counted in characters and reckoned as Python does it.
+    /// `single` marks `value[i]`, which is one character rather than a range.
+    Slice {
+        value: Box<Expr>,
+        from: Option<Box<Expr>>,
+        to: Option<Box<Expr>>,
+        single: bool,
+    },
 }
 
 /// A parsed formula, plus the columns it mentions.
@@ -234,7 +258,10 @@ fn eval(expr: &Expr, slots: &[Value]) -> Value {
             _ => Value::Empty,
         },
         Expr::Call(func, args) => {
-            // Every function takes numbers, so anything else is a gap.
+            if func.takes_any() {
+                return convert(*func, eval(&args[0], slots));
+            }
+            // The rest work on numbers, so anything else is a gap.
             let mut numbers = Vec::with_capacity(args.len());
             for arg in args {
                 match eval(arg, slots) {
@@ -243,6 +270,47 @@ fn eval(expr: &Expr, slots: &[Value]) -> Value {
                 }
             }
             call(*func, &numbers)
+        }
+        Expr::Slice {
+            value,
+            from,
+            to,
+            single,
+        } => {
+            // Taking characters out of something, so whatever it is becomes
+            // text first — the same forgiveness `+` shows.
+            let Some(text) = eval(value, slots).text() else {
+                return Value::Empty;
+            };
+            let chars: Vec<char> = text.chars().collect();
+            let index = |expr: &Option<Box<Expr>>| -> Option<f64> {
+                match expr {
+                    None => None,
+                    Some(expr) => match eval(expr, slots) {
+                        Value::Number(n) => Some(n),
+                        // A bound that is not a number is not a bound.
+                        _ => Some(f64::NAN),
+                    },
+                }
+            };
+            let (start, end) = (index(from), index(to));
+            if start.is_some_and(f64::is_nan) || end.is_some_and(f64::is_nan) {
+                return Value::Empty;
+            }
+            if *single {
+                // One character, and out of range is a gap — as Python treats
+                // an index, rather than the clamping it gives a range.
+                let Some(at) = start.and_then(|i| exact(i, chars.len())) else {
+                    return Value::Empty;
+                };
+                return Value::Text(chars[at].to_string());
+            }
+            let from = start.map(|i| clamp(i, chars.len())).unwrap_or(0);
+            let to = end.map(|i| clamp(i, chars.len())).unwrap_or(chars.len());
+            Value::Text(match from < to {
+                true => chars[from..to].iter().collect(),
+                false => String::new(),
+            })
         }
         Expr::Binary(op, left, right) => {
             let (left, right) = (eval(left, slots), eval(right, slots));
@@ -274,6 +342,51 @@ fn eval(expr: &Expr, slots: &[Value]) -> Value {
     }
 }
 
+/// A Python-style index, counting from the end when negative, kept inside the
+/// text however far out it points — what a *range* does.
+fn clamp(index: f64, len: usize) -> usize {
+    let index = index.trunc();
+    if index < 0.0 {
+        return (len as f64 + index).max(0.0) as usize;
+    }
+    (index as usize).min(len)
+}
+
+/// The same, for a single index: out of range is nothing at all.
+fn exact(index: f64, len: usize) -> Option<usize> {
+    let index = index.trunc();
+    let at = match index < 0.0 {
+        true => len as f64 + index,
+        false => index,
+    };
+    (at >= 0.0 && (at as usize) < len).then_some(at as usize)
+}
+
+/// Text as a number, a number as text — whichever was asked for.
+fn convert(func: Func, value: Value) -> Value {
+    match func {
+        Func::Str => match value.text() {
+            Some(text) => Value::Text(text),
+            None => Value::Empty,
+        },
+        // Forgiving where Python is strict: `int("3.7")` is 3 rather than a
+        // refusal, because a viewer should read what is there.
+        Func::Float | Func::Int => {
+            let number = match &value {
+                Value::Number(n) => Some(*n),
+                Value::Text(t) => t.trim().parse::<f64>().ok(),
+                Value::Empty => None,
+            };
+            match number {
+                Some(n) if func == Func::Int => Value::number(n.trunc()),
+                Some(n) => Value::number(n),
+                None => Value::Empty,
+            }
+        }
+        _ => Value::Empty,
+    }
+}
+
 fn call(func: Func, args: &[f64]) -> Value {
     let first = args.first().copied().unwrap_or(f64::NAN);
     Value::number(match func {
@@ -297,6 +410,8 @@ fn call(func: Func, args: &[f64]) -> Value {
         Func::Tan => first.tan(),
         Func::Min => first.min(args[1]),
         Func::Max => first.max(args[1]),
+        // Handled by `convert`, which takes any value rather than a number.
+        Func::Float | Func::Int | Func::Str => return Value::Empty,
     })
 }
 
@@ -310,6 +425,9 @@ enum Token {
     Open,
     Close,
     Comma,
+    OpenBracket,
+    CloseBracket,
+    Colon,
 }
 
 impl Token {
@@ -324,6 +442,9 @@ impl Token {
             Token::Open => "`(`".to_string(),
             Token::Close => "`)`".to_string(),
             Token::Comma => "`,`".to_string(),
+            Token::OpenBracket => "`[`".to_string(),
+            Token::CloseBracket => "`]`".to_string(),
+            Token::Colon => "`:`".to_string(),
         }
     }
 }
@@ -337,7 +458,7 @@ struct Spanned {
 
 /// What a formula may hold, for the message when something else turns up.
 const VOCABULARY: &str =
-    "a formula holds {columns}, \"text\", numbers, + - * / ** ( ) and functions";
+    "{columns}, \"text\", numbers, + - * / ** ( ), [slices] and functions";
 
 /// Split the formula into tokens. Column names are taken whole between braces,
 /// so a name with spaces, accents or punctuation needs no escaping.
@@ -354,6 +475,9 @@ fn lex(text: &str) -> Result<Vec<Spanned>, FormulaError> {
             '(' => Token::Open,
             ')' => Token::Close,
             ',' => Token::Comma,
+            '[' => Token::OpenBracket,
+            ']' => Token::CloseBracket,
+            ':' => Token::Colon,
             '+' => Token::Op(Op::Add),
             '-' => Token::Op(Op::Sub),
             '/' => Token::Op(Op::Div),
@@ -524,13 +648,63 @@ impl Parser<'_> {
     /// `primary ('**' unary)?` — binds tightest, and to the right, so
     /// `2**3**2` is `2**(3**2)`.
     fn power(&mut self) -> Result<Expr, FormulaError> {
-        let base = self.primary()?;
+        let base = self.sliced()?;
         if let Some(Token::Op(Op::Pow)) = self.peek() {
             self.at += 1;
             let exponent = self.unary()?;
             return Ok(Expr::Binary(Op::Pow, Box::new(base), Box::new(exponent)));
         }
         Ok(base)
+    }
+
+    /// `primary ('[' … ']')*` — Python's slicing, taken as it is written:
+    /// `[a:b]`, `[:b]`, `[a:]`, `[:]` for a range and `[i]` for one character,
+    /// with negative counting from the end.
+    fn sliced(&mut self) -> Result<Expr, FormulaError> {
+        let mut value = self.primary()?;
+        while let Some(Token::OpenBracket) = self.peek() {
+            let opened = self.tokens[self.at].at;
+            self.at += 1;
+            // `[:b]` — nothing before the colon.
+            let from = match self.peek() {
+                Some(Token::Colon) | Some(Token::CloseBracket) => None,
+                _ => Some(Box::new(self.expression()?)),
+            };
+            let (to, single) = match self.peek() {
+                Some(Token::Colon) => {
+                    self.at += 1;
+                    // `[a:]` — nothing after it either.
+                    match self.peek() {
+                        Some(Token::CloseBracket) => (None, false),
+                        _ => (Some(Box::new(self.expression()?)), false),
+                    }
+                }
+                // No colon at all: one character rather than a range.
+                _ => (None, true),
+            };
+            if single && from.is_none() {
+                return Err(FormulaError::at(opened, "this `[` says nothing")
+                    .with_hint("`[2]` is one character, `[1:3]` a range".to_string()));
+            }
+            match self.peek() {
+                Some(Token::CloseBracket) => self.at += 1,
+                _ => {
+                    return Err(FormulaError::at(opened, "this `[` never closes")
+                        .with_hint(
+                            "`[2]` is one character, `[1:3]` a range, `[:-2]` all but \
+                             the last two"
+                                .to_string(),
+                        ))
+                }
+            }
+            value = Expr::Slice {
+                value: Box::new(value),
+                from,
+                to,
+                single,
+            };
+        }
+        Ok(value)
     }
 
     fn primary(&mut self) -> Result<Expr, FormulaError> {
@@ -572,6 +746,16 @@ impl Parser<'_> {
             }
             Token::Comma => {
                 return Err(FormulaError::at(at, "this `,` is not inside a function call"))
+            }
+            Token::OpenBracket => {
+                return Err(FormulaError::at(at, "this `[` has nothing to take from")
+                    .with_hint("a slice goes after a value: `{column}[:-2]`".to_string()))
+            }
+            Token::CloseBracket => {
+                return Err(FormulaError::at(at, "this `]` has nothing open before it"))
+            }
+            Token::Colon => {
+                return Err(FormulaError::at(at, "this `:` is not inside a `[ ]`"))
             }
             Token::Op(op) => {
                 return Err(FormulaError::at(

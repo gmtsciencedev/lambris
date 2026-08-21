@@ -1359,6 +1359,76 @@ mod tests {
     }
 
     #[test]
+    fn a_formula_can_slice_text_and_convert_it() {
+        // An accented name, to be sure slicing counts characters not bytes.
+        let tsv = "col\tPRÉLÈVEMENT\n3-SSH0421\tabcdéfg\n7-SSH0422\thijklmn\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("tsv", tsv)).unwrap());
+
+        // Python's shapes, meaning what they mean there.
+        add_column(&mut app, 'f', "{col}[:-2]", "most");
+        assert_eq!(values(&app, 2), vec!["3-SSH04", "7-SSH04"]);
+        add_column(&mut app, 'f', "{col}[2:]", "tail");
+        assert_eq!(values(&app, 3), vec!["SSH0421", "SSH0422"]);
+        add_column(&mut app, 'f', "{col}[-3:-1]", "middle");
+        assert_eq!(values(&app, 4), vec!["42", "42"]);
+        add_column(&mut app, 'f', "{col}[:]", "all");
+        assert_eq!(values(&app, 5), vec!["3-SSH0421", "7-SSH0422"]);
+        // One character rather than a range.
+        add_column(&mut app, 'f', "{col}[-1]", "last");
+        assert_eq!(values(&app, 6), vec!["1", "2"]);
+        // Characters, not bytes: this file has accents in it.
+        add_column(&mut app, 'f', "{PRÉLÈVEMENT}[3:6]", "accents");
+        assert_eq!(values(&app, 7), vec!["déf", "klm"]);
+        // A range beyond the end is clamped; a single index beyond it is a gap,
+        // the same asymmetry Python has.
+        add_column(&mut app, 'f', "{col}[5:99]", "clamped");
+        assert_eq!(values(&app, 8), vec!["0421", "0422"]);
+        add_column(&mut app, 'f', "{col}[99]", "nothing_there");
+        assert!(app.data.is_null(9, 0) && app.data.is_null(9, 1));
+        // Slices chain.
+        add_column(&mut app, 'f', "{col}[2:][0]", "first_of_tail");
+        assert_eq!(values(&app, 10), vec!["S", "S"]);
+
+        // A slice is text, so `float` is what makes it countable — which is why
+        // it had to come with slicing rather than after it.
+        add_column(&mut app, 'f', "float({col}[6:]) ** 2", "squared");
+        assert_eq!(values(&app, 11), vec!["177241", "178084"]);
+        assert!(app.data.is_numeric(11));
+        add_column(&mut app, 'f', "int(float({col}[6:]) / 2)", "halved");
+        assert_eq!(values(&app, 12), vec!["210", "211"], "int cuts towards zero");
+        add_column(&mut app, 'f', "str(2 ** 10) + \"!\"", "as_text");
+        assert_eq!(values(&app, 13), vec!["1024!", "1024!"]);
+        // Text that is not a number converts to a gap, not a zero.
+        add_column(&mut app, 'f', "float({PRÉLÈVEMENT})", "not_a_number");
+        assert!(app.data.is_null(14, 0));
+        // `int` is forgiving where Python refuses, reading what is there.
+        add_column(&mut app, 'f', "int(\"3.7\")", "three");
+        assert_eq!(values(&app, 15), vec!["3", "3"]);
+    }
+
+    #[test]
+    fn a_slice_that_will_not_do_says_where() {
+        let tsv = "col\n3-SSH0421\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("tsv", tsv)).unwrap());
+        for (recipe, expected, caret) in [
+            ("{col}[", "stops here", Some(6)),
+            ("{col}[]", "says nothing", Some(5)),
+            ("{col}[1:2", "never closes", Some(5)),
+            ("[1]", "nothing to take from", Some(0)),
+            ("{col}]", "left over at the end", Some(5)),
+            ("{col}[1:2:3]", "never closes", Some(5)),
+        ] {
+            let problem = bad_formula(&mut app, recipe);
+            assert!(
+                problem.message.contains(expected),
+                "{recipe}: got {:?}",
+                problem.message
+            );
+            assert_eq!(problem.at, caret, "caret for {recipe}");
+        }
+    }
+
+    #[test]
     fn a_formula_can_do_powers_and_functions() {
         let tsv = "n\tm\n2\t9\n3\t16\n";
         let mut app = App::new(Dataset::load(&write_text_fixture("tsv", tsv)).unwrap());

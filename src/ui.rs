@@ -50,7 +50,8 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             ("( / )", "aim the next column command at every column right / left"),
             ("a", "add a column: pulled out of this one, or worked out by formula"),
-            ("", "  formula: {col} + \"x\" · {a}/{b}*100 · {x}**2 · sqrt log round …"),
+            ("", "  formula: {col} + \"x\" · {a}/{b}*100 · {x}**2 · {col}[:-2]"),
+            ("", "  float int str round log sqrt abs min max sin …"),
             ("R", "rename it"),
             ("x", "hide it"),
             ("[ / ]", "move it left / right (or Shift-←/→)"),
@@ -1082,7 +1083,7 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App, banner: Option<&str>) {
                     Style::new().dim(),
                 )),
                 _ => Line::from(Span::styled(
-                    " {column} + \"text\" · {a}/{b}*100 · {x}**2 · log sqrt round min … · + - * / ( )",
+                    " {col}+\"x\" · {a}/{b}*100 · {x}**2 · {col}[:-2] · float int round log sqrt …",
                     Style::new().dim(),
                 )),
             }
