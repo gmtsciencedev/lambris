@@ -41,6 +41,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     (
         "Shaping",
         &[
+            ("w", "remember this arrangement for the file (or a glob of files)"),
             ("z / Z", "undo / redo the last change to the view"),
             ("s", "sort by the selected column: ascending → descending → off"),
             ("S", "sort by part of the column: pick the characters, then how"),
@@ -722,6 +723,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App, clipped: &Clipped) {
             InputKind::Filter => "&",
             InputKind::Goto => ":",
             InputKind::Open => "open ",
+            InputKind::Pattern => "pattern ",
         };
         let line = Line::from(vec![
             Span::styled(
@@ -889,6 +891,10 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App, banner: Option<&str>) {
         return;
     }
     let line = match app.mode {
+        Mode::Input(InputKind::Pattern) => Line::from(Span::styled(
+            " name or glob this view is remembered for · Enter saves · empty forgets · Esc cancels",
+            Style::new().dim(),
+        )),
         Mode::Input(InputKind::Open) => Line::from(Span::styled(
             " Tab: list folder · ↑/↓: pick · Enter: open · Esc: back",
             Style::new().dim(),

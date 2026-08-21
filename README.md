@@ -23,6 +23,9 @@ cargo run --release -- book.xlsx
 
 # Treat the first row as data rather than column names.
 cargo run --release -- --no-header data.csv
+
+# Open files as they come, ignoring any arrangement saved with `w`.
+cargo run --release -- --no-pattern data.csv
 ```
 
 ### Keys
@@ -40,6 +43,7 @@ cargo run --release -- --no-header data.csv
 | `-` | Column search — same as `/` but confined to the selected column |
 | `n` / `N` | Jump to next / previous search match (within scope) |
 | `&` | Filter rows to those with a cell matching a regex |
+| `w` | Remember this arrangement for the file, or for a glob of files (see [Patterns](#patterns)) |
 | `z` / `Z` | Undo / redo the last change to the view (see [Undo](#undo)) |
 | `s` | Sort by the selected column: cycles ascending → descending → unsorted |
 | `S` | Sort by *part* of the selected column (see [Sorting by part of a column](#sorting-by-part-of-a-column)) |
@@ -151,6 +155,78 @@ A cancelled change leaves nothing behind — abandoning a resize with `Esc`, or
 interrupting a slow sort with `Ctrl-C`, does not consume an undo step. The
 history keeps the last 32 changes, and drops the oldest early if they are
 holding on to too many rows between them.
+
+## Patterns
+
+A tuned view is worth keeping. `w` remembers the current arrangement and it is
+applied the next time that file is opened — the status bar says which pattern
+matched. `--no-pattern` opens files as they come.
+
+What is remembered: which columns are shown and in what order, which are hidden,
+widths, numeric styles, the sort (including a keyed `S` sort), the frozen prefix,
+the row filter, the row-number gutter, and **how the top of the file is read** —
+so a spreadsheet with two junk rows above its real header opens correctly for
+good, rather than needing `H` every time.
+
+Everything is stored by **column name**, never by position:
+
+```json
+{
+  "bind": "*_stats.csv",
+  "columns": ["sample", "label", "depth"],
+  "hidden": ["junk"],
+  "widths": { "label": 7 },
+  "numeric": { "depth": { "align": true, "log": true } },
+  "sort": { "column": "sample", "descending": false,
+            "key": { "from": 1, "to": 2, "method": "nat" } },
+  "frozen_through": "sample",
+  "header": { "skip": 0, "named": true },
+  "row_numbers": true
+}
+```
+
+That is what makes a pattern survive the file changing under it. Reopen a file
+whose columns have moved, one has gone and another is new, and the saved names
+are placed in the saved order, the ones that are gone are skipped, and a column
+the pattern has never heard of stays **visible at the end** — a new column
+appears rather than vanishing because a pattern written before it did not mention
+it. The frozen prefix is named by its last column for the same reason.
+
+The pattern is derived from the live view at the moment you press `w`. There is
+no running record of "column X belongs at position Y" to keep in step as you
+work, and so nothing that can drift out of step with what you are looking at.
+
+### What it is tied to
+
+The prompt opens pre-filled with the file's **name** — not its full path, so a
+pattern follows a file that gets regenerated in another directory — and you can
+edit it to anything, including a glob:
+
+- `run1_stats.tsv` — that name, wherever it lives
+- `*_stats.tsv` — every file whose name ends that way
+- `/data/cohort/*.tsv` — a binding containing `/` is matched against the whole
+  path instead, for when one directory should be treated differently
+
+An exact name beats a glob, and among globs the longest binding wins, so
+`*_stats.tsv` takes precedence over a blanket `*.tsv`. Submitting an empty
+binding forgets the pattern for the current file. A workbook is remembered per
+sheet, so each sheet of one file can be arranged differently.
+
+### Where it lives
+
+`$LAMBRIS_CONFIG` if set, otherwise `$XDG_CONFIG_HOME/lambris/patterns.json`,
+otherwise `~/.config/lambris/patterns.json` — one path on every unix-ish system,
+which is where command-line tools tend to settle. The file is pretty-printed
+JSON and meant to be readable: editing it by hand, or copying a pattern between
+machines, is expected. Every field is optional, so a hand-written pattern can set
+one thing and leave the rest alone. An unreadable file is treated as no
+patterns — a viewer should still open the file you asked for.
+
+Patterns belong to files, so a join or a transposed view cannot have one; `w`
+there says so rather than saving something that could never be matched again.
+The search is left out too: it moves the cursor, which makes it navigation rather
+than part of an arrangement. A pattern is the starting point for a view, not a
+change to walk back from, so `z` will not undo it.
 
 ## Sorting by part of a column
 
@@ -409,8 +485,8 @@ data could be misread as a header.
 
 Core viewer plus regex search, row filtering, type-aware sorting (whole column
 or a slice of one), column freeze, hiding, reordering and resizing columns,
-undo/redo over all of it, a transposed view, joins between tabs, and tabs over
-several open files or workbook sheets. Nulls are shown as a highlighted `NA`. Sort
+undo/redo over all of it, saved per-file arrangements, a transposed view, joins
+between tabs, and tabs over several open files or workbook sheets. Nulls are shown as a highlighted `NA`. Sort
 composes with the active filter, and the cursor stays on the same record across
 a re-sort.
 

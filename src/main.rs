@@ -1,6 +1,7 @@
 mod app;
 mod browse;
 mod data;
+mod pattern;
 mod interrupt;
 mod ui;
 
@@ -12,6 +13,7 @@ use crossterm::event::{self, Event, KeyEventKind};
 
 use app::App;
 use data::{Dataset, HeaderSpec, JoinSide, JOIN_MAX_ROWS};
+use pattern::Store;
 
 /// A terminal viewer for parquet, CSV/TSV and Excel files, in the manner of
 /// csvlens.
@@ -26,6 +28,10 @@ struct Args {
     /// `column_N`). Toggle it per tab with `T`. Ignored for parquet.
     #[arg(long)]
     no_header: bool,
+
+    /// Open files as they come, ignoring any arrangement saved with `w`.
+    #[arg(long)]
+    no_pattern: bool,
 }
 
 /// Largest number of records turned into columns when transposing, so a huge
@@ -39,7 +45,14 @@ fn main() -> Result<()> {
     } else {
         HeaderSpec::default()
     };
-    let mut tabs = Tabs::open(&args.files, header)?;
+    // Saved arrangements are consulted before the files are read: how the top
+    // of a file is read decides its schema, so it cannot be applied afterwards.
+    let patterns = if args.no_pattern {
+        Store::default()
+    } else {
+        Store::load()
+    };
+    let mut tabs = Tabs::open(&args.files, header, patterns)?;
 
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut tabs);
@@ -55,6 +68,8 @@ struct Tabs {
     current: usize,
     /// The join wizard, while one is running.
     join: Option<JoinWizard>,
+    /// Saved arrangements, applied as files are opened and written back by `w`.
+    patterns: Store,
 }
 
 /// The join wizard: the user walks to a key column and confirms, once on each
@@ -68,21 +83,59 @@ struct JoinWizard {
 impl Tabs {
     /// Open one tab per table, failing before the TUI starts if any path won't
     /// load. A workbook contributes one tab per sheet that holds data.
-    fn open(paths: &[PathBuf], header: HeaderSpec) -> Result<Self> {
+    fn open(paths: &[PathBuf], header: HeaderSpec, patterns: Store) -> Result<Self> {
         let mut tabs = Vec::with_capacity(paths.len());
         for path in paths {
+            // A pattern tied to the file as a whole can decide how its top is
+            // read, which has to be settled before the file is decoded.
+            let header = patterns
+                .matching(path, None)
+                .and_then(App::header_from)
+                .unwrap_or(header);
             let datasets = Dataset::load_all(path, header)
                 .with_context(|| format!("loading {}", path.display()))?;
-            tabs.extend(datasets.into_iter().map(|d| vec![App::new(d)]));
+            for dataset in datasets {
+                tabs.push(vec![App::new(dataset)]);
+            }
         }
         if tabs.is_empty() {
             anyhow::bail!("nothing to show");
         }
-        Ok(Self {
+        let mut opened = Self {
             tabs,
             current: 0,
             join: None,
-        })
+            patterns,
+        };
+        for tab in 0..opened.tabs.len() {
+            opened.apply_saved_pattern(tab);
+        }
+        Ok(opened)
+    }
+
+    /// Arrange a freshly opened tab as its saved pattern says, if it has one.
+    /// A sheet's pattern may ask for a different header reading than the file
+    /// was opened with, in which case that one sheet is read again.
+    fn apply_saved_pattern(&mut self, tab: usize) {
+        let Some(app) = self.tabs.get(tab).and_then(|s| s.last()) else {
+            return;
+        };
+        let (path, sheet) = (app.data.path.clone(), app.data.sheet().map(str::to_string));
+        let Some(pattern) = self.patterns.matching(&path, sheet.as_deref()) else {
+            return;
+        };
+        let pattern = pattern.clone();
+        let bind = pattern.bind.clone();
+        // Only a worksheet can disagree with the header the file was read with.
+        if let (Some(wanted), Some(_)) = (App::header_from(&pattern), sheet.as_deref())
+            && wanted != app.data.header
+            && let Ok(reread) = app.data.reload_with_header(wanted)
+        {
+            self.tabs[tab] = vec![App::new(reread)];
+        }
+        let app = self.tabs[tab].last_mut().expect("the tab has a view");
+        app.apply_pattern(&pattern);
+        app.status_msg = Some(format!("pattern {bind}"));
     }
 
     /// Feed one key to the visible view, first telling it whether the wizard is
@@ -147,6 +200,7 @@ impl Tabs {
         let close = std::mem::take(&mut app.close_tab);
         let open = app.open_request.take();
         let toggle_header = std::mem::take(&mut app.toggle_header);
+        let save_pattern = app.save_pattern.take();
         let promote_header = std::mem::take(&mut app.promote_header);
         let join_request = std::mem::take(&mut app.join_request);
         let confirm = std::mem::take(&mut app.confirm);
@@ -173,6 +227,9 @@ impl Tabs {
         if promote_header {
             self.promote_header_row();
         }
+        if let Some(bind) = save_pattern {
+            self.remember_pattern(bind);
+        }
         if join_request {
             self.join = Some(JoinWizard { left: None });
         }
@@ -191,6 +248,11 @@ impl Tabs {
             // Relative to the folder on screen, matching what `Tab` listed.
             let path = browse::resolve(&path, &self.app_mut().base_dir());
             let header = self.app_mut().data.header;
+            let header = self
+                .patterns
+                .matching(&path, None)
+                .and_then(App::header_from)
+                .unwrap_or(header);
             match Dataset::load_all(&path, header) {
                 // A workbook lands as several tabs; the first one becomes current.
                 Ok(datasets) => {
@@ -198,6 +260,9 @@ impl Tabs {
                     self.tabs
                         .extend(datasets.into_iter().map(|d| vec![App::new(d)]));
                     self.current = first.min(self.tabs.len() - 1);
+                    for tab in first..self.tabs.len() {
+                        self.apply_saved_pattern(tab);
+                    }
                 }
                 Err(e) => self.app_mut().status_msg = Some(format!("open failed: {e}")),
             }
@@ -267,6 +332,36 @@ impl Tabs {
 }
 
 impl Tabs {
+    /// Save the current view's arrangement under `bind`, or forget the saved
+    /// one when `bind` is empty.
+    fn remember_pattern(&mut self, bind: String) {
+        let app = self.app_mut();
+        if !app.is_file_backed() {
+            app.status_msg =
+                Some("a pattern belongs to a file — this view is not one".into());
+            return;
+        }
+        let sheet = app.data.sheet().map(str::to_string);
+        if bind.is_empty() {
+            let previous = app.pattern_bind();
+            let forgotten = self.patterns.forget(&previous, sheet.as_deref());
+            let message = match (forgotten, self.patterns.save()) {
+                (_, Err(e)) => format!("pattern not saved: {e}"),
+                (true, _) => format!("forgot the pattern for {previous}"),
+                (false, _) => format!("no pattern saved for {previous}"),
+            };
+            self.app_mut().status_msg = Some(message);
+            return;
+        }
+        let pattern = app.pattern(bind.clone());
+        self.patterns.put(pattern);
+        let message = match self.patterns.save() {
+            Ok(()) => format!("remembered for {bind}"),
+            Err(e) => format!("pattern not saved: {e}"),
+        };
+        self.app_mut().status_msg = Some(message);
+    }
+
     /// Record the key column under the cursor: the first press stores it, the
     /// second runs the join.
     fn join_pick(&mut self) {
@@ -580,7 +675,7 @@ mod tests {
     fn open_prompt_lists_the_current_files_folder() {
         let root = browse_fixture();
         let mut tabs =
-            Tabs::open(&[root.join("alpha.csv")], HeaderSpec::default()).unwrap();
+            Tabs::open(&[root.join("alpha.csv")], HeaderSpec::default(), Store::default()).unwrap();
 
         // Before Tab it is a plain prompt.
         tabs.app_mut().handle_key(key('o'));
@@ -622,7 +717,7 @@ mod tests {
     fn open_prompt_steps_into_a_folder_and_opens_a_file() {
         let root = browse_fixture();
         let mut tabs =
-            Tabs::open(&[root.join("alpha.csv")], HeaderSpec::default()).unwrap();
+            Tabs::open(&[root.join("alpha.csv")], HeaderSpec::default(), Store::default()).unwrap();
         tabs.app_mut().handle_key(key('o'));
         tabs.app_mut().handle_key(code(KeyCode::Tab));
 
@@ -649,7 +744,7 @@ mod tests {
     fn open_prompt_completes_and_filters_as_you_type() {
         let root = browse_fixture();
         let mut tabs =
-            Tabs::open(&[root.join("alpha.csv")], HeaderSpec::default()).unwrap();
+            Tabs::open(&[root.join("alpha.csv")], HeaderSpec::default(), Store::default()).unwrap();
 
         // A bare prefix narrows the same folder — Tab finishes a lone match.
         tabs.app_mut().handle_key(key('o'));
@@ -690,7 +785,7 @@ mod tests {
     fn slash_types_a_path_separator_not_a_search() {
         let root = browse_fixture();
         let mut tabs =
-            Tabs::open(&[root.join("alpha.csv")], HeaderSpec::default()).unwrap();
+            Tabs::open(&[root.join("alpha.csv")], HeaderSpec::default(), Store::default()).unwrap();
 
         // In the open prompt `/` is a path separator: it reaches the input and
         // does not start a search.
@@ -722,6 +817,7 @@ mod tests {
         let mut tabs = Tabs::open(
             &[root.join("nested").join("inner.csv")],
             HeaderSpec::default(),
+            Store::default(),
         )
         .unwrap();
         tabs.app_mut().handle_key(key('o'));
@@ -753,7 +849,7 @@ mod tests {
     fn open_prompt_shows_hidden_files_only_when_asked() {
         let root = browse_fixture();
         let mut tabs =
-            Tabs::open(&[root.join("alpha.csv")], HeaderSpec::default()).unwrap();
+            Tabs::open(&[root.join("alpha.csv")], HeaderSpec::default(), Store::default()).unwrap();
         tabs.app_mut().handle_key(key('o'));
         tabs.app_mut().handle_key(code(KeyCode::Tab));
         assert!(!offered(tabs.app_mut()).contains(&".hidden.csv".to_string()));
@@ -765,7 +861,7 @@ mod tests {
     fn open_prompt_esc_closes_the_picker_before_the_prompt() {
         let root = browse_fixture();
         let mut tabs =
-            Tabs::open(&[root.join("alpha.csv")], HeaderSpec::default()).unwrap();
+            Tabs::open(&[root.join("alpha.csv")], HeaderSpec::default(), Store::default()).unwrap();
         tabs.app_mut().handle_key(key('o'));
         tabs.app_mut().handle_key(code(KeyCode::Tab));
         assert!(tabs.app_mut().completions.is_some());
@@ -1019,6 +1115,264 @@ mod tests {
             app.status_msg.as_deref(),
             Some("nothing to slice in this column")
         );
+    }
+
+    /// A pattern file of its own, so nothing here touches a real config.
+    fn store_path() -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!("lambris_test_patterns_{n}.json"));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    /// Save the current view's pattern under `bind` (empty forgets it).
+    fn save_pattern(tabs: &mut Tabs, bind: &str) {
+        tabs.key(key('w'));
+        // The prompt opens pre-filled with the file's name; replace it.
+        let filled = tabs.app_mut().input.clone();
+        for _ in 0..filled.chars().count() {
+            tabs.key(KeyEvent::from(KeyCode::Backspace));
+        }
+        type_str(tabs.app_mut(), bind);
+        tabs.key(KeyEvent::from(KeyCode::Enter));
+        assert!(tabs.step());
+    }
+
+    #[test]
+    fn a_pattern_brings_the_arrangement_back() {
+        let store = store_path();
+        let csv = "id,name,score,junk\n2,beta,20,x\n1,alpha,10,y\n";
+        let file = write_text_fixture("csv", csv);
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+
+        {
+            let mut tabs = Tabs::open(
+                std::slice::from_ref(&file),
+                HeaderSpec::default(),
+                Store::load_at(store.clone()),
+            )
+            .unwrap();
+            // Tune it: drop a column, move one, set a width, sort, freeze, and
+            // turn the gutter off.
+            tabs.app_mut().selected_pos = 3;
+            tabs.key(key('x'));
+            tabs.app_mut().selected_pos = 2;
+            tabs.key(key('['));
+            tabs.key(key('r'));
+            tabs.key(KeyEvent::from(KeyCode::Right));
+            tabs.key(KeyEvent::from(KeyCode::Enter));
+            tabs.app_mut().selected_pos = 0;
+            tabs.key(key('s'));
+            tabs.key(key('f'));
+            tabs.key(key('#'));
+            let arranged = tabs.app_mut().visible_cols().to_vec();
+            assert_eq!(arranged, vec![0, 2, 1]);
+
+            save_pattern(&mut tabs, &name);
+            assert!(
+                tabs.app_mut().status_msg.as_deref() == Some(&format!("remembered for {name}")),
+                "unexpected: {:?}",
+                tabs.app_mut().status_msg
+            );
+        }
+
+        // It is written by column *name*, not by position.
+        let text = std::fs::read_to_string(&store).unwrap();
+        assert!(text.contains("\"score\""), "names not written: {text}");
+        assert!(text.contains(&name));
+
+        // Opening it again brings the arrangement back …
+        let mut tabs =
+            Tabs::open(std::slice::from_ref(&file), HeaderSpec::default(), Store::load_at(store.clone()))
+                .unwrap();
+        let app = tabs.app_mut();
+        assert_eq!(app.visible_cols(), &[0, 2, 1], "order and hidden column");
+        assert_eq!(app.col_width(2), Some(6));
+        assert_eq!(app.sort.unwrap().col, 0);
+        assert_eq!(app.frozen_cols, 1);
+        assert!(!app.show_line_numbers);
+        assert_eq!(
+            app.data.cells(0, &app.view_rows(usize::MAX)).unwrap(),
+            vec![Some("1".into()), Some("2".into())],
+            "the sort came back too"
+        );
+        // … and it is the starting point, not a change to undo.
+        tabs.key(key('z'));
+        assert_eq!(tabs.app_mut().status_msg.as_deref(), Some("nothing to undo"));
+
+        // …unless asked to ignore it, which is what --no-pattern does.
+        let mut plain =
+            Tabs::open(&[file], HeaderSpec::default(), Store::default()).unwrap();
+        assert_eq!(plain.app_mut().visible_cols(), &[0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn a_pattern_follows_column_names_when_the_file_changes() {
+        // This is why positions are not saved: the file is rewritten with its
+        // columns in a different order, one gone and one new.
+        let store = store_path();
+        let file = write_text_fixture("csv", "a,b,c\n1,2,3\n");
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        {
+            let mut tabs = Tabs::open(
+                std::slice::from_ref(&file),
+                HeaderSpec::default(),
+                Store::load_at(store.clone()),
+            )
+            .unwrap();
+            tabs.app_mut().selected_pos = 1;
+            tabs.key(key('x')); // hide b
+            tabs.app_mut().selected_pos = 1;
+            tabs.key(key('[')); // c before a
+            assert_eq!(tabs.app_mut().visible_cols(), &[2, 0]);
+            save_pattern(&mut tabs, &name);
+        }
+
+        // `a` is now third, `c` first, `b` is still there and `d` is new.
+        std::fs::write(&file, "c,b,a,d\n3,2,1,4\n").unwrap();
+        let mut tabs =
+            Tabs::open(&[file], HeaderSpec::default(), Store::load_at(store)).unwrap();
+        let app = tabs.app_mut();
+        let shown: Vec<&str> = app
+            .visible_cols()
+            .iter()
+            .map(|&c| app.data.column_names[c].as_str())
+            .collect();
+        assert_eq!(
+            shown,
+            vec!["c", "a", "d"],
+            "c then a as saved, b still hidden, and the new d kept visible"
+        );
+    }
+
+    #[test]
+    fn a_pattern_can_be_tied_to_a_glob() {
+        let store = store_path();
+        let first = write_text_fixture("tsv", "x\ty\n1\t2\n");
+        {
+            let mut tabs = Tabs::open(
+                std::slice::from_ref(&first),
+                HeaderSpec::default(),
+                Store::load_at(store.clone()),
+            )
+            .unwrap();
+            tabs.key(key('#')); // something visible to check for
+            save_pattern(&mut tabs, "*.tsv");
+        }
+        // Any other .tsv picks it up.
+        let other = write_text_fixture("tsv", "p\tq\n7\t8\n");
+        let mut tabs =
+            Tabs::open(&[other], HeaderSpec::default(), Store::load_at(store.clone()))
+                .unwrap();
+        assert!(!tabs.app_mut().show_line_numbers, "the glob matched");
+        assert!(
+            tabs.app_mut()
+                .status_msg
+                .as_deref()
+                .unwrap_or_default()
+                .contains("*.tsv"),
+            "the pattern that matched should be named"
+        );
+        // A .csv does not.
+        let csv = write_text_fixture("csv", "p,q\n7,8\n");
+        let mut tabs =
+            Tabs::open(&[csv], HeaderSpec::default(), Store::load_at(store)).unwrap();
+        assert!(tabs.app_mut().show_line_numbers);
+    }
+
+    #[test]
+    fn an_exact_binding_beats_a_glob_and_empty_forgets() {
+        let store = store_path();
+        let file = write_text_fixture("csv", "a,b\n1,2\n");
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+
+        // A blanket glob hides nothing but turns the gutter off; the exact
+        // binding for this file hides a column instead.
+        {
+            let mut tabs = Tabs::open(
+                std::slice::from_ref(&file),
+                HeaderSpec::default(),
+                Store::load_at(store.clone()),
+            )
+            .unwrap();
+            tabs.key(key('#'));
+            save_pattern(&mut tabs, "*.csv");
+            tabs.key(key('#')); // gutter back on
+            tabs.key(key('x')); // hide a
+            save_pattern(&mut tabs, &name);
+        }
+        let mut tabs = Tabs::open(
+            std::slice::from_ref(&file),
+            HeaderSpec::default(),
+            Store::load_at(store.clone()),
+        )
+        .unwrap();
+        assert_eq!(tabs.app_mut().visible_cols(), &[1], "the exact one won");
+        assert!(tabs.app_mut().show_line_numbers, "…so the glob did not apply");
+
+        // An empty binding forgets the pattern for this file, leaving the glob.
+        save_pattern(&mut tabs, "");
+        assert!(
+            tabs.app_mut()
+                .status_msg
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("forgot the pattern"),
+            "unexpected: {:?}",
+            tabs.app_mut().status_msg
+        );
+        let mut tabs =
+            Tabs::open(&[file], HeaderSpec::default(), Store::load_at(store)).unwrap();
+        assert_eq!(tabs.app_mut().visible_cols(), &[0, 1], "back to the glob");
+        assert!(!tabs.app_mut().show_line_numbers);
+    }
+
+    #[test]
+    fn a_pattern_remembers_how_the_top_of_the_file_is_read() {
+        // The header reading has to be settled before the file is decoded, so
+        // this exercises the one part of a pattern that is applied at load.
+        let store = store_path();
+        let csv = "exported by hand,,\nnote,2026,-\nid,name,score\n1,alpha,3\n";
+        let file = write_text_fixture("csv", csv);
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        {
+            let mut tabs = Tabs::open(
+                std::slice::from_ref(&file),
+                HeaderSpec::default(),
+                Store::load_at(store.clone()),
+            )
+            .unwrap();
+            tabs.key(key('j'));
+            tabs.key(key('H')); // the real header is row 3
+            assert!(tabs.step(), "H re-reads the file from the loop");
+            assert_eq!(tabs.app_mut().data.column_names, vec!["id", "name", "score"]);
+            save_pattern(&mut tabs, &name);
+        }
+        let mut tabs =
+            Tabs::open(&[file], HeaderSpec::default(), Store::load_at(store)).unwrap();
+        let app = tabs.app_mut();
+        assert_eq!(app.data.column_names, vec!["id", "name", "score"]);
+        assert_eq!(app.data.header.skip, 2);
+        assert_eq!(app.row_count(), 1);
+    }
+
+    #[test]
+    fn a_view_with_no_file_behind_it_cannot_be_remembered() {
+        let store = store_path();
+        let file = write_text_fixture("csv", "a,b\n1,2\n");
+        let mut tabs =
+            Tabs::open(&[file], HeaderSpec::default(), Store::load_at(store.clone())).unwrap();
+        tabs.key(key('t')); // transpose: not the file's own layout
+        assert!(tabs.step());
+        save_pattern(&mut tabs, "anything");
+        assert_eq!(
+            tabs.app_mut().status_msg.as_deref(),
+            Some("a pattern belongs to a file — this view is not one")
+        );
+        assert!(!store.exists(), "nothing should have been written");
     }
 
     #[test]
@@ -1426,7 +1780,7 @@ mod tests {
         // decides which column titles the records.
         let csv = "sample,depth,junk\nS1,10,x\nS2,20,y\n";
         let mut tabs =
-            Tabs::open(&[write_text_fixture("csv", csv)], HeaderSpec::default()).unwrap();
+            Tabs::open(&[write_text_fixture("csv", csv)], HeaderSpec::default(), Store::default()).unwrap();
         tabs.app_mut().selected_pos = 2;
         tabs.key(key('x')); // drop `junk`
         tabs.key(key('t'));
@@ -1462,7 +1816,7 @@ mod tests {
     #[test]
     fn join_wizard_combines_two_tabs() {
         let (meta, dict) = join_fixtures();
-        let mut tabs = Tabs::open(&[meta, dict], HeaderSpec::default()).unwrap();
+        let mut tabs = Tabs::open(&[meta, dict], HeaderSpec::default(), Store::default()).unwrap();
 
         // The banner leads the way, and only while the wizard is running.
         assert!(tabs.join_banner().is_none());
@@ -1512,7 +1866,7 @@ mod tests {
             "csv",
             "sample,note\nS1,first\nS1,second\nS2,only\n",
         );
-        let mut tabs = Tabs::open(&[left, right], HeaderSpec::default()).unwrap();
+        let mut tabs = Tabs::open(&[left, right], HeaderSpec::default(), Store::default()).unwrap();
         run_wizard(&mut tabs, 0, 1, 0);
 
         let joined = &tabs.app_mut().data;
@@ -1526,7 +1880,7 @@ mod tests {
     #[test]
     fn join_uses_what_each_tab_is_showing() {
         let (meta, dict) = join_fixtures();
-        let mut tabs = Tabs::open(&[meta, dict], HeaderSpec::default()).unwrap();
+        let mut tabs = Tabs::open(&[meta, dict], HeaderSpec::default(), Store::default()).unwrap();
 
         // Filter the left tab down to one row; the join sees only that row.
         tabs.key(key('&'));
@@ -1546,7 +1900,7 @@ mod tests {
         // Transposed, the dict's `sample` values become column headers and its
         // fields become rows — so joining it means joining what is on screen.
         let (meta, dict) = join_fixtures();
-        let mut tabs = Tabs::open(&[dict, meta], HeaderSpec::default()).unwrap();
+        let mut tabs = Tabs::open(&[dict, meta], HeaderSpec::default(), Store::default()).unwrap();
         tabs.key(key('t'));
         assert!(tabs.step());
         assert!(tabs.app_mut().is_transposed);
@@ -1567,7 +1921,7 @@ mod tests {
     #[test]
     fn join_wizard_cancels_and_survives_a_closed_tab() {
         let (meta, dict) = join_fixtures();
-        let mut tabs = Tabs::open(&[meta, dict], HeaderSpec::default()).unwrap();
+        let mut tabs = Tabs::open(&[meta, dict], HeaderSpec::default(), Store::default()).unwrap();
 
         // Esc backs out of the wizard rather than clearing search or quitting.
         tabs.key(key('J'));
@@ -1599,7 +1953,7 @@ mod tests {
         let (meta, dict) = join_fixtures();
         let spare = write_text_fixture("csv", "z\n1\n");
         let mut tabs =
-            Tabs::open(&[spare, meta, dict], HeaderSpec::default()).unwrap();
+            Tabs::open(&[spare, meta, dict], HeaderSpec::default(), Store::default()).unwrap();
         tabs.current = 2;
         tabs.key(key('J'));
         assert!(tabs.step());
@@ -1629,7 +1983,7 @@ mod tests {
         // blank key that must not pair up with the other blank.
         let left = write_text_fixture("csv", "id,x\n1,a\n2,b\n,c\n");
         let right = write_text_fixture("tsv", "id\ty\n1\tone\n\tblank\n");
-        let mut tabs = Tabs::open(&[left, right], HeaderSpec::default()).unwrap();
+        let mut tabs = Tabs::open(&[left, right], HeaderSpec::default(), Store::default()).unwrap();
         assert_eq!(tabs.app_mut().data.column_types[0], "Int64");
         run_wizard(&mut tabs, 0, 1, 0);
 
@@ -1684,7 +2038,7 @@ mod tests {
     fn promoting_a_row_to_header_drops_what_is_above() {
         // Two rows of title junk above the real header — the ill-conceived case.
         let csv = "exported by hand,,\nnote,2026,-\nid,name,score\n1,alpha,3\n2,beta,4\n";
-        let mut tabs = Tabs::open(&[write_text_fixture("csv", csv)], HeaderSpec::default())
+        let mut tabs = Tabs::open(&[write_text_fixture("csv", csv)], HeaderSpec::default(), Store::default())
             .unwrap();
         assert_eq!(tabs.app_mut().data.column_names[0], "exported by hand");
 
@@ -1715,7 +2069,7 @@ mod tests {
     fn promoting_counts_from_the_row_under_the_cursor() {
         // Header at the top, so the first data row is raw row 2.
         let csv = "id,name\nalpha,1\nbeta,2\n";
-        let mut tabs = Tabs::open(&[write_text_fixture("csv", csv)], HeaderSpec::default())
+        let mut tabs = Tabs::open(&[write_text_fixture("csv", csv)], HeaderSpec::default(), Store::default())
             .unwrap();
         tabs.app_mut().handle_key(key('H'));
         assert!(tabs.step());
@@ -1727,7 +2081,7 @@ mod tests {
     #[test]
     fn promoting_a_row_works_on_a_sheet_and_a_commented_file() {
         // A worksheet: H re-reads just that sheet.
-        let mut tabs = Tabs::open(&[xlsx_fixture()], HeaderSpec::default()).unwrap();
+        let mut tabs = Tabs::open(&[xlsx_fixture()], HeaderSpec::default(), Store::default()).unwrap();
         tabs.app_mut().handle_key(key('H'));
         assert!(tabs.step());
         assert_eq!(tabs.app_mut().data.header.skip, 1);
@@ -1738,7 +2092,7 @@ mod tests {
         // A `#` preamble is skipped first, so H counts from the real content.
         let tsv = "# a comment\njunk\tjunk2\nid\tname\n1\talpha\n";
         let mut tabs =
-            Tabs::open(&[write_text_fixture("tsv", tsv)], HeaderSpec::default()).unwrap();
+            Tabs::open(&[write_text_fixture("tsv", tsv)], HeaderSpec::default(), Store::default()).unwrap();
         assert_eq!(tabs.app_mut().data.column_names, vec!["junk", "junk2"]);
         tabs.app_mut().handle_key(key('H'));
         assert!(tabs.step());
@@ -1766,7 +2120,7 @@ mod tests {
     #[test]
     fn header_toggle_reloads_the_current_tab() {
         let csv = "id,name\n1,alpha\n2,beta\n";
-        let mut tabs = Tabs::open(&[write_text_fixture("csv", csv)], HeaderSpec::default()).unwrap();
+        let mut tabs = Tabs::open(&[write_text_fixture("csv", csv)], HeaderSpec::default(), Store::default()).unwrap();
         assert_eq!(tabs.app_mut().row_count(), 2);
 
         // `T` re-reads the file with the header row as data.
@@ -1797,7 +2151,7 @@ mod tests {
         assert!(!buffer_text(&mut headed, 100, 20).contains("no header"));
 
         // Parquet carries its own names, so there is nothing to toggle.
-        let mut tabs = Tabs::open(&[fixture()], HeaderSpec::default()).unwrap();
+        let mut tabs = Tabs::open(&[fixture()], HeaderSpec::default(), Store::default()).unwrap();
         tabs.app_mut().handle_key(key('T'));
         assert!(tabs.step());
         let msg = tabs.app_mut().status_msg.clone().unwrap_or_default();
@@ -1843,7 +2197,7 @@ mod tests {
         assert!(!numbers.header.named);
 
         // Toggling a workbook tab reloads just that sheet, keeping the others.
-        let mut tabs = Tabs::open(&[book], HeaderSpec::default()).unwrap();
+        let mut tabs = Tabs::open(&[book], HeaderSpec::default(), Store::default()).unwrap();
         tabs.app_mut().handle_key(code(KeyCode::Tab));
         assert!(tabs.step());
         tabs.app_mut().handle_key(key('T'));
@@ -1861,7 +2215,7 @@ mod tests {
 
     #[test]
     fn xlsx_opens_one_tab_per_sheet() {
-        let mut tabs = Tabs::open(&[xlsx_fixture()], HeaderSpec::default()).unwrap();
+        let mut tabs = Tabs::open(&[xlsx_fixture()], HeaderSpec::default(), Store::default()).unwrap();
         assert_eq!(tabs.tabs.len(), 2, "the blank sheet earns no tab");
         let strip = tabs.strip();
         assert!(
@@ -2444,7 +2798,7 @@ mod tests {
 
     #[test]
     fn tabs_cycle_with_tab_and_back_tab() {
-        let mut tabs = Tabs::open(&[fixture(), fixture(), fixture()], HeaderSpec::default()).unwrap();
+        let mut tabs = Tabs::open(&[fixture(), fixture(), fixture()], HeaderSpec::default(), Store::default()).unwrap();
         assert_eq!(tabs.tabs.len(), 3);
         assert_eq!(tabs.current, 0);
 
@@ -2465,7 +2819,7 @@ mod tests {
 
     #[test]
     fn each_tab_keeps_its_own_view_state() {
-        let mut tabs = Tabs::open(&[fixture(), fixture()], HeaderSpec::default()).unwrap();
+        let mut tabs = Tabs::open(&[fixture(), fixture()], HeaderSpec::default(), Store::default()).unwrap();
 
         // Transpose tab 0.
         tabs.app_mut().handle_key(key('t'));
@@ -2494,7 +2848,7 @@ mod tests {
 
     #[test]
     fn open_adds_a_tab_and_ctrl_w_closes_it() {
-        let mut tabs = Tabs::open(&[fixture()], HeaderSpec::default()).unwrap();
+        let mut tabs = Tabs::open(&[fixture()], HeaderSpec::default(), Store::default()).unwrap();
         let other = fixture();
 
         tabs.app_mut().handle_key(key('o'));
@@ -2517,7 +2871,7 @@ mod tests {
 
     #[test]
     fn open_reports_a_bad_path_without_adding_a_tab() {
-        let mut tabs = Tabs::open(&[fixture()], HeaderSpec::default()).unwrap();
+        let mut tabs = Tabs::open(&[fixture()], HeaderSpec::default(), Store::default()).unwrap();
         tabs.app_mut().handle_key(key('o'));
         type_str(tabs.app_mut(), "/no/such/file.parquet");
         tabs.app_mut().handle_key(code(KeyCode::Enter));
@@ -2529,7 +2883,7 @@ mod tests {
 
     #[test]
     fn open_prompt_takes_a_literal_path_and_can_be_cancelled() {
-        let mut tabs = Tabs::open(&[fixture()], HeaderSpec::default()).unwrap();
+        let mut tabs = Tabs::open(&[fixture()], HeaderSpec::default(), Store::default()).unwrap();
         // The prompt shows the typed path verbatim (no regex handling).
         tabs.app_mut().handle_key(key('o'));
         type_str(tabs.app_mut(), "some/file.csv");
@@ -2545,7 +2899,7 @@ mod tests {
     #[test]
     fn tab_strip_lists_the_open_files() {
         let paths = vec![fixture(), fixture()];
-        let mut tabs = Tabs::open(&paths, HeaderSpec::default()).unwrap();
+        let mut tabs = Tabs::open(&paths, HeaderSpec::default(), Store::default()).unwrap();
         let strip = tabs.strip();
         assert_eq!(strip.labels.len(), 2);
         let text = buffer_text_tabs(tabs.app_mut(), &strip, 120, 20);
@@ -2563,7 +2917,7 @@ mod tests {
     fn tab_strip_windows_to_keep_the_active_tab_visible() {
         // More tabs than fit: the strip scrolls so the active one is on screen.
         let paths: Vec<PathBuf> = (0..8).map(|_| fixture()).collect();
-        let mut tabs = Tabs::open(&paths, HeaderSpec::default()).unwrap();
+        let mut tabs = Tabs::open(&paths, HeaderSpec::default(), Store::default()).unwrap();
         tabs.current = 7;
         let strip = tabs.strip();
         let text = buffer_text_tabs(tabs.app_mut(), &strip, 40, 20);

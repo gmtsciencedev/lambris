@@ -6,7 +6,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use regex::{Regex, RegexBuilder};
 
 use crate::browse::Completions;
-use crate::data::{Dataset, SortKey, SortMethod};
+use crate::data::{Dataset, HeaderSpec, SortKey, SortMethod};
+use crate::pattern::{Pattern, SavedHeader, SavedNumStyle, SavedSort, SavedSortKey};
 use crate::interrupt;
 
 /// How a numeric column is displayed (set with `%`, `<`, `>`).
@@ -60,6 +61,8 @@ pub enum InputKind {
     Goto,
     /// Open a file path in a new tab.
     Open,
+    /// Name the file (or glob) a saved pattern is tied to.
+    Pattern,
 }
 
 /// How many steps `z` can walk back, and how many row indices the whole history
@@ -267,6 +270,10 @@ pub struct App {
     pub close_tab: bool,
     /// A path typed at the `o` prompt, to be opened in a new tab by the loop.
     pub open_request: Option<String>,
+    /// A binding typed at the `w` prompt: save this view's pattern under it, or
+    /// forget the pattern when the text is empty. Handled by the loop, which
+    /// owns the store.
+    pub save_pattern: Option<String>,
     /// Set when the first row should switch between column names and data
     /// (handled by the loop, which reloads the file).
     pub toggle_header: bool,
@@ -336,6 +343,7 @@ impl App {
             switch_tab: None,
             close_tab: false,
             open_request: None,
+            save_pattern: None,
             toggle_header: false,
             promote_header: false,
             join_request: false,
@@ -354,6 +362,194 @@ impl App {
             undo: Vec::new(),
             redo: Vec::new(),
         }
+    }
+
+    /// What a pattern for this view would be tied to by default: the file's
+    /// name, which follows the file if it is regenerated elsewhere.
+    pub fn pattern_bind(&self) -> String {
+        self.data
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.data.path.display().to_string())
+    }
+
+    /// Whether a pattern can be tied to this view at all: it has to be a file's
+    /// own content, which a join or a transposed view is not.
+    pub fn is_file_backed(&self) -> bool {
+        self.data.is_file_backed()
+    }
+
+    /// Describe this view as a pattern tied to `bind`.
+    ///
+    /// Everything is written out by column *name*, worked out from the live
+    /// view at the moment of asking — there is nothing to keep in step as the
+    /// view changes, and nothing to drift.
+    pub fn pattern(&self, bind: String) -> Pattern {
+        let name = |col: usize| self.data.column_names[col].clone();
+        let shown: Vec<String> = self.cols.iter().map(|&c| name(c)).collect();
+        let hidden: Vec<String> = (0..self.data.ncols)
+            .filter(|c| !self.cols.contains(c))
+            .map(name)
+            .collect();
+        Pattern {
+            bind,
+            sheet: self.data.sheet().map(str::to_string),
+            columns: shown,
+            hidden,
+            widths: self
+                .col_widths
+                .iter()
+                .map(|(&col, &w)| (name(col), w))
+                .collect(),
+            numeric: self
+                .num_styles
+                .iter()
+                .map(|(&col, style)| {
+                    (
+                        name(col),
+                        SavedNumStyle {
+                            align: style.align,
+                            log: style.log,
+                            decimals: style.decimals,
+                        },
+                    )
+                })
+                .collect(),
+            sort: self.sort.map(|s| SavedSort {
+                column: name(s.col),
+                descending: s.dir == SortDir::Desc,
+                key: s.key.map(|k| SavedSortKey {
+                    // Written the way `sort -k` writes them: 1-based, inclusive.
+                    from: k.start + 1,
+                    to: k.end,
+                    method: k.method.label().to_string(),
+                }),
+            }),
+            // The frozen prefix is named by its last column, so it survives a
+            // column before it going missing.
+            frozen_through: (self.frozen_cols > 0)
+                .then(|| self.cols.get(self.frozen_cols - 1).map(|&c| name(c)))
+                .flatten(),
+            filter: self.filter_query.clone(),
+            header: Some(SavedHeader {
+                skip: self.data.header.skip,
+                named: self.data.header.named,
+            }),
+            row_numbers: self.show_line_numbers,
+        }
+    }
+
+    /// Arrange this view as `pattern` describes.
+    ///
+    /// Names that the file no longer has are skipped, and columns the file has
+    /// gained — in neither list — stay visible at the end rather than vanishing
+    /// because a pattern written before them did not mention them.
+    pub fn apply_pattern(&mut self, pattern: &Pattern) {
+        let index_of = |wanted: &str| {
+            self.data
+                .column_names
+                .iter()
+                .position(|name| name == wanted)
+        };
+
+        let mut ordered: Vec<usize> = pattern.columns.iter().filter_map(|n| index_of(n)).collect();
+        let known: Vec<usize> = pattern
+            .columns
+            .iter()
+            .chain(&pattern.hidden)
+            .filter_map(|n| index_of(n))
+            .collect();
+        ordered.extend((0..self.data.ncols).filter(|c| !known.contains(c)));
+        if !ordered.is_empty() {
+            self.cols = ordered;
+        }
+
+        self.col_widths = pattern
+            .widths
+            .iter()
+            .filter_map(|(name, &w)| index_of(name).map(|c| (c, w)))
+            .collect();
+        self.num_styles = pattern
+            .numeric
+            .iter()
+            .filter_map(|(name, style)| {
+                index_of(name).map(|c| {
+                    (
+                        c,
+                        NumStyle {
+                            align: style.align,
+                            log: style.log,
+                            decimals: style.decimals,
+                        },
+                    )
+                })
+            })
+            .collect();
+        self.frozen_cols = pattern
+            .frozen_through
+            .as_deref()
+            .and_then(index_of)
+            .and_then(|col| self.cols.iter().position(|&c| c == col))
+            .map(|pos| pos + 1)
+            .unwrap_or(0);
+        self.show_line_numbers = pattern.row_numbers;
+
+        // A filter has to be run again — only the regex that made it is saved.
+        if let Some(query) = &pattern.filter
+            && let Ok(re) = build_regex(query)
+        {
+            self.filter_query = Some(query.to_string());
+            if let Ok(Some(rows)) =
+                self.data
+                    .filter_rows(self.visible_cols(), &re, interrupt::requested)
+            {
+                self.filter = Some(Arc::new(rows));
+            } else {
+                interrupt::take();
+                self.filter_query = None;
+            }
+        }
+        if let Some(saved) = &pattern.sort
+            && let Some(col) = index_of(&saved.column)
+        {
+            let method = |name: &str| match name {
+                "num" => SortMethod::Numeric,
+                "nat" => SortMethod::Natural,
+                _ => SortMethod::Alphabetic,
+            };
+            self.sort = Some(SortSpec {
+                col,
+                dir: if saved.descending {
+                    SortDir::Desc
+                } else {
+                    SortDir::Asc
+                },
+                key: saved.key.as_ref().map(|k| SortKey {
+                    start: k.from.saturating_sub(1),
+                    end: k.to.max(k.from),
+                    method: method(&k.method),
+                }),
+            });
+        }
+        if !self.rebuild_view() {
+            // Interrupted while sorting: keep the arrangement, drop the sort.
+            interrupt::take();
+            self.sort = None;
+            self.rebuild_view();
+        }
+        // A pattern is the starting point, not a change to walk back from.
+        self.undo.clear();
+        self.redo.clear();
+    }
+
+    /// The header reading a pattern asks for, which has to be known before the
+    /// file is read rather than applied afterwards.
+    pub fn header_from(pattern: &Pattern) -> Option<HeaderSpec> {
+        pattern.header.map(|h| HeaderSpec {
+            skip: h.skip,
+            named: h.named,
+        })
     }
 
     /// Take a copy of everything `z` can restore.
@@ -926,6 +1122,7 @@ impl App {
             KeyCode::BackTab => self.switch_tab = Some(-1),
             KeyCode::Char('w') if ctrl => self.close_tab = true,
             KeyCode::Char('o') => self.enter_input(InputKind::Open),
+            KeyCode::Char('w') if !ctrl => self.enter_input(InputKind::Pattern),
             KeyCode::Char('?') => self.show_help = true,
             // `J` starts the join wizard; `Enter` then picks the key column
             // under the cursor, once on each side.
@@ -1130,6 +1327,9 @@ impl App {
                 self.search.as_ref().map(|s| s.query.clone())
             }
             InputKind::Filter => self.filter_query.clone(),
+            // Offered pre-filled with the file's name, which is the binding
+            // most patterns want — and editable into a glob for the rest.
+            InputKind::Pattern => Some(self.pattern_bind()),
             InputKind::Goto | InputKind::Open => None,
         }
         .unwrap_or_default();
@@ -1139,9 +1339,13 @@ impl App {
         let query = std::mem::take(&mut self.input);
         self.mode = Mode::Normal;
         self.completions = None;
-        // These two take the text literally rather than as a regex.
+        // These take the text literally rather than as a regex.
         match kind {
             InputKind::Goto => return self.goto_line(&query),
+            InputKind::Pattern => {
+                self.save_pattern = Some(query.trim().to_string());
+                return;
+            }
             InputKind::Open => {
                 let path = query.trim();
                 if !path.is_empty() {
@@ -1155,7 +1359,7 @@ impl App {
             match kind {
                 InputKind::Search | InputKind::ColumnSearch => self.search = None,
                 InputKind::Filter => self.clear_filter(),
-                InputKind::Goto | InputKind::Open => unreachable!(),
+                InputKind::Goto | InputKind::Open | InputKind::Pattern => unreachable!(),
             }
             return;
         }
@@ -1170,7 +1374,7 @@ impl App {
             InputKind::Search => self.apply_search(query, re, None),
             InputKind::ColumnSearch => self.apply_search(query, re, Some(self.selected_col())),
             InputKind::Filter => self.apply_filter(query, re),
-            InputKind::Goto | InputKind::Open => unreachable!(),
+            InputKind::Goto | InputKind::Open | InputKind::Pattern => unreachable!(),
         }
     }
 

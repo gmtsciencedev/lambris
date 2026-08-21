@@ -217,6 +217,18 @@ impl Dataset {
         }
     }
 
+    /// The worksheet this came from, when the file is a workbook.
+    pub fn sheet(&self) -> Option<&str> {
+        self.sheet.as_deref()
+    }
+
+    /// Whether this table is the file's own content, rather than something
+    /// derived from it — a transposed view or the result of a join. A worksheet
+    /// counts as the file's own, even though it is served from memory.
+    pub fn is_file_backed(&self) -> bool {
+        !matches!(self.backend, Backend::Memory(_)) || self.sheet.is_some()
+    }
+
     /// The raw file (or sheet) row behind dataset row `row`: the rows skipped
     /// above, the header itself, then the data. Used to point the header at the
     /// row under the cursor.
