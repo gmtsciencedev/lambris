@@ -15,8 +15,8 @@ use app::App;
 use data::{Dataset, HeaderSpec, JoinSide, JOIN_MAX_ROWS};
 use pattern::Store;
 
-/// A terminal viewer for parquet, CSV/TSV and Excel files, in the manner of
-/// csvlens.
+/// A terminal viewer for parquet, CSV/TSV (plain or gzipped) and Excel files,
+/// in the manner of csvlens.
 #[derive(Parser)]
 #[command(name = "lambris", version, about)]
 struct Args {
@@ -217,10 +217,15 @@ impl Tabs {
             }
         }
         if toggle_header {
-            let named = !self.app_mut().data.header.named;
-            let skip = self.app_mut().data.header.skip;
+            // Stating it either way, so a `#` comment header is no longer what
+            // decides: `T` is about the rows of the table.
+            let header = self.app_mut().data.header;
+            let named = !header.named();
             self.reload_header(
-                HeaderSpec { skip, named },
+                HeaderSpec::At {
+                    skip: header.skip(),
+                    named,
+                },
                 if named { "first row: column names" } else { "first row: data" },
             );
         }
@@ -316,8 +321,11 @@ impl Tabs {
     /// Pressing `H` again with a promoted header puts it back at the top.
     fn promote_header_row(&mut self) {
         let app = self.app_mut();
-        if app.data.header.skip > 0 {
-            self.reload_header(HeaderSpec::default(), "header: back to the first row");
+        // Any stated header row means `H` has been used, so this press takes it
+        // back — testing `skip > 0` would miss the case where the row wanted is
+        // the first one, which is exactly what a `#`-commented file needs.
+        if matches!(app.data.header, HeaderSpec::At { named: true, .. }) {
+            self.reload_header(HeaderSpec::Auto, "header: back to how the file reads");
             return;
         }
         if app.row_count() == 0 {
@@ -325,7 +333,7 @@ impl Tabs {
         }
         // The raw file row under the cursor, which is what becomes the header.
         let skip = app.data.raw_row(app.selected_orig());
-        let spec = HeaderSpec { skip, named: true };
+        let spec = HeaderSpec::At { skip, named: true };
         let msg = format!("header: row {}", spec.header_line());
         self.reload_header(spec, &msg);
     }
@@ -492,6 +500,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::io::Write;
     use std::time::{Duration, Instant};
     use parquet::arrow::ArrowWriter;
     use ratatui::backend::TestBackend;
@@ -1585,7 +1594,7 @@ mod tests {
             Tabs::open(&[file], HeaderSpec::default(), Store::load_at(store)).unwrap();
         let app = tabs.app_mut();
         assert_eq!(app.data.column_names, vec!["id", "name", "score"]);
-        assert_eq!(app.data.header.skip, 2);
+        assert_eq!(app.data.header.skip(), 2);
         assert_eq!(app.row_count(), 1);
     }
 
@@ -2284,7 +2293,7 @@ mod tests {
         assert!(tabs.step());
         assert_eq!(tabs.app_mut().data.column_names, vec!["id", "name", "score"]);
         assert_eq!(tabs.app_mut().row_count(), 2, "only the real data rows remain");
-        assert_eq!(tabs.app_mut().data.header.skip, 2);
+        assert_eq!(tabs.app_mut().data.header.skip(), 2);
         assert_eq!(tabs.app_mut().data.header.header_line(), 3);
         // The score column is numeric now that the junk rows are gone.
         assert!(tabs.app_mut().data.is_numeric(2));
@@ -2293,7 +2302,7 @@ mod tests {
         // Pressing H again cancels it, back to the file as it comes.
         tabs.app_mut().handle_key(key('H'));
         assert!(tabs.step());
-        assert_eq!(tabs.app_mut().data.header, HeaderSpec::default());
+        assert_eq!(tabs.app_mut().data.header, HeaderSpec::Auto);
         assert_eq!(tabs.app_mut().data.column_names[0], "exported by hand");
         assert_eq!(tabs.tabs.len(), 1, "it stays one tab throughout");
     }
@@ -2306,9 +2315,56 @@ mod tests {
             .unwrap();
         tabs.app_mut().handle_key(key('H'));
         assert!(tabs.step());
-        assert_eq!(tabs.app_mut().data.header.skip, 1, "row under the cursor, not row 0");
+        assert_eq!(tabs.app_mut().data.header.skip(), 1, "row under the cursor, not row 0");
         assert_eq!(tabs.app_mut().data.column_names, vec!["alpha", "1"]);
         assert_eq!(tabs.app_mut().row_count(), 1);
+    }
+
+    #[test]
+    fn promoting_a_row_in_a_commented_file_picks_the_row_under_the_cursor() {
+        // The MetaPhlAn shape: the names come from the last `#` line, which used
+        // up none of the table's rows. `H` on the first row must therefore mean
+        // *that* row — not the one after it.
+        let tsv = "# some command\n#clade_name\ts1\ts2\nk__Bacteria\t0.5\t0.25\nk__Archaea\t0.1\t0.2\n";
+        let path = write_text_fixture("tsv", tsv);
+        let mut tabs =
+            Tabs::open(std::slice::from_ref(&path), HeaderSpec::default(), Store::default())
+                .unwrap();
+        assert_eq!(tabs.app_mut().data.column_names, vec!["clade_name", "s1", "s2"]);
+        assert_eq!(
+            tabs.app_mut().data.raw_row(0),
+            0,
+            "a comment header costs the table no row"
+        );
+
+        tabs.key(key('H'));
+        assert!(tabs.step());
+        assert_eq!(
+            tabs.app_mut().data.column_names,
+            vec!["k__Bacteria", "0.5", "0.25"],
+            "the row under the cursor, not the next one"
+        );
+        assert_eq!(tabs.app_mut().row_count(), 1);
+        // Stated outright, so the comment line no longer decides — which a
+        // single `skip`/`named` pair could not have expressed.
+        assert_eq!(
+            tabs.app_mut().data.header,
+            HeaderSpec::At { skip: 0, named: true }
+        );
+
+        // And `H` again goes back to how the file reads itself, even though the
+        // row it named was the first one.
+        tabs.key(key('H'));
+        assert!(tabs.step());
+        assert_eq!(tabs.app_mut().data.header, HeaderSpec::Auto);
+        assert_eq!(tabs.app_mut().data.column_names, vec!["clade_name", "s1", "s2"]);
+
+        // `T` states the other reading: no names at all, comments still skipped.
+        tabs.key(key('T'));
+        assert!(tabs.step());
+        let app = tabs.app_mut();
+        assert_eq!(app.data.column_names, vec!["column_1", "column_2", "column_3"]);
+        assert_eq!(app.row_count(), 2, "both data rows, the comments dropped");
     }
 
     #[test]
@@ -2317,7 +2373,7 @@ mod tests {
         let mut tabs = Tabs::open(&[xlsx_fixture()], HeaderSpec::default(), Store::default()).unwrap();
         tabs.app_mut().handle_key(key('H'));
         assert!(tabs.step());
-        assert_eq!(tabs.app_mut().data.header.skip, 1);
+        assert_eq!(tabs.app_mut().data.header.skip(), 1);
         assert_eq!(tabs.app_mut().data.column_names, vec!["1", "alpha", "3.5"]);
         assert_eq!(tabs.app_mut().row_count(), 3);
         assert_eq!(tabs.tabs.len(), 2, "the other sheet is untouched");
@@ -2341,12 +2397,12 @@ mod tests {
         let headed = Dataset::load(&path).unwrap();
         assert_eq!(headed.column_names, vec!["1", "2", "3"]);
         assert_eq!(headed.nrows, 1);
-        assert!(headed.header.named);
+        assert!(headed.header.named());
         // Without one, every record is data and the names are positional.
         let bare = Dataset::load_all(&path, HeaderSpec::NONE).unwrap().remove(0);
         assert_eq!(bare.column_names, vec!["column_1", "column_2", "column_3"]);
         assert_eq!(bare.nrows, 2);
-        assert!(!bare.header.named);
+        assert!(!bare.header.named());
         assert_eq!(bare.cell_display(0, 0).unwrap().as_deref(), Some("1"));
     }
 
@@ -2359,7 +2415,7 @@ mod tests {
         // `T` re-reads the file with the header row as data.
         tabs.app_mut().handle_key(key('T'));
         assert!(tabs.step());
-        assert!(!tabs.app_mut().data.header.named);
+        assert!(!tabs.app_mut().data.header.named());
         assert_eq!(tabs.app_mut().data.column_names, vec!["column_1", "column_2"]);
         assert_eq!(tabs.app_mut().row_count(), 3, "the header row is now data");
         assert_eq!(tabs.tabs.len(), 1, "toggling stays in the same tab");
@@ -2367,7 +2423,7 @@ mod tests {
         // And back again.
         tabs.app_mut().handle_key(key('T'));
         assert!(tabs.step());
-        assert!(tabs.app_mut().data.header.named);
+        assert!(tabs.app_mut().data.header.named());
         assert_eq!(tabs.app_mut().data.column_names, vec!["id", "name"]);
         assert_eq!(tabs.app_mut().row_count(), 2);
     }
@@ -2427,7 +2483,7 @@ mod tests {
         assert_eq!(numbers.nrows, 5);
         assert_eq!(numbers.column_types[0], "Utf8");
         assert_eq!(numbers.cell_display(0, 0).unwrap().as_deref(), Some("id"));
-        assert!(!numbers.header.named);
+        assert!(!numbers.header.named());
 
         // Toggling a workbook tab reloads just that sheet, keeping the others.
         let mut tabs = Tabs::open(&[book], HeaderSpec::default(), Store::default()).unwrap();
@@ -2437,13 +2493,13 @@ mod tests {
         assert!(tabs.step());
         assert_eq!(tabs.tabs.len(), 2, "the other sheet's tab survives");
         assert_eq!(tabs.current, 1);
-        assert!(!tabs.app_mut().data.header.named);
+        assert!(!tabs.app_mut().data.header.named());
         assert_eq!(tabs.app_mut().data.column_names, vec!["column_1", "column_2"]);
         assert!(tabs.app_mut().data.label.ends_with("[Dates]"));
         // The untouched sheet still has its header.
         tabs.app_mut().handle_key(code(KeyCode::Tab));
         assert!(tabs.step());
-        assert!(tabs.app_mut().data.header.named);
+        assert!(tabs.app_mut().data.header.named());
     }
 
     #[test]
@@ -2744,6 +2800,142 @@ mod tests {
         assert_eq!(ds.nrows, 2, "the `#` header line is not counted as data");
         assert_eq!(ds.cell_display(0, 0).unwrap().as_deref(), Some("k__Bacteria"));
         assert_eq!(ds.cell_display(1, 1).unwrap().as_deref(), Some("2157"));
+    }
+
+    /// Write `content` gzipped to a uniquely-named temp file.
+    fn write_gzip_fixture(name: &str, content: &str) -> PathBuf {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!("lambris_test_gz_{n}.{name}.gz"));
+        let file = std::fs::File::create(&path).unwrap();
+        let mut encoder = GzEncoder::new(file, Compression::fast());
+        encoder.write_all(content.as_bytes()).unwrap();
+        encoder.finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn reads_a_gzipped_delimited_file() {
+        // The delimiter comes from the extension under the `.gz`.
+        let tsv = "id\tname\n1\talpha\n2\tbeta\n";
+        let ds = Dataset::load(&write_gzip_fixture("tsv", tsv)).unwrap();
+        assert_eq!(ds.column_names, vec!["id", "name"]);
+        assert_eq!(ds.column_types, vec!["Int64", "Utf8"]);
+        assert_eq!(ds.nrows, 2);
+        assert_eq!(ds.cell_display(1, 1).unwrap().as_deref(), Some("beta"));
+
+        let csv = "a,b\n1,2\n";
+        let ds = Dataset::load(&write_gzip_fixture("csv", csv)).unwrap();
+        assert_eq!(ds.column_names, vec!["a", "b"]);
+
+        // With nothing useful under the `.gz`, the delimiter is sniffed from
+        // the expanded text.
+        let ds = Dataset::load(&write_gzip_fixture("dat", tsv)).unwrap();
+        assert_eq!(ds.column_names, vec!["id", "name"]);
+    }
+
+    #[test]
+    fn a_gzipped_file_keeps_every_other_behaviour() {
+        // Big enough to span chunks, so it exercises the byte-offset index over
+        // the expanded copy rather than a single read.
+        let mut text = String::from("id,name\n");
+        for i in 0..BIG {
+            text.push_str(&format!("{i},r{i}\n"));
+        }
+        let path = write_gzip_fixture("csv", &text);
+        let ds = Dataset::load(&path).unwrap();
+        assert_eq!(ds.nrows, BIG as usize);
+        for row in [0usize, 8191, 8192, 19_999] {
+            assert_eq!(
+                ds.cell_display(0, row).unwrap().as_deref(),
+                Some(row.to_string().as_str()),
+                "row {row} across a chunk boundary"
+            );
+        }
+        // Filtering streams the expanded file the same way.
+        let hits = ds
+            .filter_rows(&[0, 1], &regex::Regex::new("^18000$").unwrap(), || false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(hits, vec![18000]);
+
+        // The label and the pattern binding are the name the user typed, not
+        // the temporary copy's.
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(ds.label, name);
+        assert!(name.ends_with(".gz"));
+    }
+
+    #[test]
+    fn a_gzipped_file_reads_all_of_its_members() {
+        // bgzip writes a series of gzip streams, and `cat a.gz b.gz` is a valid
+        // file: reading only the first member would truncate the table.
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        let mut bytes = Vec::new();
+        for part in ["id\n1\n2\n", "3\n4\n"] {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(part.as_bytes()).unwrap();
+            bytes.extend(encoder.finish().unwrap());
+        }
+        let mut path = std::env::temp_dir();
+        path.push("lambris_test_multimember.csv.gz");
+        std::fs::write(&path, bytes).unwrap();
+
+        let ds = Dataset::load(&path).unwrap();
+        assert_eq!(ds.nrows, 4, "every member should be read");
+        assert_eq!(ds.cell_display(0, 3).unwrap().as_deref(), Some("4"));
+    }
+
+    #[test]
+    fn a_gzipped_file_keeps_the_comment_and_header_handling() {
+        // The MetaPhlAn shape, gzipped: the last `#` line is the header.
+        let tsv = "# some command\n#clade_name\ts1\ts2\nk__Bacteria\t0.5\t0.25\n";
+        let path = write_gzip_fixture("tsv", tsv);
+        let ds = Dataset::load(&path).unwrap();
+        assert_eq!(ds.column_names, vec!["clade_name", "s1", "s2"]);
+        assert_eq!(ds.nrows, 1);
+
+        // And re-reading the file — `T` here — expands it again rather than
+        // losing track of where the text went.
+        let mut tabs =
+            Tabs::open(std::slice::from_ref(&path), HeaderSpec::default(), Store::default())
+                .unwrap();
+        tabs.key(key('T'));
+        assert!(tabs.step());
+        let app = tabs.app_mut();
+        assert!(!app.data.header.named());
+        assert_eq!(app.data.column_names, vec!["column_1", "column_2", "column_3"]);
+        assert_eq!(app.row_count(), 1, "the comment block is still skipped");
+        assert_eq!(app.data.cell_display(0, 0).unwrap().as_deref(), Some("k__Bacteria"));
+    }
+
+    #[test]
+    fn the_expanded_copy_is_cleaned_up() {
+        let path = write_gzip_fixture("csv", "a\n1\n");
+        let temporary = || -> Vec<PathBuf> {
+            std::fs::read_dir(std::env::temp_dir())
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().starts_with("lambris-"))
+                        .unwrap_or(false)
+                })
+                .collect()
+        };
+        let before = temporary().len();
+        {
+            let ds = Dataset::load(&path).unwrap();
+            assert_eq!(ds.nrows, 1);
+            assert!(temporary().len() > before, "an expanded copy exists while open");
+        }
+        assert_eq!(temporary().len(), before, "and goes when the dataset does");
     }
 
     #[test]

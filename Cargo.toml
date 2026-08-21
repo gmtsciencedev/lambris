@@ -1,6 +1,6 @@
 [package]
 name = "lambris"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 license = "MIT"
 
@@ -11,6 +11,7 @@ calamine = { version = "0.36.1", features = ["dates"] }
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 clap = { version = "4.6.1", features = ["derive"] }
 crossterm = "0.29.0"
+flate2 = "1.1.9"
 parquet = "59.1.0"
 ratatui = "0.30.2"
 regex = "1.12.4"

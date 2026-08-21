@@ -535,10 +535,12 @@ impl App {
                 .then(|| self.cols.get(self.frozen_cols - 1).map(|&c| name(c)))
                 .flatten(),
             filter: self.filter_query.clone(),
-            header: Some(SavedHeader {
-                skip: self.data.header.skip,
-                named: self.data.header.named,
-            }),
+            // `Auto` is the absence of a stated reading, so it is left out —
+            // a pattern should not pin down what the file already says.
+            header: match self.data.header {
+                HeaderSpec::Auto => None,
+                HeaderSpec::At { skip, named } => Some(SavedHeader { skip, named }),
+            },
             row_numbers: self.show_line_numbers,
             summary: self.summary.map(|s| s.name().to_string()),
             summaries: self
@@ -666,7 +668,7 @@ impl App {
     /// The header reading a pattern asks for, which has to be known before the
     /// file is read rather than applied afterwards.
     pub fn header_from(pattern: &Pattern) -> Option<HeaderSpec> {
-        pattern.header.map(|h| HeaderSpec {
+        pattern.header.map(|h| HeaderSpec::At {
             skip: h.skip,
             named: h.named,
         })

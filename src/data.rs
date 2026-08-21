@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -17,6 +17,7 @@ use arrow::csv::ReaderBuilder as CsvReaderBuilder;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
+use flate2::read::MultiGzDecoder;
 // `DataType` is imported anonymously: it carries the cell accessors we need
 // (`as_datetime`), and the name would collide with Arrow's own `DataType`.
 use calamine::{open_workbook_auto, Data, DataType as _, Range, Reader};
@@ -38,34 +39,54 @@ const CACHE_CHUNKS: usize = 32;
 /// columns a join reads stay in the chunk cache instead of being re-decoded.
 pub const JOIN_MAX_ROWS: usize = 200_000;
 
-/// How the top of a file (or sheet) is read: how many rows to ignore, and
-/// whether the row after them holds the column names.
+/// How the top of a file (or sheet) is read.
 ///
-/// `skip` exists for files that put title or provenance rows above the real
-/// header — common in hand-made spreadsheets and in exported TSVs — so the
-/// header can be moved down to where it actually is (`H`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct HeaderSpec {
-    /// Rows dropped before the header (or before the data, when unnamed).
-    pub skip: usize,
-    /// Whether the row after `skip` holds column names rather than data.
-    pub named: bool,
-}
-
-impl Default for HeaderSpec {
-    /// The first row holds the column names — what almost every file does.
-    fn default() -> Self {
-        Self { skip: 0, named: true }
-    }
+/// The two cases are genuinely different questions, which is why this is not
+/// one struct: `Auto` asks the file how it is laid out, while `At` states it.
+/// Without the distinction, "the first row is the header" and "work it out"
+/// would be the same value, and `H` could not ask for the first row of a file
+/// whose header would otherwise be taken from a `#` comment line.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum HeaderSpec {
+    /// Read the top the usual way: a `#` comment line as the header where the
+    /// file has one (MetaPhlAn and friends), otherwise the first row. What a
+    /// file opens as.
+    #[default]
+    Auto,
+    /// Stated outright: ignore `skip` rows, then take the names from the next
+    /// one, or treat that as data too. `skip` is for files that put title or
+    /// provenance rows above the real header — common in hand-made spreadsheets
+    /// and exported TSVs — so the header can be moved to where it actually is.
+    At { skip: usize, named: bool },
 }
 
 impl HeaderSpec {
     /// Every row is data; columns are named `column_N`.
-    pub const NONE: Self = Self { skip: 0, named: false };
+    pub const NONE: Self = Self::At {
+        skip: 0,
+        named: false,
+    };
+
+    /// Rows ignored above the header.
+    pub fn skip(&self) -> usize {
+        match self {
+            HeaderSpec::Auto => 0,
+            HeaderSpec::At { skip, .. } => *skip,
+        }
+    }
+
+    /// Whether a row is being read as the column names. `Auto` always names
+    /// them, from a comment line or the first row.
+    pub fn named(&self) -> bool {
+        match self {
+            HeaderSpec::Auto => true,
+            HeaderSpec::At { named, .. } => *named,
+        }
+    }
 
     /// The named row itself, as a 1-based row number for display.
     pub fn header_line(&self) -> usize {
-        self.skip + 1
+        self.skip() + 1
     }
 }
 
@@ -74,10 +95,15 @@ impl HeaderSpec {
 enum Backend {
     Parquet,
     /// Delimited text: the field separator plus byte offsets of every chunk's
-    /// first row (`chunk_offsets[k]` = start of row `k * CHUNK`).
+    /// first row (`chunk_offsets[k]` = start of row `k * CHUNK`). `text` is
+    /// where that text is read from, which is the file itself unless it arrived
+    /// compressed and had to be expanded first.
     Csv {
         delimiter: u8,
         chunk_offsets: Vec<u64>,
+        text: PathBuf,
+        /// Holds the expanded copy alive, and removes it afterwards.
+        _temp: Option<TempText>,
     },
     /// A fully-resident batch (e.g. a transposed view), served in chunks.
     Memory(Arc<RecordBatch>),
@@ -131,6 +157,9 @@ pub struct Dataset {
     sheet: Option<String>,
     /// How the top of the file (or sheet) was read.
     pub header: HeaderSpec,
+    /// Whether the column names came from a `#` comment line, which — unlike a
+    /// header row — used up none of the file's rows.
+    comment_header: bool,
     backend: Backend,
     schema: SchemaRef,
     pub column_names: Vec<String>,
@@ -167,13 +196,28 @@ impl Dataset {
     /// Prepare a single-table format for lazy access. Reads only metadata
     /// (parquet) or builds a byte-offset index (CSV) — never the data.
     fn from_source(path: &Path, source: Source, header: HeaderSpec) -> Result<Self> {
+        let mut comment_header = false;
         let (backend, schema, nrows, header) = match source {
             // Parquet carries its own column names, so this never applies.
             Source::Parquet => {
                 let (b, s, n) = load_parquet_meta(path)?;
                 (b, s, n, HeaderSpec::default())
             }
-            Source::Delimited(delim) => load_csv_meta(path, delim, header)?,
+            Source::Delimited(delim) => {
+                let (b, s, n, h, from_comment) =
+                    load_csv_meta(TextSource::plain(path), delim, header)?;
+                comment_header = from_comment;
+                (b, s, n, h)
+            }
+            // Expanded first, then read exactly like any other delimited file —
+            // including the comment handling and the header choice.
+            Source::Gzip => {
+                let text = expand(path)?;
+                let delim = delimiter_for(&uncompressed_name(path), &text.path)?;
+                let (b, s, n, h, from_comment) = load_csv_meta(text, delim, header)?;
+                comment_header = from_comment;
+                (b, s, n, h)
+            }
             // Workbooks go through `load_workbook`: a sheet is fully decoded
             // into memory, so there is no lazy backend to set up here.
             Source::Excel => unreachable!("workbooks are opened per sheet"),
@@ -191,6 +235,7 @@ impl Dataset {
             label,
             sheet: None,
             header,
+            comment_header,
             backend,
             schema,
             column_names,
@@ -231,10 +276,15 @@ impl Dataset {
     }
 
     /// The raw file (or sheet) row behind dataset row `row`: the rows skipped
-    /// above, the header itself, then the data. Used to point the header at the
-    /// row under the cursor.
+    /// above, the header row itself, then the data. Used to point the header at
+    /// the row under the cursor.
+    ///
+    /// Names taken from a `#` comment line cost no row, so nothing is added for
+    /// them — otherwise every row here would be off by one on exactly the files
+    /// that need `H` most.
     pub fn raw_row(&self, row: usize) -> usize {
-        self.header.skip + self.header.named as usize + row
+        let header_rows = (self.header.named() && !self.comment_header) as usize;
+        self.header.skip() + header_rows + row
     }
 
     /// Build a dataset from an already-materialised batch (used for transpose).
@@ -259,6 +309,7 @@ impl Dataset {
             label,
             sheet,
             header,
+            comment_header: false,
             backend: Backend::Memory(Arc::new(batch)),
             schema,
             column_names,
@@ -460,7 +511,9 @@ impl Dataset {
             Backend::Csv {
                 delimiter,
                 chunk_offsets,
-            } => self.load_csv_chunk(k, *delimiter, chunk_offsets),
+                text,
+                ..
+            } => self.load_csv_chunk(k, *delimiter, chunk_offsets, text),
             Backend::Memory(batch) => {
                 let start = k * CHUNK;
                 if start >= batch.num_rows() {
@@ -488,11 +541,17 @@ impl Dataset {
         concat(&self.schema, &batches)
     }
 
-    fn load_csv_chunk(&self, k: usize, delimiter: u8, offsets: &[u64]) -> Result<RecordBatch> {
+    fn load_csv_chunk(
+        &self,
+        k: usize,
+        delimiter: u8,
+        offsets: &[u64],
+        text: &Path,
+    ) -> Result<RecordBatch> {
         let Some(&start) = offsets.get(k) else {
             return Ok(RecordBatch::new_empty(self.schema.clone()));
         };
-        let mut file = File::open(&self.path)?;
+        let mut file = File::open(text)?;
         file.seek(SeekFrom::Start(start))?;
         // Read exactly this chunk's byte span (to EOF for the last chunk).
         let bytes = match offsets.get(k + 1) {
@@ -1042,6 +1101,107 @@ impl ChunkCache {
     }
 }
 
+/// Where a dataset's delimited text is, and the temporary copy to clean up if
+/// it is one we made.
+struct TextSource {
+    path: PathBuf,
+    temp: Option<TempText>,
+}
+
+impl TextSource {
+    /// The file as it stands on disk.
+    fn plain(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            temp: None,
+        }
+    }
+
+    fn backend(self, delimiter: u8, chunk_offsets: Vec<u64>) -> Backend {
+        Backend::Csv {
+            delimiter,
+            chunk_offsets,
+            text: self.path,
+            _temp: self.temp,
+        }
+    }
+}
+
+/// An expanded copy of a compressed file, removed when the dataset reading it
+/// is dropped.
+struct TempText {
+    path: PathBuf,
+}
+
+impl Drop for TempText {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Expand a gzipped file into a temporary one and read that.
+///
+/// A gzip stream cannot be seeked — deflate carries state from byte to byte — so
+/// the choice is between holding the whole table in memory and writing it out
+/// once. Writing it out keeps everything the chunked reader gives: bounded
+/// memory whatever the size, and sorting, filtering and searching by re-reading
+/// chunks rather than keeping them. The copy lands in the temporary directory,
+/// so `TMPDIR` decides where a very large one goes.
+fn expand(path: &Path) -> Result<TextSource> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "text".to_string());
+    let mut temp = std::env::temp_dir();
+    temp.push(format!(
+        "lambris-{}-{}-{name}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let temp = TempText { path: temp };
+
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    // Multi-member: bgzip writes a series of gzip streams, and `cat a.gz b.gz`
+    // is a valid file too. Reading only the first member would quietly truncate
+    // the table at the first block.
+    let mut reader = MultiGzDecoder::new(BufReader::new(file));
+    let mut out = BufWriter::new(
+        File::create(&temp.path)
+            .with_context(|| format!("creating {}", temp.path.display()))?,
+    );
+    std::io::copy(&mut reader, &mut out)
+        .with_context(|| format!("expanding {}", path.display()))?;
+    out.flush().context("finishing the expanded copy")?;
+    drop(out);
+    Ok(TextSource {
+        path: temp.path.clone(),
+        temp: Some(temp),
+    })
+}
+
+/// The name with a compression suffix taken off: `runs.tsv.gz` → `runs.tsv`, so
+/// the delimiter can still be read from the extension that matters.
+fn uncompressed_name(path: &Path) -> PathBuf {
+    PathBuf::from(path.file_stem().unwrap_or_default())
+}
+
+/// The field separator for a delimited file: from `name`'s extension, or
+/// sniffed from `text` when the extension says nothing useful.
+fn delimiter_for(name: &Path, text: &Path) -> Result<u8> {
+    let extension = name
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    Ok(match extension.as_str() {
+        "tsv" | "tab" => b'\t',
+        "csv" => b',',
+        _ => sniff_delimiter(text)?,
+    })
+}
+
 /// The kind of file behind a path, chosen by autodetection.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Source {
@@ -1050,12 +1210,16 @@ enum Source {
     Delimited(u8),
     /// An Excel (or OpenDocument) workbook, read one sheet at a time.
     Excel,
+    /// Gzipped delimited text, expanded before anything else happens.
+    Gzip,
 }
 
 /// A ZIP container: xlsx, xlsm and ods all start with it.
 const ZIP_MAGIC: &[u8] = b"PK\x03\x04";
 /// The OLE2 compound-file header of legacy `.xls` workbooks.
 const OLE2_MAGIC: &[u8] = &[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+/// A gzip member header, which is what `.gz` and bgzip files start with.
+const GZIP_MAGIC: &[u8] = &[0x1F, 0x8B];
 
 /// Autodetect the format from the file's magic number, falling back to the
 /// extension. Parquet carries `PAR1`; workbooks are either a ZIP container
@@ -1085,12 +1249,10 @@ fn detect_source(path: &Path) -> Result<Source> {
     if is_workbook_ext || magic.starts_with(ZIP_MAGIC) || magic.starts_with(OLE2_MAGIC) {
         return Ok(Source::Excel);
     }
-    let delimiter = match ext.as_str() {
-        "tsv" | "tab" => b'\t',
-        "csv" => b',',
-        _ => sniff_delimiter(path)?,
-    };
-    Ok(Source::Delimited(delimiter))
+    if magic.starts_with(GZIP_MAGIC) {
+        return Ok(Source::Gzip);
+    }
+    Ok(Source::Delimited(delimiter_for(path, path)?))
 }
 
 /// The file name, shown in the title bar and the tab strip.
@@ -1136,10 +1298,11 @@ fn load_parquet_meta(path: &Path) -> Result<(Backend, SchemaRef, usize)> {
 /// named `column_N` and the first record is data. Files that begin with `#`
 /// comment lines take a dedicated path (see [`load_csv_meta_commented`]).
 fn load_csv_meta(
-    path: &Path,
+    source: TextSource,
     delimiter: u8,
     header: HeaderSpec,
-) -> Result<(Backend, SchemaRef, usize, HeaderSpec)> {
+) -> Result<(Backend, SchemaRef, usize, HeaderSpec, bool)> {
+    let path = &source.path.clone();
     // Where the real content starts, past any leading `#` comment block.
     let (body_start, comment_names) = if starts_with_comment(path)? {
         let layout = analyze_comment_header(path, delimiter)?;
@@ -1147,37 +1310,37 @@ fn load_csv_meta(
     } else {
         (0, None)
     };
-    // A `#` line that is itself the header (MetaPhlAn style) stands only while
-    // the caller hasn't asked for a different reading.
-    if header == HeaderSpec::default()
+    // A `#` line that is itself the header (MetaPhlAn style) is what `Auto`
+    // means for such a file. Any stated reading takes the generic path, so
+    // `At { skip: 0, named: true }` really does mean the first row after the
+    // comments rather than the comment itself.
+    if header == HeaderSpec::Auto
         && let Some(names) = comment_names
     {
-        return commented_meta(path, delimiter, body_start, names);
+        return commented_meta(source, delimiter, body_start, names);
     }
     // Skip past the ignored rows; the next record is the header, or data.
-    let header_at = skip_records(path, body_start, header.skip)?;
+    let header_at = skip_records(path, body_start, header.skip())?;
     let format = CsvFormat::default()
-        .with_header(header.named)
+        .with_header(header.named())
         .with_delimiter(delimiter);
     let mut infer_file = File::open(path)?;
     infer_file.seek(SeekFrom::Start(header_at))?;
     let (schema, _) = format
         .infer_schema(BufReader::new(infer_file), Some(CSV_INFER_ROWS))
         .with_context(|| format!("inferring schema from {}", path.display()))?;
-    let data_start = if header.named {
+    let data_start = if header.named() {
         skip_records(path, header_at, 1)?
     } else {
         header_at
     };
     let (chunk_offsets, nrows) = build_index_from(path, data_start)?;
     Ok((
-        Backend::Csv {
-            delimiter,
-            chunk_offsets,
-        },
+        source.backend(delimiter, chunk_offsets),
         Arc::new(schema),
         nrows,
         header,
+        false,
     ))
 }
 
@@ -1185,11 +1348,12 @@ fn load_csv_meta(
 /// friends): the names come from the comment, and column types are inferred
 /// from the data alone — the comment lines never reach the chunk reader.
 fn commented_meta(
-    path: &Path,
+    source: TextSource,
     delimiter: u8,
     data_start: u64,
     names: Vec<String>,
-) -> Result<(Backend, SchemaRef, usize, HeaderSpec)> {
+) -> Result<(Backend, SchemaRef, usize, HeaderSpec, bool)> {
+    let path = &source.path.clone();
     let (chunk_offsets, nrows) = build_index_from(path, data_start)?;
 
     // Types come from the data rows only (header, if any, is already excluded).
@@ -1212,13 +1376,12 @@ fn commented_meta(
         .collect();
     let schema = Arc::new(Schema::new(fields));
     Ok((
-        Backend::Csv {
-            delimiter,
-            chunk_offsets,
-        },
+        source.backend(delimiter, chunk_offsets),
         schema,
         nrows,
-        HeaderSpec::default(),
+        HeaderSpec::Auto,
+        // The names came from a comment, not from a row of the table.
+        true,
     ))
 }
 
@@ -1456,7 +1619,7 @@ fn sheet_dataset(
 /// named positionally. Each column is typed from the values Excel reported
 /// (see [`sheet_array`]).
 fn sheet_batch(range: &Range<Data>, header: HeaderSpec) -> Result<RecordBatch> {
-    let mut rows = range.rows().skip(header.skip);
+    let mut rows = range.rows().skip(header.skip());
     let Some(first) = rows.next() else {
         return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
     };
@@ -1465,14 +1628,14 @@ fn sheet_batch(range: &Range<Data>, header: HeaderSpec) -> Result<RecordBatch> {
         .enumerate()
         .map(|(i, cell)| {
             let positional = || format!("column_{}", i + 1);
-            if !header.named {
+            if !header.named() {
                 return positional();
             }
             cell_text(cell).filter(|name| !name.is_empty()).unwrap_or_else(positional)
         })
         .collect();
     // Unnamed, that first row is a data row like any other.
-    let body: Vec<&[Data]> = if header.named {
+    let body: Vec<&[Data]> = if header.named() {
         rows.collect()
     } else {
         std::iter::once(first).chain(rows).collect()

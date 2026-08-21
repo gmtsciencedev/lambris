@@ -862,10 +862,10 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App, clipped: &Clipped) {
         ));
     }
     // Flag any reading of the top rows other than the usual one.
-    if !app.data.header.named {
+    if !app.data.header.named() {
         spans.push(Span::styled("  no header", Style::new().fg(Color::Yellow)));
     }
-    if app.data.header.skip > 0 {
+    if app.data.header.skip() > 0 {
         spans.push(Span::styled(
             format!("  header@{}", app.data.header.header_line()),
             Style::new().fg(Color::Yellow),

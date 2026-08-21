@@ -1,7 +1,7 @@
 # lambris
 
-A terminal viewer for parquet, CSV/TSV, and Excel files, in the manner of
-[csvlens](https://github.com/YS-L/csvlens).
+A terminal viewer for parquet, CSV/TSV (plain or gzipped), and Excel files, in
+the manner of [csvlens](https://github.com/YS-L/csvlens).
 
 Opens one or more data files — each in its own tab — and lets you scroll around
 them in a TUI: a header row with column names, a row-number gutter, a status bar
@@ -479,8 +479,8 @@ a provenance row above it, or a CSV exported the same way — put the cursor on
 the real header row and press `H`. That row becomes the header and everything
 above it is dropped, which also fixes the column *types*: a numeric column that
 was reading as text because of the junk above it becomes numeric again. Press
-`H` again to put the header back at the top. The status bar shows `header@3` for
-a header promoted to row 3.
+`H` again to go back to how the file reads itself. The status bar shows
+`header@3` for a header promoted to row 3.
 
 ```
 #  exported by hand                   #  id  name  score
@@ -507,6 +507,11 @@ extension:
   OLE2 one for legacy `.xls`) even when the extension doesn't. Since neither
   container can be delimited text, such a file is always read as a workbook,
   and reports clearly if it turns out to hold something else.
+- **Gzipped text** — a file starting with a gzip header is expanded and then
+  read as delimited text. The delimiter comes from the extension *under* the
+  `.gz` (`runs.tsv.gz` → tab). Multi-member files are read whole, so a **bgzip**
+  file — which is a series of gzip streams — comes through complete rather than
+  stopping at the first block.
 - **CSV / TSV** — anything else is read as delimited text. The delimiter comes
   from the extension (`.tsv`/`.tab` → tab, `.csv` → comma) or, for unknown
   extensions, is sniffed from the first non-comment line. The first row is
@@ -548,6 +553,11 @@ tools) are handled automatically:
 
 - A leading block of `#` lines is skipped (with `--no-header`/`T`/`H` too — the
   comment block never counts as a row).
+- Names taken from a `#` line cost the table no row, so `H` on the first row
+  means *that* row. Stating a header with `H` or `T` also settles the question
+  the comment line would otherwise answer: `H` on the first row after the
+  comments makes it the header, where leaving it alone would keep the comment's
+  names.
 - If the **last** `#` line has the same number of columns as the data (e.g.
   MetaPhlAn's `#clade_name<TAB>…`), it is used as the header. Otherwise the
   comment block is treated as pure preamble and the first non-`#` line is the
@@ -604,6 +614,24 @@ for the visible window using Arrow's `ArrayFormatter`.
 
 > Note: CSV/TSV are indexed with a single fast scan when the file is opened, so
 > there's a brief pause on very large text files before the viewer appears.
+
+### Gzipped text
+
+A gzip stream cannot be seeked — deflate carries state from byte to byte — so a
+gzipped file is **expanded into a temporary file once**, and everything then
+works on that: the byte-offset index, chunked reads, sorting, filtering and
+searching, all with memory still bounded by the chunk cache rather than the
+file's size. The alternative — holding the expanded table in memory — is exactly
+what the chunked reader exists to avoid.
+
+What that costs: one pass at open (on top of the indexing scan), and temporary
+disk for the expanded copy. It lands in the temporary directory, so `TMPDIR`
+decides where a very large one goes, and it is removed when the tab closes. A
+command that re-reads the file — `T` or `H` — expands it again.
+
+Everything else is unchanged: a gzipped file keeps the `#` comment handling, the
+header controls, and its own name for the title bar and for
+[patterns](#patterns), so a pattern can be tied to `*_stats.tsv.gz`.
 
 ## Development
 
