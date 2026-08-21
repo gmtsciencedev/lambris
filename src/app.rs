@@ -5,7 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use regex::{Regex, RegexBuilder};
 
 use crate::browse::Completions;
-use crate::data::Dataset;
+use crate::data::{Dataset, SortKey, SortMethod};
 use crate::interrupt;
 
 /// How a numeric column is displayed (set with `%`, `<`, `>`).
@@ -70,6 +70,34 @@ pub enum SortDir {
 pub struct SortSpec {
     pub col: usize,
     pub dir: SortDir,
+    /// When set, sort by this slice of the field rather than the whole value.
+    pub key: Option<SortKey>,
+}
+
+/// The `S` wizard: choosing which slice of a column to sort by, with the
+/// choice drawn into every cell of that column so the same offsets can be
+/// judged across the whole column at once.
+#[derive(Clone, Copy)]
+pub struct KeySort {
+    /// The dataset column being sliced.
+    pub col: usize,
+    /// First character of the slice.
+    pub start: usize,
+    /// One past the last character; while picking the start it is `start + 1`.
+    pub end: usize,
+    pub stage: KeyStage,
+    /// Longest value on screen in that column, so the edges can be clamped.
+    pub width: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum KeyStage {
+    /// Moving the left edge of the slice.
+    Start,
+    /// Moving the right edge.
+    End,
+    /// Choosing how to compare it.
+    Method,
 }
 
 /// The ordered set of original rows currently on display.
@@ -172,6 +200,8 @@ pub struct App {
     pub confirm: bool,
     /// Set by `Esc` while the wizard is running.
     pub cancel_join: bool,
+    /// The `S` sort-key wizard, while one is running.
+    pub key_sort: Option<KeySort>,
     /// Whether the `?` key reference is covering the table.
     pub show_help: bool,
     /// First line of the key reference on screen, for scrolling it.
@@ -221,6 +251,7 @@ impl App {
             join_active: false,
             confirm: false,
             cancel_join: false,
+            key_sort: None,
             show_help: false,
             help_offset: 0,
             frozen_cols: 0,
@@ -316,6 +347,9 @@ impl App {
         if self.show_help {
             return self.handle_help(key);
         }
+        if self.key_sort.is_some() {
+            return self.handle_key_sort(key);
+        }
         match self.mode {
             Mode::Normal => self.handle_normal(key, now),
             Mode::Input(kind) => self.handle_input(key, kind),
@@ -351,6 +385,143 @@ impl App {
     /// the transposed table without unbounded width on large files).
     pub fn view_rows(&self, max: usize) -> Vec<usize> {
         (0..self.row_count().min(max)).map(|i| self.orig_row(i)).collect()
+    }
+
+    /// Start the `S` wizard on the selected column.
+    fn start_key_sort(&mut self) {
+        if self.row_count() == 0 {
+            return;
+        }
+        let col = self.selected_col();
+        let width = self.visible_width(col);
+        if width == 0 {
+            self.status_msg = Some("nothing to slice in this column".into());
+            return;
+        }
+        self.key_sort = Some(KeySort {
+            col,
+            start: 0,
+            end: 1,
+            stage: KeyStage::Start,
+            width,
+        });
+    }
+
+    /// The longest value on screen in `col`, which bounds the slice.
+    fn visible_width(&self, col: usize) -> usize {
+        let end = (self.row_offset + self.viewport_rows).min(self.row_count());
+        let rows: Vec<usize> = (self.row_offset..end).map(|i| self.orig_row(i)).collect();
+        self.data
+            .cells(col, &rows)
+            .map(|cells| {
+                cells
+                    .iter()
+                    .flatten()
+                    .map(|v| v.chars().count())
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    }
+
+    /// Drive the `S` wizard: the arrows (or `h`/`l`) move the edge being
+    /// chosen, `j`/`k` scroll so more values can be judged against it, `Enter`
+    /// moves on and `Esc` gives up.
+    fn handle_key_sort(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return;
+        }
+        let Some(mut wizard) = self.key_sort else { return };
+        let last = wizard.width.saturating_sub(1);
+        match key.code {
+            KeyCode::Esc => {
+                self.key_sort = None;
+                self.status_msg = Some("sort key cancelled".into());
+                return;
+            }
+            KeyCode::Left | KeyCode::Char('h') => match wizard.stage {
+                KeyStage::Start => {
+                    wizard.start = wizard.start.saturating_sub(1);
+                    wizard.end = wizard.start + 1;
+                }
+                // The right edge never crosses the left one.
+                KeyStage::End => wizard.end = (wizard.end - 1).max(wizard.start + 1),
+                KeyStage::Method => {}
+            },
+            KeyCode::Right | KeyCode::Char('l') => match wizard.stage {
+                KeyStage::Start => {
+                    wizard.start = (wizard.start + 1).min(last);
+                    wizard.end = wizard.start + 1;
+                }
+                KeyStage::End => wizard.end = (wizard.end + 1).min(wizard.width),
+                KeyStage::Method => {}
+            },
+            // Scrolling is allowed: the point is to judge the offsets against
+            // the other values in the column.
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_row(1);
+                self.key_sort = Some(wizard);
+                return;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_row(-1);
+                self.key_sort = Some(wizard);
+                return;
+            }
+            KeyCode::Enter => match wizard.stage {
+                // The end edge opens at the far side of the field, so taking
+                // everything from the start onwards — the common case — needs no
+                // moving at all: `S`, Enter, Enter, method.
+                KeyStage::Start => {
+                    wizard.stage = KeyStage::End;
+                    wizard.end = wizard.width;
+                }
+                KeyStage::End | KeyStage::Method => wizard.stage = KeyStage::Method,
+            },
+            KeyCode::Char('a') if wizard.stage == KeyStage::Method => {
+                return self.apply_key_sort(wizard, SortMethod::Alphabetic);
+            }
+            KeyCode::Char('n') if wizard.stage == KeyStage::Method => {
+                return self.apply_key_sort(wizard, SortMethod::Numeric);
+            }
+            KeyCode::Char('v') if wizard.stage == KeyStage::Method => {
+                return self.apply_key_sort(wizard, SortMethod::Natural);
+            }
+            _ => {}
+        }
+        self.key_sort = Some(wizard);
+    }
+
+    /// Sort by the chosen slice, ascending. `s` afterwards cycles the direction
+    /// as usual, keeping the slice.
+    fn apply_key_sort(&mut self, wizard: KeySort, method: SortMethod) {
+        self.key_sort = None;
+        let key = SortKey {
+            start: wizard.start,
+            end: wizard.end,
+            method,
+        };
+        let previous = self.sort;
+        self.sort = Some(SortSpec {
+            col: wizard.col,
+            dir: SortDir::Asc,
+            key: Some(key),
+        });
+        if !self.rebuild_view() {
+            interrupt::take();
+            self.sort = previous;
+            self.status_msg = Some("sort cancelled".into());
+            return;
+        }
+        self.status_msg = Some(format!(
+            "sorted ↑ {}[{}-{}] {}",
+            self.data.column_names[wizard.col],
+            wizard.start + 1,
+            wizard.end,
+            method.label(),
+        ));
     }
 
     fn handle_normal(&mut self, key: KeyEvent, now: Instant) {
@@ -412,6 +583,7 @@ impl App {
             KeyCode::Char('>') => self.adjust_decimals(1),
             KeyCode::Char('<') => self.adjust_decimals(-1),
             KeyCode::Char('s') => self.cycle_sort(),
+            KeyCode::Char('S') => self.start_key_sort(),
             KeyCode::Char('f') if !ctrl => self.toggle_freeze(),
             KeyCode::Char('/') => self.enter_input(InputKind::Search),
             // Column-scoped search. `-` is a direct, unshifted key on AZERTY;
@@ -715,7 +887,9 @@ impl App {
             Some(s) if s.col == col && s.dir == SortDir::Desc => None,
             _ => Some(SortDir::Asc),
         };
-        self.sort = next.map(|dir| SortSpec { col, dir });
+        // Cycling the direction of a keyed sort keeps its slice.
+        let key = self.sort.filter(|s| s.col == col).and_then(|s| s.key);
+        self.sort = next.map(|dir| SortSpec { col, dir, key });
         if !self.rebuild_view() {
             // Sort aborted; restore the previous ordering (the view is untouched).
             interrupt::take();
@@ -810,8 +984,21 @@ impl App {
                     Some(f) => f.clone(),
                     None => (0..self.data.nrows).collect(),
                 };
-                match self.data.sort_indices(&base, s.col, s.dir == SortDir::Desc, interrupt::requested)
-                {
+                let descending = s.dir == SortDir::Desc;
+                let ordered = match s.key {
+                    Some(key) => self.data.sort_indices_by_key(
+                        &base,
+                        s.col,
+                        key,
+                        descending,
+                        interrupt::requested,
+                    ),
+                    None => {
+                        self.data
+                            .sort_indices(&base, s.col, descending, interrupt::requested)
+                    }
+                };
+                match ordered {
                     Ok(Some(rows)) => View::Rows(rows),
                     Ok(None) => return false, // cancelled; leave the view as it was
                     Err(e) => {

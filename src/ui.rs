@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use crate::app::{App, InputKind, Mode, NumStyle, SortDir};
+use crate::app::{App, InputKind, KeySort, KeyStage, Mode, NumStyle, SortDir};
 use crate::browse::{Completions, VISIBLE};
 
 /// The full key reference shown by `?`, grouped into sections. Kept as data so
@@ -39,6 +39,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         "Shaping",
         &[
             ("s", "sort by the selected column: ascending → descending → off"),
+            ("S", "sort by part of the column: pick the characters, then how"),
             ("f", "freeze columns up to the selected one"),
             ("x", "hide the selected column"),
             ("[ / ]", "move the selected column left / right (or Shift-←/→)"),
@@ -357,6 +358,9 @@ fn render_table(
 
     // Body rows.
     let search = app.search.as_ref();
+    // While the `S` wizard is choosing a slice, it is drawn into every cell of
+    // that column at once — that is the whole point of picking it visually.
+    let slicing = app.key_sort;
     let mut rows = Vec::with_capacity(visible_view.len());
     for (i, &vi) in visible_view.iter().enumerate() {
         let orig = app.orig_row(vi);
@@ -407,7 +411,11 @@ fn render_table(
             if sel_cell {
                 style = style.add_modifier(Modifier::REVERSED);
             }
-            cells.push(Cell::from(text).style(style));
+            let cell = match slicing.filter(|w| w.col == col) {
+                Some(wizard) => Cell::from(slice_line(&text, wizard)),
+                None => Cell::from(text),
+            };
+            cells.push(cell.style(style));
         }
         rows.push(Row::new(cells));
     }
@@ -467,6 +475,32 @@ fn render_help_page(frame: &mut Frame, area: Rect, app: &mut App) {
             .scroll((app.help_offset as u16, 0)),
         area,
     );
+}
+
+/// One cell with the wizard's slice picked out, so the same character offsets
+/// can be seen against every value in the column.
+fn slice_line(text: &str, wizard: KeySort) -> Line<'static> {
+    let chars: Vec<char> = text.chars().collect();
+    let take = |from: usize, to: usize| -> String {
+        chars.get(from..to.min(chars.len())).unwrap_or(&[]).iter().collect()
+    };
+    let start = wizard.start.min(chars.len());
+    let end = wizard.end.min(chars.len());
+    // Dim what is outside the slice rather than colouring the slice alone: it
+    // reads better across a column of differing lengths.
+    let outside = Style::new().dim();
+    let inside = Style::new()
+        .bg(Color::Cyan)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD);
+    let mut spans = vec![Span::styled(take(0, start), outside)];
+    if start < end {
+        spans.push(Span::styled(take(start, end), inside));
+    }
+    if end < chars.len() {
+        spans.push(Span::styled(take(end, chars.len()), outside));
+    }
+    Line::from(spans)
 }
 
 fn divider_cell() -> Cell<'static> {
@@ -710,8 +744,13 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     }
     if let Some(s) = app.sort {
         let arrow = if s.dir == SortDir::Asc { "↑" } else { "↓" };
+        // A keyed sort names its slice, 1-based and inclusive like `sort -k`.
+        let slice = match s.key {
+            Some(k) => format!("[{}-{}] {}", k.start + 1, k.end, k.method.label()),
+            None => String::new(),
+        };
         spans.push(Span::styled(
-            format!("  sort {arrow}{}", app.data.column_names[s.col]),
+            format!("  sort {arrow}{}{slice}", app.data.column_names[s.col]),
             Style::new().fg(Color::Blue),
         ));
     }
@@ -755,6 +794,25 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App, banner: Option<&str>) {
             banner.to_string(),
             Style::new().fg(Color::Black).bg(Color::Yellow).bold(),
         ));
+        frame.render_widget(line, area);
+        return;
+    }
+    if let Some(wizard) = app.key_sort {
+        let (what, keys) = match wizard.stage {
+            KeyStage::Start => ("start of the sort key", "←/→ move · Enter next · Esc cancel"),
+            KeyStage::End => ("end of the sort key", "←/→ move · Enter next · Esc cancel"),
+            KeyStage::Method => (
+                "how to compare it",
+                "a alphabetic · n numeric · v natural · Esc cancel",
+            ),
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" chars {}-{}: {what} ", wizard.start + 1, wizard.end),
+                Style::new().fg(Color::Black).bg(Color::Cyan).bold(),
+            ),
+            Span::styled(format!(" {keys}"), Style::new().dim()),
+        ]);
         frame.render_widget(line, area);
         return;
     }

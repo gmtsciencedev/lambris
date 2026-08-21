@@ -41,6 +41,7 @@ cargo run --release -- --no-header data.csv
 | `n` / `N` | Jump to next / previous search match (within scope) |
 | `&` | Filter rows to those with a cell matching a regex |
 | `s` | Sort by the selected column: cycles ascending → descending → unsorted |
+| `S` | Sort by *part* of the selected column (see [Sorting by part of a column](#sorting-by-part-of-a-column)) |
 | `f` | Freeze columns `0..=selected` (pinned while scrolling); press again to unfreeze |
 | `x` | Hide the selected column |
 | `[` / `]` (or `Shift-←`/`Shift-→`) | Move the selected column left / right |
@@ -114,6 +115,49 @@ ones.
 Since a transposed view is itself just a table on that tab's stack, transposing
 in one tab leaves the others alone, and `t`/`Esc` pops only that tab's view
 rather than closing the tab.
+
+## Sorting by part of a column
+
+`s` sorts by a whole column. `S` sorts by a slice of it — `sort -k 1.10,1.11`,
+except you pick the characters by eye instead of counting them.
+
+Press `S` on a column and the arrows move the **start** of the slice; `Enter`,
+and they move the **end**; `Enter` again, and you choose how to compare it. The
+slice is drawn into *every* row of the column at once and moves as you press, so
+the offsets are judged against the whole column rather than one value:
+
+```
+1  SMP_2024_07_a        chars 10-11
+2  SMP_2024_03_b               ▔▔
+3  SHORT                ← too short: no key here
+```
+
+The end edge **opens at the far side of the field**, so taking everything from
+the start onwards needs no arrows at all: `S` `Enter` `Enter` `v` sorts by the
+whole value, naturally — which is most of what this is used for. Walk the end
+back with `←` only when you want less than that.
+
+`j`/`k` scroll while you choose, so the offsets can be checked further down the
+table, and `Esc` gives up at any point.
+
+Three ways to compare, all ascending (`s` afterwards cycles the direction,
+keeping the slice):
+
+| Key | Method | |
+| --- | --- | --- |
+| `a` | alphabetic | character by character |
+| `n` | numeric | parsed as a number; anything that won't parse sorts last |
+| `v` | natural | digits inside text compared as numbers, so `chr2` comes before `chr10` |
+
+**Natural** is there because the other two both get identifiers wrong:
+alphabetically `chr10` precedes `chr2`, and numerically neither parses at all.
+It is `sort -V`'s behaviour. The other methods `sort(1)` offers — month,
+human-numeric, random — have no place in a viewer, so they aren't here.
+
+A row whose field is too short to reach the slice has no key and sorts **last**
+ascending, whichever method is chosen, rather than being treated as an empty
+string. Offsets are characters, shown 1-based and inclusive (`id[10-11]` in the
+status bar) to match `sort -k`.
 
 ## Columns
 
@@ -275,9 +319,9 @@ data could be misread as a header.
 
 ## Scope
 
-Core viewer plus regex search, row filtering, type-aware sorting, column
-freeze, hiding and reordering columns, a transposed view, joins between tabs,
-and tabs over several open files or workbook sheets. Nulls are shown as a highlighted `NA`. Sort
+Core viewer plus regex search, row filtering, type-aware sorting (whole column
+or a slice of one), column freeze, hiding and reordering columns, a transposed
+view, joins between tabs, and tabs over several open files or workbook sheets. Nulls are shown as a highlighted `NA`. Sort
 composes with the active filter, and the cursor stays on the same record across
 a re-sort.
 

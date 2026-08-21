@@ -826,6 +826,201 @@ mod tests {
         assert!(tabs.step());
     }
 
+    /// Walk the `S` wizard to the slice `start..end` (0-based, end exclusive),
+    /// then pick `method`. The end edge opens at the far side of the field, so
+    /// it is walked back rather than forward.
+    fn key_sort_wizard(app: &mut App, start: usize, end: usize, method: char) {
+        app.handle_key(key('S'));
+        for _ in 0..start {
+            app.handle_key(code(KeyCode::Right));
+        }
+        app.handle_key(code(KeyCode::Enter));
+        let width = app.key_sort.expect("wizard running").width;
+        for _ in 0..width.saturating_sub(end) {
+            app.handle_key(code(KeyCode::Left));
+        }
+        app.handle_key(code(KeyCode::Enter));
+        app.handle_key(key(method));
+    }
+
+    /// The column's values in view order.
+    fn column_values(app: &App, col: usize) -> Vec<String> {
+        app.data
+            .cells(col, &app.view_rows(usize::MAX))
+            .unwrap()
+            .into_iter()
+            .map(|v| v.unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn key_sort_sorts_by_a_slice_of_the_field() {
+        // Characters 10-11 hold the number the rows should order by.
+        let csv = "id\nSMP_2024_07_a\nSMP_2024_03_b\nSMP_2024_11_c\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        key_sort_wizard(&mut app, 9, 11, 'n');
+
+        assert_eq!(
+            column_values(&app, 0),
+            vec!["SMP_2024_03_b", "SMP_2024_07_a", "SMP_2024_11_c"]
+        );
+        let spec = app.sort.expect("sorted");
+        let slice = spec.key.expect("by a slice");
+        assert_eq!((slice.start, slice.end), (9, 11), "0-based, end exclusive");
+        assert_eq!(slice.method, data::SortMethod::Numeric);
+        assert!(app.key_sort.is_none(), "the wizard is done");
+
+        // `s` then cycles the direction, keeping the slice.
+        app.handle_key(key('s'));
+        let spec = app.sort.expect("still sorted");
+        assert_eq!(spec.dir, app::SortDir::Desc);
+        assert_eq!(spec.key.map(|k| (k.start, k.end)), Some((9, 11)));
+        assert_eq!(
+            column_values(&app, 0),
+            vec!["SMP_2024_11_c", "SMP_2024_07_a", "SMP_2024_03_b"]
+        );
+    }
+
+    #[test]
+    fn key_sort_shows_the_same_slice_in_every_row() {
+        // The point of picking it visually: one highlight per row, at the same
+        // offsets, and none at all where the value is too short to reach them.
+        let csv = "id\nSMP_2024_07_a\nSMP_2024_03_b\nSHORT\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        app.handle_key(key('S'));
+        for _ in 0..9 {
+            app.handle_key(code(KeyCode::Right));
+        }
+        app.handle_key(code(KeyCode::Enter));
+        // The end opens at the field's far edge; walk it back to char 11.
+        let width = app.key_sort.unwrap().width;
+        for _ in 0..width - 11 {
+            app.handle_key(code(KeyCode::Left));
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 7)).unwrap();
+        terminal
+            .draw(|f| ui::render(f, &mut app, &ui::TabStrip::default(), None).unwrap())
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let highlighted = |y: u16| -> String {
+            (0..24u16)
+                .filter(|&x| buf.cell((x, y)).unwrap().bg == ratatui::style::Color::Cyan)
+                .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                .collect()
+        };
+        assert_eq!(highlighted(2), "07", "first row's slice");
+        assert_eq!(highlighted(3), "03", "and the second's, at the same offsets");
+        assert_eq!(highlighted(4), "", "SHORT never reaches char 10");
+
+        // The prompt says which stage and which characters.
+        let text = buffer_text(&mut app, 80, 10);
+        assert!(text.contains("chars 10-11"), "no offsets shown: {text}");
+        assert!(text.contains("end of the sort key"), "no stage shown: {text}");
+    }
+
+    #[test]
+    fn key_sort_takes_the_whole_field_by_default() {
+        // `S`, Enter, Enter, v — no arrows at all — sorts by the whole field,
+        // which is what a natural sort usually wants.
+        let csv = "chrom\nchr10\nchr2\nchr1\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        app.handle_key(key('S'));
+        app.handle_key(code(KeyCode::Enter));
+        let wizard = app.key_sort.expect("wizard running");
+        assert_eq!(
+            (wizard.start, wizard.end),
+            (0, 5),
+            "the end opens at the far edge of the widest value"
+        );
+        app.handle_key(code(KeyCode::Enter));
+        app.handle_key(key('v'));
+
+        assert_eq!(column_values(&app, 0), vec!["chr1", "chr2", "chr10"]);
+        let slice = app.sort.unwrap().key.unwrap();
+        assert_eq!((slice.start, slice.end), (0, 5));
+    }
+
+    #[test]
+    fn key_sort_methods_order_differently() {
+        // `chr2` vs `chr10`: alphabetic puts 10 first, natural gets it right,
+        // and numeric can't parse either so the order is left alone.
+        let csv = "chrom\nchr10\nchr2\nchr1\n";
+        let path = write_text_fixture("csv", csv);
+        let full = 5; // the whole field
+
+        let mut abc = App::new(Dataset::load(&path).unwrap());
+        key_sort_wizard(&mut abc, 0, full, 'a');
+        assert_eq!(column_values(&abc, 0), vec!["chr1", "chr10", "chr2"]);
+
+        let mut nat = App::new(Dataset::load(&path).unwrap());
+        key_sort_wizard(&mut nat, 0, full, 'v');
+        assert_eq!(column_values(&nat, 0), vec!["chr1", "chr2", "chr10"]);
+
+        let mut num = App::new(Dataset::load(&path).unwrap());
+        key_sort_wizard(&mut num, 0, full, 'n');
+        assert_eq!(
+            column_values(&num, 0),
+            vec!["chr10", "chr2", "chr1"],
+            "nothing parses, so the stable sort keeps the original order"
+        );
+    }
+
+    #[test]
+    fn key_sort_puts_rows_without_the_slice_last() {
+        let csv = "id\nAA_9\nBB\nCC_1\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        // Characters 4-4: `BB` never reaches it.
+        key_sort_wizard(&mut app, 3, 4, 'n');
+        assert_eq!(column_values(&app, 0), vec!["CC_1", "AA_9", "BB"]);
+    }
+
+    #[test]
+    fn key_sort_can_be_cancelled_and_its_edges_clamp() {
+        let csv = "id\nabcd\nefgh\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+
+        // Esc leaves the sort untouched.
+        app.handle_key(key('S'));
+        assert!(app.key_sort.is_some());
+        app.handle_key(code(KeyCode::Esc));
+        assert!(app.key_sort.is_none() && app.sort.is_none());
+        assert_eq!(app.status_msg.as_deref(), Some("sort key cancelled"));
+
+        // The start stops at the last character of the widest value …
+        app.handle_key(key('S'));
+        for _ in 0..20 {
+            app.handle_key(code(KeyCode::Right));
+        }
+        assert_eq!(app.key_sort.unwrap().start, 3, "clamped to the width");
+        // … and the end never crosses back over the start.
+        app.handle_key(code(KeyCode::Enter));
+        for _ in 0..5 {
+            app.handle_key(code(KeyCode::Left));
+        }
+        let wizard = app.key_sort.unwrap();
+        assert_eq!((wizard.start, wizard.end), (3, 4), "at least one character");
+
+        // Scrolling while choosing is allowed — that is how you check the
+        // offsets against other values — and leaves the wizard alone.
+        app.handle_key(key('j'));
+        assert_eq!(app.selected_row, 1);
+        assert!(app.key_sort.is_some());
+    }
+
+    #[test]
+    fn key_sort_declines_when_there_is_nothing_to_slice() {
+        let csv = "id,note\n1,\n2,\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        app.selected_pos = 1; // the empty column
+        app.handle_key(key('S'));
+        assert!(app.key_sort.is_none());
+        assert_eq!(
+            app.status_msg.as_deref(),
+            Some("nothing to slice in this column")
+        );
+    }
+
     #[test]
     fn columns_can_be_hidden_moved_and_restored() {
         let csv = "id,name,score\n1,alpha,3\n2,beta,4\n";

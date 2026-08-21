@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom};
@@ -79,6 +80,39 @@ enum Backend {
     },
     /// A fully-resident batch (e.g. a transposed view), served in chunks.
     Memory(Arc<RecordBatch>),
+}
+
+/// Which slice of a field to sort by, and how to compare it: the viewer's
+/// equivalent of `sort -k 1.3,1.5`. Offsets are characters, `start` inclusive
+/// and `end` exclusive.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SortKey {
+    pub start: usize,
+    pub end: usize,
+    pub method: SortMethod,
+}
+
+/// How the slice is compared.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SortMethod {
+    /// Character by character.
+    Alphabetic,
+    /// Parsed as a number; anything that won't parse sorts last.
+    Numeric,
+    /// Text, but with runs of digits compared as numbers, so `chr2` comes
+    /// before `chr10` — which neither of the other two get right.
+    Natural,
+}
+
+impl SortMethod {
+    /// Short label for the status bar.
+    pub fn label(&self) -> &'static str {
+        match self {
+            SortMethod::Alphabetic => "abc",
+            SortMethod::Numeric => "num",
+            SortMethod::Natural => "nat",
+        }
+    }
 }
 
 /// A lazily-loaded view of one table: a parquet or CSV/TSV file, or a single
@@ -579,6 +613,87 @@ impl Dataset {
         Ok(Some(out))
     }
 
+    /// Order `rows` by a slice of `col`'s text, `sort -k`-style. A row whose
+    /// field is too short to reach the slice — or null — has no key, and sorts
+    /// last ascending, whichever method is used. Stable, so ties keep their
+    /// prior order. Returns `None` if `cancel` fires.
+    pub fn sort_indices_by_key(
+        &self,
+        rows: &[usize],
+        col: usize,
+        key: SortKey,
+        descending: bool,
+        cancel: impl Fn() -> bool,
+    ) -> Result<Option<Vec<usize>>> {
+        let Some(slices) = self.key_slices(rows, col, &key, &cancel)? else {
+            return Ok(None);
+        };
+        let mut order: Vec<usize> = (0..rows.len()).collect();
+        let flip = |ord: Ordering| if descending { ord.reverse() } else { ord };
+        match key.method {
+            SortMethod::Numeric => {
+                let numbers: Vec<Option<f64>> = slices
+                    .iter()
+                    .map(|s| s.as_deref().and_then(|s| s.trim().parse::<f64>().ok()))
+                    .collect();
+                order.sort_by(|&a, &b| {
+                    flip(cmp_missing_last(&numbers[a], &numbers[b], |x, y| x.total_cmp(y)))
+                });
+            }
+            SortMethod::Alphabetic => order.sort_by(|&a, &b| {
+                flip(cmp_missing_last(&slices[a], &slices[b], |x, y| {
+                    x.as_str().cmp(y.as_str())
+                }))
+            }),
+            SortMethod::Natural => order.sort_by(|&a, &b| {
+                flip(cmp_missing_last(&slices[a], &slices[b], |x, y| natural_cmp(x, y)))
+            }),
+        }
+        Ok(Some(order.into_iter().map(|i| rows[i]).collect()))
+    }
+
+    /// The slice `key` selects from `col` for every row, pulled out a chunk at a
+    /// time so the fields' full text is never all resident at once. An empty
+    /// slice (a field that doesn't reach it) comes back as `None`.
+    fn key_slices(
+        &self,
+        rows: &[usize],
+        col: usize,
+        key: &SortKey,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<Option<String>>>> {
+        let mut out = vec![None; rows.len()];
+        let mut by_chunk: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (i, &r) in rows.iter().enumerate() {
+            by_chunk.entry(r / CHUNK).or_default().push(i);
+        }
+        let opts = FormatOptions::default().with_null("");
+        for (k, positions) in by_chunk {
+            if cancel() {
+                return Ok(None);
+            }
+            let batch = self.chunk(k)?;
+            let array = batch.column(col);
+            let formatter = ArrayFormatter::try_new(array, &opts)
+                .with_context(|| format!("formatting column {}", self.column_names[col]))?;
+            for i in positions {
+                let off = rows[i] % CHUNK;
+                if array.is_null(off) {
+                    continue;
+                }
+                let slice: String = formatter
+                    .value(off)
+                    .to_string()
+                    .chars()
+                    .skip(key.start)
+                    .take(key.end.saturating_sub(key.start))
+                    .collect();
+                out[i] = (!slice.is_empty()).then_some(slice);
+            }
+        }
+        Ok(Some(out))
+    }
+
     /// Return the original row indices where any (non-null) cell matches `re`.
     /// Streams the file one chunk at a time; returns `None` if `cancel` fires.
     pub fn filter_rows(
@@ -680,6 +795,60 @@ impl Dataset {
         }
         None
     }
+}
+
+/// Order two optional keys, with a missing one last.
+fn cmp_missing_last<T>(
+    a: &Option<T>,
+    b: &Option<T>,
+    cmp: impl Fn(&T, &T) -> Ordering,
+) -> Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => cmp(a, b),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Compare two strings with runs of digits compared as numbers, so `chr2` sorts
+/// before `chr10`. Digit runs are compared by value without parsing — leading
+/// zeros dropped, then longer wins, then character order — so a run of any
+/// length works.
+fn natural_cmp(a: &str, b: &str) -> Ordering {
+    let (mut x, mut y) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (x.peek().copied(), y.peek().copied()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(ca), Some(cb)) if ca.is_ascii_digit() && cb.is_ascii_digit() => {
+                let (da, db) = (take_digits(&mut x), take_digits(&mut y));
+                let (na, nb) = (da.trim_start_matches('0'), db.trim_start_matches('0'));
+                let ord = na.len().cmp(&nb.len()).then_with(|| na.cmp(nb));
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            (Some(ca), Some(cb)) => {
+                x.next();
+                y.next();
+                if ca != cb {
+                    return ca.cmp(&cb);
+                }
+            }
+        }
+    }
+}
+
+/// Consume and return the leading run of digits.
+fn take_digits(it: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    let mut digits = String::new();
+    while let Some(c) = it.peek().copied().filter(char::is_ascii_digit) {
+        digits.push(c);
+        it.next();
+    }
+    digits
 }
 
 /// One side of a join: the table, the rows and columns it is showing, and which
