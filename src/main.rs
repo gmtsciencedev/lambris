@@ -320,6 +320,17 @@ impl Tabs {
                 return;
             }
         };
+        // Asked before anything is looked at or written over: there is no
+        // point discussing a name for a file that cannot hold this view.
+        let app = self.app_mut();
+        let (total, cols) = (app.row_count(), app.visible_cols().to_vec());
+        if let Err(e) = target.holds(total, cols.len()) {
+            self.app_mut().notice = Some(
+                app::Notice::say("export", format!("{e}"))
+                    .hint("as .csv or .parquet it would go out whole"),
+            );
+            return;
+        }
         // Never over a file that is open here: it is being read from as this
         // writes, and the tab would be left describing something that is gone.
         //
@@ -394,7 +405,6 @@ impl Tabs {
         }
 
         let app = self.app_mut();
-        let (total, cols) = (app.row_count(), app.visible_cols().to_vec());
         let schema = app.data.schema_for(&cols);
         let written = (|| -> Result<Option<usize>> {
             let mut out = export::Export::create(&path, target, schema)?;
@@ -2350,7 +2360,7 @@ mod tests {
         )
         .unwrap();
 
-        for name in ["out.csv", "out.tsv", "out.parquet", "out.csv.gz"] {
+        for name in ["out.csv", "out.tsv", "out.parquet", "out.csv.gz", "out.xlsx"] {
             let out = folder.join(name);
             export_to(&mut tabs, &out);
             let msg = tabs.app_mut().status_msg.clone().unwrap_or_default();
@@ -2374,6 +2384,7 @@ mod tests {
             ("out", "give the name an extension"),
             ("out.docx", "is not something this can write"),
             ("out.parquet.gz", "holds its own compression"),
+            ("out.xlsx.gz", "already a zip"),
         ] {
             let out = folder.join(name);
             export_to(&mut tabs, &out);
@@ -2386,6 +2397,137 @@ mod tests {
             assert!(!out.exists(), "{name} should not have been created");
             tabs.key(key('j')); // dismiss
         }
+    }
+
+    #[test]
+    fn xlsx_keeps_the_types_a_csv_would_lose() {
+        let (folder, _) = project();
+        // Sourced from a workbook, since that is where a text cell holding a
+        // number-shaped value survives being read at all: arrow's csv reader
+        // makes `0421` an integer, so a csv can no longer offer one.
+        let source = folder.join("in.xlsx");
+        {
+            use rust_xlsxwriter::Workbook;
+            let mut book = Workbook::new();
+            let sheet = book.add_worksheet();
+            for (c, name) in ["well", "gene", "reads"].iter().enumerate() {
+                sheet.write_string(0, c as u16, *name).unwrap();
+            }
+            sheet.write_string(1, 0, "0421").unwrap();
+            sheet.write_string(1, 1, "SEPT1").unwrap();
+            sheet.write_number(1, 2, 2500.0).unwrap();
+            sheet.write_string(2, 0, "0422").unwrap();
+            sheet.write_string(2, 1, "MARCH1").unwrap();
+            book.save(&source).unwrap();
+        }
+        let mut tabs = Tabs::open(
+            std::slice::from_ref(&source),
+            HeaderSpec::default(),
+            Store::default(),
+        )
+        .unwrap();
+
+        let out = folder.join("typed.xlsx");
+        export_to(&mut tabs, &out);
+        let back = read_back(&out);
+        assert_eq!(back.column_names, vec!["well", "gene", "reads"]);
+        assert_eq!(back.nrows, 2);
+
+        // The whole reason to write xlsx rather than hand Excel a csv: the type
+        // travels in the file, so it is not guessed again on the way in. These
+        // two are the textbook casualties of the csv route — the padded well
+        // loses its zero, and the gene name comes back as a date.
+        assert!(back.column_types[0].contains("Utf8"), "{:?}", back.column_types);
+        // `cell_display` takes the column first, then the row.
+        assert_eq!(back.cell_display(0, 0).unwrap().as_deref(), Some("0421"));
+        assert_eq!(back.cell_display(0, 1).unwrap().as_deref(), Some("0422"));
+        assert_eq!(back.cell_display(1, 0).unwrap().as_deref(), Some("SEPT1"));
+        assert_eq!(back.cell_display(1, 1).unwrap().as_deref(), Some("MARCH1"));
+
+        // A number stays a number, and a gap stays a gap rather than becoming
+        // a zero or an empty string.
+        assert!(!back.column_types[2].contains("Utf8"), "{:?}", back.column_types);
+        assert_eq!(back.cell_display(2, 0).unwrap().as_deref(), Some("2500"));
+        assert_eq!(back.cell_display(2, 1).unwrap(), None, "the gap");
+    }
+
+    #[test]
+    fn dates_go_out_as_dates_not_as_serial_numbers() {
+        let (folder, _) = project();
+        // The fixture's second sheet holds a date column and a datetime one.
+        let book = xlsx_fixture();
+        let mut tabs =
+            Tabs::open(std::slice::from_ref(&book), HeaderSpec::default(), Store::default())
+                .unwrap();
+        tabs.current = 1;
+        assert_eq!(tabs.app_mut().data.column_names, vec!["day", "moment"]);
+
+        let out = folder.join("dates.xlsx");
+        export_to(&mut tabs, &out);
+        let back = read_back(&out);
+
+        // A date cell carries a number and a format, and without the format
+        // Excel shows the number: 45322 rather than a day in January.
+        assert_eq!(back.column_types[0], "Date32", "{:?}", back.column_types);
+        assert!(back.column_types[1].starts_with("Timestamp"), "{:?}", back.column_types);
+        assert_eq!(back.cell_display(0, 0).unwrap().as_deref(), Some("2024-01-31"));
+        assert!(
+            back.cell_display(1, 0).unwrap().unwrap().starts_with("2024-01-31"),
+            "{:?}",
+            back.cell_display(1, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_view_too_big_for_a_sheet_is_refused_not_cut_short() {
+        let excel = export::Target::for_name(Path::new("out.xlsx")).unwrap();
+        // Excel's own ceiling, less the row the column names take.
+        assert!(excel.holds(1_048_575, 3).is_ok());
+        let too_tall = excel.holds(1_048_576, 3).expect_err("refused");
+        assert!(too_tall.to_string().contains("a sheet holds 1048575"), "{too_tall}");
+        assert!(excel.holds(10, 16_384).is_ok());
+        let too_wide = excel.holds(10, 16_385).expect_err("refused");
+        assert!(too_wide.to_string().contains("a sheet holds 16384"), "{too_wide}");
+
+        // No other format has a ceiling to hit.
+        for name in ["out.csv", "out.tsv", "out.parquet", "out.csv.gz"] {
+            let target = export::Target::for_name(Path::new(name)).unwrap();
+            assert!(target.holds(usize::MAX, usize::MAX).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_sheet_written_over_several_batches_keeps_its_rows_in_order() {
+        let (folder, _) = project();
+        // More than two batches, so the row a sheet is written at has to carry
+        // across them: getting that wrong writes each batch over the last.
+        let rows = export::BATCH * 2 + 17;
+        let mut csv = String::from("n,label\n");
+        for i in 0..rows {
+            csv.push_str(&format!("{i},row{i}\n"));
+        }
+        let file = write_text_fixture("csv", &csv);
+        let mut tabs = Tabs::open(
+            std::slice::from_ref(&file),
+            HeaderSpec::default(),
+            Store::default(),
+        )
+        .unwrap();
+
+        let out = folder.join("many.xlsx");
+        export_to(&mut tabs, &out);
+        let back = read_back(&out);
+        assert_eq!(back.nrows, rows);
+        let last = rows - 1;
+        assert_eq!(
+            back.cell_display(1, last).unwrap().as_deref(),
+            Some(format!("row{last}").as_str())
+        );
+        // And the first row of the second batch is where it belongs.
+        assert_eq!(
+            back.cell_display(1, export::BATCH).unwrap().as_deref(),
+            Some(format!("row{}", export::BATCH).as_str())
+        );
     }
 
     #[test]

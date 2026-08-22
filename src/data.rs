@@ -2085,7 +2085,9 @@ fn sheet_batch(range: &Range<Data>, header: HeaderSpec) -> Result<RecordBatch> {
 /// integers and floats become Float64, booleans stay boolean, and dates become
 /// a real date (or timestamp, when any cell carries a time of day). Anything
 /// textual or mixed falls back to the same string inference the CSV and
-/// transposed paths use, so numbers stored as text still sort numerically.
+/// transposed paths use, so numbers stored as text still sort numerically —
+/// except text that would lose its padding by becoming a number, which stays
+/// text, since a workbook is explicit about having stored it as text.
 /// Blank cells and Excel error cells (`#REF!`, `#DIV/0!`) become nulls.
 fn sheet_array(values: &[&Data]) -> ArrayRef {
     let (mut ints, mut floats, mut bools, mut dates, mut texts) = (0, 0, 0, 0, 0);
@@ -2138,6 +2140,17 @@ fn sheet_array(values: &[&Data]) -> ArrayRef {
         // falls through to the text path rather than nulling half the column.
     }
     let text: Vec<Option<String>> = values.iter().map(|v| cell_text(v)).collect();
+    // A workbook says which of its cells are text, and a text cell holding
+    // `0421` was stored that way on purpose — the padding is part of the value,
+    // the way it is in a computed column. Reading it as a number would throw the
+    // zero away before it ever reached the screen. A bare `0421` in a csv is
+    // ambiguous and still goes the numeric way; here there is nothing to guess.
+    let padded = values
+        .iter()
+        .any(|v| matches!(v, Data::String(s) if looks_padded(s)));
+    if padded {
+        return Arc::new(StringArray::from(text));
+    }
     infer_array(&text)
 }
 

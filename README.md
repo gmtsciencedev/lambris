@@ -301,6 +301,7 @@ choose beyond where it goes:
 | `out.csv` | comma-separated |
 | `out.tsv` | tab-separated |
 | `out.parquet` | parquet, types and all |
+| `out.xlsx` | one Excel sheet, a type per cell |
 | `out.csv.gz` | gzipped, either delimited form |
 
 A bare name lands in the folder `lambris` was started in, and `Tab` browses from
@@ -323,6 +324,41 @@ The *values* leave, not the presentation. A cell clipped to `…` on screen is
 written in full; a gap stays a gap rather than becoming an empty string; column
 widths, the header row's position and the rest of the arrangement have already
 done their work by deciding what is written.
+
+### Why `.xlsx` and not just `.csv`
+
+Excel *coerces on import*. Handed a csv it re-guesses every column, and the
+guesses lose data: leading zeros go (`0421` becomes `421`), long ids turn into
+scientific notation and lose their last digits, and in a genomics table gene
+names like `SEPT1` and `MARCH1` come back as dates. None of it is announced.
+
+An xlsx file carries a type per cell, so there is nothing left to guess: a
+string stays a string. That is the whole reason this format is here — for
+getting a table *to* someone working in Excel without it arriving damaged.
+
+Numbers become numbers, booleans booleans, and dates real dates with a
+`yyyy-mm-dd` format, since a date cell without one shows as the serial number
+underneath it. Anything Excel has no type of its own for — a duration, a list, a
+nested column — is written as the text shown on screen, which is the safe end to
+fall off: a string is never re-read as something else. Gaps are left as empty
+cells rather than as zeros or empty strings.
+
+Reading is the other half of this, and it was giving the padding away: a text
+cell holding `0421` was being read as the number 421, so the zero was gone
+before the table ever reached the screen — and no export could put it back. A
+workbook is explicit about which cells are text, so a text cell whose padding a
+number would lose now stays text. A bare `0421` in a *csv* is genuinely
+ambiguous and still reads as a number, which is what makes it sort sensibly.
+
+**Excel's limits are Excel's**: 1,048,576 rows (one of which the column names
+take) and 16,384 columns. A view bigger than that is refused before anything is
+created rather than written short — a sheet that stopped at the millionth row
+would be a complete-looking file with the rest of the data missing. The message
+says so, and `.csv` or `.parquet` will take the whole thing.
+
+Rows are streamed here too, a batch at a time into a workbook assembled in its
+own temporary file, so a large sheet costs no more memory than a small one.
+Nothing appears at the chosen name until the export finishes.
 
 **The summary line does not leave.** `=` shows a reading *of* the rows, not one
 *among* them, and a total written down as a final row stops being a total: it
