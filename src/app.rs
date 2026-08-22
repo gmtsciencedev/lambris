@@ -74,6 +74,24 @@ pub enum InputKind {
     Export,
 }
 
+/// The rectangle a crop covers: a run of view rows and a run of columns, both
+/// as inclusive pairs in the order they are shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CropSpan {
+    pub rows: (usize, usize),
+    /// Display positions, not dataset columns: what is taken is what is on
+    /// screen between the two corners, so hidden columns are already out of it.
+    pub cols: (usize, usize),
+}
+
+/// Where a tab came from, for the tabs that were made here rather than read
+/// from a file. Kept so a session can describe one and make it again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Origin {
+    Join(JoinOrigin),
+    Crop(CropOrigin),
+}
+
 /// The two sides a joined view was made from: which tab, and which column of it
 /// held the key. Tabs are held by index, which the loop keeps straight as tabs
 /// come and go.
@@ -83,6 +101,29 @@ pub struct JoinOrigin {
     pub right_tab: usize,
     pub left_key: String,
     pub right_key: String,
+}
+
+/// A run of rows taken from another tab (`c`), described by where it started
+/// and ended rather than by which rows they were.
+///
+/// Row numbers would not survive a reload: the same run is found again by
+/// looking for the two values that bounded it in the column the tab was sorted
+/// by, which is the column that made the run a run in the first place. An
+/// unsorted tab is ordered by its row numbers, and then those are the bounds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CropOrigin {
+    pub tab: usize,
+    /// The column the bounds are read in, or empty for the row-number gutter.
+    pub column: String,
+    pub from: String,
+    pub to: String,
+    /// How many rows it held when it was taken, as a check on the way back: a
+    /// boundary value shared by several rows takes all of them in, so a crop
+    /// can come back taller than it went out.
+    pub rows: usize,
+    /// The columns kept, by name and in the order they were shown. The column
+    /// half of a crop needs no locating: a name is a name.
+    pub columns: Vec<String>,
 }
 
 /// Something the loop is waiting for a yes or a no about.
@@ -480,7 +521,7 @@ pub struct App {
     /// Where a joined view came from: the tabs and key columns it was made
     /// from. A join keeps no data of its own, so this is what lets a session
     /// make it again.
-    pub origin: Option<JoinOrigin>,
+    pub origin: Option<Origin>,
     /// Set when the first row should switch between column names and data
     /// (handled by the loop, which reloads the file).
     pub toggle_header: bool,
@@ -506,6 +547,11 @@ pub struct App {
     pub quit_anyway: bool,
     /// The `S` sort-key wizard, while one is running.
     pub key_sort: Option<KeySort>,
+    /// The first corner of a crop — a view row and a display position — while
+    /// `c` waits for the opposite one.
+    pub crop_mark: Option<(usize, usize)>,
+    /// A crop asked for: the rectangle its two corners enclose.
+    pub crop_request: Option<CropSpan>,
     /// Widths the user has set, keyed by dataset column. A column without one
     /// is sized to its contents as usual.
     col_widths: HashMap<usize, u16>,
@@ -588,6 +634,8 @@ impl App {
             question: None,
             quit_anyway: false,
             key_sort: None,
+            crop_mark: None,
+            crop_request: None,
             col_widths: HashMap::new(),
             resize: None,
             scope: None,
@@ -1184,6 +1232,101 @@ impl App {
             }
             KeyCode::Char('g') | KeyCode::Home => self.help_offset = 0,
             _ => {}
+        }
+    }
+
+    /// Mark an edge of a crop, or close one that is already marked.
+    fn mark_crop(&mut self) {
+        if self.join_active || self.row_count() == 0 {
+            return;
+        }
+        let here = (self.selected_row, self.selected_pos);
+        match self.crop_mark.take() {
+            None => {
+                self.crop_mark = Some(here);
+                self.status_msg = None;
+            }
+            // Two corners, in either order. The same cell twice is a crop of
+            // one cell, which is a reasonable way to say "just this".
+            Some((row, pos)) => {
+                let span = |a: usize, b: usize| (a.min(b), a.max(b));
+                self.crop_request = Some(CropSpan {
+                    rows: span(row, here.0),
+                    cols: span(pos, here.1),
+                });
+            }
+        }
+    }
+
+    /// How a crop of these view rows is written down: the column this tab is
+    /// ordered by, and the values at the two ends of the run.
+    ///
+    /// Values, because row numbers do not survive the file being read again,
+    /// while "from this sample to that one" does. The sort column is the one
+    /// that made the run a run: with no sort the order is the row numbering,
+    /// and then the numbers themselves are the honest description.
+    pub fn crop_bounds(&self, from: usize, to: usize) -> (String, String, String) {
+        match self.sort {
+            Some(spec) => {
+                let at = |i: usize| {
+                    self.data
+                        .cell_display(spec.col, self.orig_row(i))
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default()
+                };
+                (self.data.column_names[spec.col].clone(), at(from), at(to))
+            }
+            None => (
+                String::new(),
+                (self.orig_row(from) + 1).to_string(),
+                (self.orig_row(to) + 1).to_string(),
+            ),
+        }
+    }
+
+    /// Where the two values that once bounded a crop sit in this tab's order
+    /// now, as view rows.
+    ///
+    /// Found by looking for the values rather than by comparing against them:
+    /// the run is contiguous because the tab is ordered by that column, so the
+    /// first and last row carrying each value are its edges, and no notion of
+    /// which way round the column sorts is needed here. `None` if either value
+    /// has gone, which is the honest answer — a crop cannot be placed by
+    /// guesswork.
+    pub fn locate_crop(&self, column: &str, from: &str, to: &str) -> Option<(usize, usize)> {
+        let total = self.row_count();
+        if column.is_empty() {
+            // Row-number order: the bounds are those numbers.
+            let number = |text: &str| text.parse::<usize>().ok().map(|n| n.saturating_sub(1));
+            let (first, last) = (number(from)?, number(to)?);
+            let place = |wanted: usize| (0..total).find(|&i| self.orig_row(i) == wanted);
+            return Some((place(first)?, place(last)?));
+        }
+        let col = self.data.column_names.iter().position(|n| n == column)?;
+        let (mut start, mut end) = (None, None);
+        // Read in blocks, so locating a crop in a large tab costs one pass and
+        // not one chunk load per row.
+        const BLOCK: usize = 8192;
+        for base in (0..total).step_by(BLOCK) {
+            let rows = self.view_slice(base, BLOCK);
+            let cells = self.data.cells(col, &rows).ok()?;
+            for (i, cell) in cells.iter().enumerate() {
+                let text = cell.as_deref().unwrap_or_default();
+                if start.is_none() && text == from {
+                    start = Some(base + i);
+                }
+                if text == to {
+                    end = Some(base + i);
+                }
+            }
+        }
+        let (start, end) = (start?, end?);
+        match start <= end {
+            true => Some((start, end)),
+            // The column now sorts the other way round: the run is still the
+            // same run, just walked from the other end.
+            false => Some((end, start)),
         }
     }
 
@@ -1785,7 +1928,9 @@ impl App {
             // Esc peels away search, then filter, then leaves a transposed
             // view (or quits at the top level).
             KeyCode::Esc => {
-                if self.join_active {
+                if self.crop_mark.take().is_some() {
+                    self.status_msg = Some("crop dropped".into());
+                } else if self.join_active {
                     self.cancel_join = true;
                 } else if self.search.is_some() {
                     self.record("clear search");
@@ -1842,6 +1987,10 @@ impl App {
             // `J` starts the join wizard; `Enter` then picks the key column
             // under the cursor, once on each side.
             KeyCode::Char('J') => self.join_request = true,
+            // `c` marks one edge of a crop and then the other. What lies
+            // between becomes a tab of its own, so nothing here is disturbed
+            // and there is nothing to undo — the crop is closed by closing it.
+            KeyCode::Char('c') => self.mark_crop(),
             KeyCode::Enter if self.join_active => self.confirm = true,
             // `T` re-reads the file with the first row as names or as data;
             // `H` moves the header down to the selected row (or undoes that).

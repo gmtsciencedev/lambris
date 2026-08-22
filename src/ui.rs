@@ -83,6 +83,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             ("t", "transpose the table (t or Esc to come back)"),
             ("J", "join two tabs on a key column: Enter on each side"),
+            ("c", "crop: mark one cell, then the opposite corner — it becomes a tab"),
         ],
     ),
     (
@@ -119,6 +120,11 @@ const HELP_KEY_WIDTH: usize = 30;
 
 const COL_SPACING: u16 = 1;
 const NA: &str = "NA";
+
+/// The block a crop covers while it is being marked. Brighter and bluer than
+/// the row cursor sits on, so a marked run reads as one solid rectangle rather
+/// than as a slightly darker patch.
+pub const CROP_BG: Color = Color::Rgb(28, 72, 112);
 
 /// The open tabs, drawn on the title line whenever more than one file is open.
 /// `labels` holds one label per tab (the label of the view on top of that
@@ -422,6 +428,23 @@ fn render_table(
     // While the `S` wizard is choosing a slice, it is drawn into every cell of
     // that column at once — that is the whole point of picking it visually.
     let slicing = app.key_sort;
+    // While a crop is being marked, the run it would take is tinted: the point
+    // of marking it on screen is to see where the edges fall.
+    let cropping = app.crop_mark.map(|(row, pos)| {
+        let span = |a: usize, b: usize| (a.min(b), a.max(b));
+        (
+            span(row, app.selected_row),
+            span(pos, app.selected_pos),
+        )
+    });
+    // A crop is a rectangle: a cell is in it only if both its row and its
+    // column are. The row-number gutter is not part of it — it is not one of
+    // the columns being taken.
+    let in_crop = |vi: usize, pos: usize| {
+        cropping.is_some_and(|(rows, cols)| {
+            vi >= rows.0 && vi <= rows.1 && pos >= cols.0 && pos <= cols.1
+        })
+    };
     let mut rows = Vec::with_capacity(visible_view.len());
     for (i, &vi) in visible_view.iter().enumerate() {
         let orig = app.orig_row(vi);
@@ -466,8 +489,14 @@ fn render_table(
                     (truncate(s, width), base)
                 }
             };
-            // Background priority: selected row > frozen tint.
-            if sel_row && !sel_cell {
+            // Background priority: a crop being marked > selected row >
+            // frozen tint. The crop comes first, and covers the row the cursor
+            // is on as well: the whole point is to see one solid block, and an
+            // edge row in a different colour breaks it. The cursor is still
+            // visible — its own cell is reversed below.
+            if in_crop(vi, pos) {
+                style = style.bg(CROP_BG);
+            } else if sel_row && !sel_cell {
                 style = style.bg(sel_bg);
             } else if idx < frozen && !sel_cell {
                 style = style.bg(frozen_bg);

@@ -569,6 +569,22 @@ impl Dataset {
     }
 
     /// Build a dataset from an already-materialised batch (used for transpose).
+    /// A run of rows taken from this table, as a table of its own (`c`).
+    ///
+    /// Held in memory, like a join: a crop is a narrowing, so what is kept is
+    /// smaller than what it came from — usually far smaller, since the point of
+    /// taking one is to have a piece small enough to send somewhere.
+    pub fn cropped(&self, rows: &[usize], cols: &[usize], label: String) -> Result<Self> {
+        let batch = self.gather(rows, cols)?;
+        Ok(Self::in_memory(
+            batch,
+            self.path.clone(),
+            label,
+            None,
+            self.header,
+        ))
+    }
+
     fn in_memory(
         batch: RecordBatch,
         path: PathBuf,

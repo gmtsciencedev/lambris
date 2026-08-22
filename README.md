@@ -63,6 +63,7 @@ cargo run --release
 | `u` | Put every hidden column back, in the file's own order |
 | `t` | Transpose the table (first column becomes the headers); `t`/`Esc` to return |
 | `J` | Join two tabs on a key column: `Enter` on each side (see [Join](#join)) |
+| `c` | Crop: mark one cell, then another — the rectangle becomes a tab (see [Cropping](#cropping)) |
 | `Tab` / `Shift-Tab` | Switch to the next / previous tab (wraps around) |
 | `o` | Open another file in a new tab; at the prompt `Tab` browses the folder |
 | `Ctrl-w` | Close the current tab; closing the last one quits |
@@ -749,6 +750,56 @@ key columns, and the result can address any row of either side. Both sides are
 therefore materialised, and each is capped at **200 000 rows** — enough that the
 columns stay in the chunk cache. Past that it declines rather than trying; a long
 join can be abandoned with `Esc`/`Ctrl-C` like any other heavy operation.
+
+## Cropping
+
+`c` marks one **cell**; `c` again on another takes the rectangle between them
+into **a tab of its own**. Both corners count in both directions: the rows
+between them, and the columns between them. Land on the first column you want
+and finish on the last, and what lies outside — a `sample` column to the left, a
+couple of columns to the right — stays behind.
+
+The rectangle is drawn as a solid block as you move, so what will be taken is
+what you can see. The cell the cursor is on takes the same tint as the rest, and
+is picked out by reversing instead, so the block has no odd-coloured edge; the
+row-number gutter stays outside it, since it is not one of the columns being
+taken. The banner counts both dimensions (`5 row(s) × 4 col(s)`), and `Esc`
+drops the mark.
+
+A tab rather than a narrowing of the one you were in, for two reasons. The tab
+you cropped from is untouched, so there is nothing to undo and no key to uncrop
+with — closing the new tab is the whole of putting it back. And the crop is a
+table in its own right, so everything applies to it unchanged: totals are
+totals *of the crop*, `X` writes it out, it can be joined, transposed or cropped
+again.
+
+Columns are taken as they are arranged, so renames and computed columns come
+along, and anything hidden (`x`, or `(`/`)` for a run of them) is already out of
+reach of the corners.
+
+Like a join, a crop is held in memory and capped at **200 000 rows**, since what
+is taken has to be materialised. That is rarely a constraint: the reason to crop
+is to end up with a piece small enough to send somewhere.
+
+### How a crop survives a reload
+
+A session cannot remember a crop as row numbers — a row added to the file moves
+every one of them. It is remembered instead as **the two values that bounded the
+run in the column the tab was sorted by**, which is the column that made the run
+a run in the first place. Reopening looks those values up again, so a crop of
+`S2` through `S3` is still those samples after the file has gained rows above
+them.
+
+Only the rows need that treatment. The columns are written down as **names**, in
+the order they were taken — a name is a name, and one the file no longer has is
+simply absent, the way a pattern treats a column that has gone.
+
+Two honest consequences on the row side. A tab with no sort is ordered by its row
+numbers, and then those *are* the bounds — the description is only as stable as
+the ordering it was taken in. And a boundary value shared by several rows takes
+all of them in, so a crop can come back taller than it went out; the row count is
+recorded with it, and a mismatch is reported rather than passed off as the same
+crop.
 
 ## The first row
 

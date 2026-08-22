@@ -255,7 +255,7 @@ pub struct Session {
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct SessionTab {
     /// Relative to the folder when the file is inside it, absolute otherwise —
-    /// so a project that is copied elsewhere still opens. Empty for a join.
+    /// so a project that is copied elsewhere still opens. Empty for a join or a crop.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub file: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -263,6 +263,9 @@ pub struct SessionTab {
     /// Set when this tab was joined rather than read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join: Option<SavedJoin>,
+    /// Set when this tab was cropped out of another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crop: Option<SavedCrop>,
     /// Whether the tab was showing a transposed view.
     #[serde(default, skip_serializing_if = "is_false")]
     pub transposed: bool,
@@ -281,6 +284,28 @@ pub struct SavedJoin {
     /// The key columns, by name.
     pub left_key: String,
     pub right_key: String,
+}
+
+/// A crop, as a session writes it down: which tab it was taken from, and the
+/// two values that bounded the run in that tab's sort column. Values rather
+/// than row numbers, so the same run can be found again once the file has been
+/// read afresh. `column` is empty when the tab was in row-number order, and
+/// then the bounds are those numbers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedCrop {
+    pub source: usize,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub column: String,
+    pub from: String,
+    pub to: String,
+    /// How many rows it held when it was taken. Checked on the way back, since
+    /// a boundary value shared by several rows takes all of them in.
+    pub rows: usize,
+    /// The columns kept, by name and in the order they were shown. Unlike the
+    /// rows, these need no locating — which is why only one half of a crop is
+    /// described by where it began and ended.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<String>,
 }
 
 fn is_false(value: &bool) -> bool {

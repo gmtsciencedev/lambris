@@ -16,7 +16,9 @@ use crossterm::event::{self, Event, KeyEventKind};
 
 use app::App;
 use data::{Dataset, HeaderSpec, JoinSide, JOIN_MAX_ROWS};
-use pattern::{relative_to, resolve_in, SavedJoin, Session, SessionTab, Sessions, Store};
+use pattern::{
+    relative_to, resolve_in, SavedCrop, SavedJoin, Session, SessionTab, Sessions, Store,
+};
 
 /// A terminal viewer for parquet, CSV/TSV (plain or gzipped) and Excel files,
 /// in the manner of csvlens.
@@ -226,6 +228,68 @@ impl Tabs {
                     }
                     None => {
                         missing.push("a join".to_string());
+                        built.push(None);
+                    }
+                }
+                continue;
+            }
+            // A crop is taken again from the tab it came from, by looking for
+            // the two values that bounded it. The run may come back a little
+            // wider if a boundary value is shared, so it is counted and said.
+            if let Some(crop) = &saved.crop {
+                let made = built.get(crop.source).copied().flatten().and_then(|source| {
+                    let app = tabs.get(source)?.last()?;
+                    let (from, to) = app.locate_crop(&crop.column, &crop.from, &crop.to)?;
+                    let rows = app.view_slice(from, to - from + 1);
+                    if rows.is_empty() || rows.len() > JOIN_MAX_ROWS {
+                        return None;
+                    }
+                    // The columns by name, in the order they were taken. Ones
+                    // the file no longer has are simply not there, the way a
+                    // pattern treats a column that has gone.
+                    let cols: Vec<usize> = match crop.columns.is_empty() {
+                        true => app.visible_cols().to_vec(),
+                        false => crop
+                            .columns
+                            .iter()
+                            .filter_map(|name| {
+                                app.data.column_names.iter().position(|n| n == name)
+                            })
+                            .collect(),
+                    };
+                    if cols.is_empty() {
+                        return None;
+                    }
+                    let label = format!("{} crop", app.data.label);
+                    let dataset = app.data.cropped(&rows, &cols, label).ok()?;
+                    let mut view = App::new(dataset);
+                    view.origin = Some(app::Origin::Crop(app::CropOrigin {
+                        tab: source,
+                        column: crop.column.clone(),
+                        from: crop.from.clone(),
+                        to: crop.to.clone(),
+                        rows: rows.len(),
+                        columns: crop.columns.clone(),
+                    }));
+                    if rows.len() != crop.rows {
+                        view.status_msg = Some(format!(
+                            "crop came back with {} rows, not {} — a boundary value is shared",
+                            rows.len(),
+                            crop.rows
+                        ));
+                    }
+                    Some(view)
+                });
+                match made {
+                    Some(mut app) => {
+                        let note = app.status_msg.take();
+                        app.apply_pattern(&saved.view);
+                        app.status_msg = note;
+                        built.push(Some(tabs.len()));
+                        tabs.push(vec![app]);
+                    }
+                    None => {
+                        missing.push("a crop".to_string());
                         built.push(None);
                     }
                 }
@@ -484,6 +548,69 @@ impl Tabs {
         self.app_mut().status_msg = Some(message);
     }
 
+    /// Take the marked run of rows as a tab of its own.
+    ///
+    /// A tab rather than a narrowing of this one: the crop is a thing you go on
+    /// to do something with — write it out, join it, transpose it — and leaving
+    /// the tab it came from untouched means there is nothing to undo. Closing
+    /// the new tab is the whole of putting it back.
+    fn crop(&mut self, span: app::CropSpan) {
+        let source = self.current;
+        let app = self.app_mut();
+        app.crop_mark = None;
+        let (from, to) = span.rows;
+        let rows = app.view_slice(from, to - from + 1);
+        // The columns between the two corners, as they are shown. Named rather
+        // than numbered from here on: a session has to find them again in a
+        // file that may have gained or lost some.
+        let shown = app.visible_cols();
+        let cols: Vec<usize> = shown[span.cols.0..=span.cols.1.min(shown.len() - 1)].to_vec();
+        let names: Vec<String> = cols
+            .iter()
+            .map(|&c| app.data.column_names[c].clone())
+            .collect();
+        // The same cap a join has, for the same reason: what is taken is held
+        // in memory.
+        if rows.len() > JOIN_MAX_ROWS {
+            app.notice = Some(
+                app::Notice::say(
+                    "crop",
+                    format!("{} rows: a crop is held in memory, so it is capped at {JOIN_MAX_ROWS}", rows.len()),
+                )
+                .hint("filter or sort first, then take a narrower run"),
+            );
+            return;
+        }
+        let (column, first, last) = app.crop_bounds(from, to);
+        let label = format!("{} crop", app.data.label);
+        let cropped = app.data.cropped(&rows, &cols, label);
+        let dataset = match cropped {
+            Ok(dataset) => dataset,
+            Err(e) => {
+                app.status_msg = Some(format!("crop failed: {e}"));
+                return;
+            }
+        };
+        let counted = rows.len();
+        let mut view = App::new(dataset);
+        // Where it came from, so a session can find the same run again.
+        view.origin = Some(app::Origin::Crop(app::CropOrigin {
+            tab: source,
+            column: column.clone(),
+            from: first.clone(),
+            to: last.clone(),
+            rows: counted,
+            columns: names.clone(),
+        }));
+        let size = format!("{counted} rows × {} cols cropped", names.len());
+        view.status_msg = Some(match column.is_empty() {
+            true => format!("{size}, {first} to {last}"),
+            false => format!("{size}, {column} {first} to {last}"),
+        });
+        self.tabs.push(vec![view]);
+        self.current = self.tabs.len() - 1;
+    }
+
     /// Whether what is open now differs from what was last saved for this
     /// folder — worked out by building what `W` would write and comparing it,
     /// so there is no flag to keep in step with the twenty things that change a
@@ -525,15 +652,16 @@ impl Tabs {
                     file: relative_to(&folder, &base.data.path),
                     sheet: base.data.sheet().map(str::to_string),
                     join: None,
+                    crop: None,
                     transposed,
                     view,
                 });
                 continue;
             }
-            // Not a file: the only other thing a tab can hold is a join, and
-            // only one that still knows where it came from can be made again.
+            // Not a file: a tab made here, which can be described only if it
+            // still knows where it came from.
             match &base.origin {
-                Some(origin) => tabs.push(SessionTab {
+                Some(app::Origin::Join(origin)) => tabs.push(SessionTab {
                     file: String::new(),
                     sheet: None,
                     join: Some(SavedJoin {
@@ -541,6 +669,22 @@ impl Tabs {
                         right: origin.right_tab,
                         left_key: origin.left_key.clone(),
                         right_key: origin.right_key.clone(),
+                    }),
+                    crop: None,
+                    transposed,
+                    view,
+                }),
+                Some(app::Origin::Crop(origin)) => tabs.push(SessionTab {
+                    file: String::new(),
+                    sheet: None,
+                    join: None,
+                    crop: Some(SavedCrop {
+                        source: origin.tab,
+                        column: origin.column.clone(),
+                        from: origin.from.clone(),
+                        to: origin.to.clone(),
+                        rows: origin.rows,
+                        columns: origin.columns.clone(),
                     }),
                     transposed,
                     view,
@@ -597,6 +741,16 @@ impl Tabs {
 
     /// The line the wizard shows in place of the command hints.
     fn join_banner(&self) -> Option<String> {
+        // A crop is a rectangle, so it says how much of one is covered as the
+        // cursor moves — both ways, since both are being chosen.
+        let showing = self.tabs.get(self.current).and_then(|stack| stack.last());
+        if let Some((app, (row, pos))) = showing.zip(showing.and_then(|app| app.crop_mark)) {
+            let rows = row.abs_diff(app.selected_row) + 1;
+            let cols = pos.abs_diff(app.selected_pos) + 1;
+            return Some(format!(
+                " crop: {rows} row(s) × {cols} col(s) — go to the opposite corner ·                  c takes it · Esc drops it"
+            ));
+        }
         let wizard = self.join.as_ref()?;
         Some(match wizard.left {
             None => " join: go to the first key column — Tab switches tabs · Enter picks · Esc cancels".into(),
@@ -652,6 +806,7 @@ impl Tabs {
         let save_pattern = app.save_pattern.take();
         let save_session = std::mem::take(&mut app.save_session);
         let export_request = app.export_request.take();
+        let crop_request = app.crop_request.take();
         let overwrite_allowed = std::mem::take(&mut app.overwrite_allowed);
         let promote_header = std::mem::take(&mut app.promote_header);
         let join_request = std::mem::take(&mut app.join_request);
@@ -692,6 +847,9 @@ impl Tabs {
         }
         if let Some(name) = export_request {
             self.export(name, overwrite_allowed);
+        }
+        if let Some(span) = crop_request {
+            self.crop(span);
         }
         if join_request {
             self.join = Some(JoinWizard { left: None });
@@ -753,17 +911,28 @@ impl Tabs {
             // since it could no longer be made again.
             for stack in &mut self.tabs {
                 for app in stack.iter_mut() {
-                    let Some(origin) = &mut app.origin else { continue };
-                    let gone = origin.left_tab == closed || origin.right_tab == closed;
-                    if gone {
-                        app.origin = None;
-                        continue;
-                    }
-                    if origin.left_tab > closed {
-                        origin.left_tab -= 1;
-                    }
-                    if origin.right_tab > closed {
-                        origin.right_tab -= 1;
+                    let shift = |tab: &mut usize| {
+                        if *tab > closed {
+                            *tab -= 1;
+                        }
+                    };
+                    match &mut app.origin {
+                        Some(app::Origin::Join(origin)) => {
+                            if origin.left_tab == closed || origin.right_tab == closed {
+                                app.origin = None;
+                                continue;
+                            }
+                            shift(&mut origin.left_tab);
+                            shift(&mut origin.right_tab);
+                        }
+                        Some(app::Origin::Crop(origin)) => {
+                            if origin.tab == closed {
+                                app.origin = None;
+                                continue;
+                            }
+                            shift(&mut origin.tab);
+                        }
+                        None => continue,
                     }
                 }
             }
@@ -931,12 +1100,12 @@ fn joined_view(
     let (dataset, report) = joined.ok()??;
     let mut view = App::new(dataset);
     // Where it came from, so a session can make it again.
-    view.origin = Some(app::JoinOrigin {
+    view.origin = Some(app::Origin::Join(app::JoinOrigin {
         left_tab,
         right_tab,
         left_key: left_app.data.column_names[left_col].clone(),
         right_key: right_app.data.column_names[right_col].clone(),
-    });
+    }));
     let mut msg = format!(
         "{} rows · {} matched, {} unmatched",
         report.rows, report.matched, report.unmatched
@@ -2307,6 +2476,222 @@ mod tests {
         Dataset::load(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
     }
 
+    /// Mark one corner of a crop and take it at the other, each `(row, col)` as
+    /// a view row and a display position.
+    fn crop_cells(tabs: &mut Tabs, from: (usize, usize), to: (usize, usize)) {
+        let put = |tabs: &mut Tabs, (row, pos): (usize, usize)| {
+            let app = tabs.app_mut();
+            app.selected_row = row;
+            app.selected_pos = pos;
+        };
+        put(tabs, from);
+        tabs.key(key('c'));
+        assert!(tabs.step());
+        put(tabs, to);
+        tabs.key(key('c'));
+        assert!(tabs.step());
+    }
+
+    #[test]
+    fn cropping_takes_a_rectangle_into_a_tab_of_its_own() {
+        let (_folder, _) = project();
+        let csv = "sample,reads,depth,note\nS1,10,1,a\nS2,20,2,b\nS3,30,3,c\nS4,40,4,d\n";
+        let file = write_text_fixture("csv", csv);
+        let mut tabs = Tabs::open(
+            std::slice::from_ref(&file),
+            HeaderSpec::default(),
+            Store::default(),
+        )
+        .unwrap();
+
+        // From (row 1, reads) to (row 2, depth): both ends of the rectangle
+        // matter, so `sample` before it and `note` after it are left behind.
+        crop_cells(&mut tabs, (1, 1), (2, 2));
+        assert_eq!(tabs.tabs.len(), 2, "a tab of its own");
+        assert_eq!(tabs.current, 1, "and it comes to the front");
+        let app = tabs.app_mut();
+        assert_eq!(app.data.column_names, vec!["reads", "depth"]);
+        assert_eq!(app.row_count(), 2);
+        assert_eq!(app.data.cell_display(0, 0).unwrap().as_deref(), Some("20"));
+        assert_eq!(app.data.cell_display(1, 1).unwrap().as_deref(), Some("3"));
+        assert!(app.status_msg.clone().unwrap().contains("2 rows × 2 cols"));
+
+        // The tab it came from is untouched — which is why there is nothing to
+        // undo and no key to uncrop with.
+        tabs.current = 0;
+        let app = tabs.app_mut();
+        assert_eq!(app.row_count(), 4);
+        assert_eq!(app.data.column_names.len(), 4);
+
+        // Totals follow the crop, since the crop is a table in its own right.
+        tabs.current = 1;
+        tabs.app_mut().selected_pos = 0;
+        tabs.key(key('='));
+        assert!(tabs.step());
+        let text = buffer_text(tabs.app_mut(), 40, 12);
+        assert!(text.contains("50"), "20 + 30, not 100: {text}");
+    }
+
+    #[test]
+    fn a_crop_is_marked_before_it_is_taken() {
+        let (_folder, _) = project();
+        let file = write_text_fixture("csv", "a,b\n1,x\n2,y\n3,z\n");
+        let mut tabs = Tabs::open(
+            std::slice::from_ref(&file),
+            HeaderSpec::default(),
+            Store::default(),
+        )
+        .unwrap();
+
+        // One `c` marks a corner and takes nothing.
+        tabs.key(key('c'));
+        assert!(tabs.step());
+        assert_eq!(tabs.tabs.len(), 1, "nothing taken yet");
+        assert_eq!(tabs.app_mut().crop_mark, Some((0, 0)));
+        // The banner counts the rectangle as the cursor moves, both ways.
+        tabs.key(key('j'));
+        assert!(tabs.step());
+        tabs.key(key('l'));
+        assert!(tabs.step());
+        let banner = tabs.join_banner().expect("a crop banner");
+        assert!(banner.contains("2 row(s) × 2 col(s)"), "{banner}");
+
+        // Esc drops the mark, and the next `c` starts again.
+        tabs.key(KeyEvent::from(KeyCode::Esc));
+        assert!(tabs.step());
+        assert_eq!(tabs.app_mut().crop_mark, None);
+        assert_eq!(tabs.tabs.len(), 1, "still nothing taken");
+
+        // Marking a cell and taking it there is a crop of that one cell.
+        tabs.key(key('c'));
+        assert!(tabs.step());
+        tabs.key(key('c'));
+        assert!(tabs.step());
+        assert_eq!(tabs.tabs.len(), 2);
+        let app = tabs.app_mut();
+        assert_eq!(app.row_count(), 1);
+        assert_eq!(app.data.column_names, vec!["b"], "just that column");
+    }
+
+    #[test]
+    fn the_marked_rectangle_is_drawn_as_a_block() {
+        let csv = "sample,reads,note\nS1,10,a\nS2,20,b\nS3,30,c\nS4,40,d\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+
+        // Mark the middle column on the second row, then move down one: two
+        // rows by one column, with a column either side of it left out.
+        app.handle_key(code(KeyCode::Down));
+        app.handle_key(code(KeyCode::Right));
+        app.handle_key(key('c'));
+        app.handle_key(code(KeyCode::Down));
+        assert_eq!(app.crop_mark, Some((1, 1)));
+
+        let mut terminal = Terminal::new(TestBackend::new(30, 8)).unwrap();
+        terminal
+            .draw(|f| ui::render(f, &mut app, &ui::TabStrip::default(), None).unwrap())
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let marked = |y: u16| -> String {
+            (0..30u16)
+                .filter(|&x| buf.cell((x, y)).unwrap().bg == ui::CROP_BG)
+                .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                .collect::<String>()
+                .trim()
+                .to_string()
+        };
+        // Frame row 2 is the first data row, which is above the mark.
+        assert_eq!(marked(2), "", "the row above is untouched");
+        assert_eq!(marked(3), "20", "only the marked column, not S2 or b");
+        // The row the cursor is on takes the same tint, so the block has no
+        // odd-coloured edge; the cursor's own cell is picked out by reversing.
+        assert_eq!(marked(4), "30");
+        assert_eq!(marked(5), "", "and nothing below it");
+        // The row-number gutter is not one of the columns being taken.
+        assert_ne!(
+            buf.cell((0, 3)).unwrap().bg,
+            ui::CROP_BG,
+            "the gutter is outside the rectangle"
+        );
+
+        // The tint goes when the mark does.
+        app.handle_key(code(KeyCode::Esc));
+        let mut terminal = Terminal::new(TestBackend::new(30, 8)).unwrap();
+        terminal
+            .draw(|f| ui::render(f, &mut app, &ui::TabStrip::default(), None).unwrap())
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        assert!(
+            (0..8u16).all(|y| (0..30u16).all(|x| buf.cell((x, y)).unwrap().bg != ui::CROP_BG)),
+            "nothing should still be tinted"
+        );
+    }
+
+    #[test]
+    fn a_crop_is_remembered_by_its_edges_not_its_row_numbers() {
+        let (folder, store) = project();
+        let path = folder.join("a.csv");
+        std::fs::write(&path, "sample,reads\nS1,10\nS2,20\nS3,30\nS4,40\n").unwrap();
+        let files = vec![path.clone()];
+        let open = |store: &PathBuf| {
+            let mut tabs = Tabs::open(&files, HeaderSpec::default(), Store::default()).unwrap();
+            tabs.folder = folder.clone();
+            tabs.sessions = Sessions::load_at(store.clone());
+            tabs
+        };
+        let mut tabs = open(&store);
+
+        // Sorted by sample, so the run has a column that makes it a run.
+        tabs.app_mut().selected_pos = 0;
+        tabs.key(key('s'));
+        assert!(tabs.step());
+        assert!(tabs.app_mut().sort.is_some(), "sorted");
+        crop_cells(&mut tabs, (1, 0), (2, 0));
+        assert_eq!(
+            tabs.app_mut().data.column_names,
+            vec!["sample"],
+            "one column of the two"
+        );
+
+        tabs.key(key('W'));
+        assert!(tabs.step());
+        let saved = std::fs::read_to_string(&store).unwrap();
+        assert!(saved.contains("\"crop\""), "{saved}");
+        assert!(saved.contains("\"from\": \"S2\""), "{saved}");
+        assert!(saved.contains("\"to\": \"S3\""), "{saved}");
+        // The column half needs no locating: names are names.
+        assert!(saved.contains("\"columns\""), "{saved}");
+        assert!(saved.contains("\"sample\""), "{saved}");
+        assert!(!saved.contains("\"1\""), "not row numbers: {saved}");
+
+        // A row inserted at the top moves every row number by one. The crop is
+        // described by its edges, so it comes back as the same two samples.
+        std::fs::write(&path, "sample,reads\nS0,5\nS1,10\nS2,20\nS3,30\nS4,40\n").unwrap();
+        let sessions = Sessions::load_at(store.clone());
+        let mut back =
+            Tabs::reopen(&folder, &sessions, HeaderSpec::default(), Store::default()).unwrap();
+        assert_eq!(back.tabs.len(), 2, "the crop came back");
+        back.current = 0;
+        assert_eq!(back.app_mut().row_count(), 5, "the file gained a row");
+        back.current = 1;
+        let app = back.app_mut();
+        assert_eq!(app.row_count(), 2);
+        assert_eq!(app.data.column_names, vec!["sample"], "and the same column");
+        assert_eq!(app.data.cell_display(0, 0).unwrap().as_deref(), Some("S2"));
+        assert_eq!(app.data.cell_display(0, 1).unwrap().as_deref(), Some("S3"));
+
+        // A boundary value shared by two rows takes both in, so the run comes
+        // back wider than it went out — which is said rather than hidden.
+        std::fs::write(&path, "sample,reads\nS1,10\nS2,20\nS2,21\nS3,30\n").unwrap();
+        let sessions = Sessions::load_at(store);
+        let mut wider =
+            Tabs::reopen(&folder, &sessions, HeaderSpec::default(), Store::default()).unwrap();
+        wider.current = 1;
+        let app = wider.app_mut();
+        assert_eq!(app.row_count(), 3, "both S2 rows and the S3");
+        let said = app.status_msg.clone().unwrap_or_default();
+        assert!(said.contains("boundary value is shared"), "{said}");
+    }
+
     #[test]
     fn exporting_writes_the_view_as_it_is_arranged() {
         let (folder, _) = project();
@@ -2896,7 +3281,11 @@ mod tests {
 
         tabs.current = 1; // join a × b
         run_wizard(&mut tabs, 0, 2, 0);
-        let origin = tabs.app_mut().origin.clone().expect("where it came from");
+        let joined = |tabs: &mut Tabs| match tabs.app_mut().origin.clone() {
+            Some(app::Origin::Join(origin)) => origin,
+            other => panic!("expected a join origin, got {other:?}"),
+        };
+        let origin = joined(&mut tabs);
         assert_eq!((origin.left_tab, origin.right_tab), (1, 2));
 
         // Closing an unrelated tab before them shifts both sides down with it.
@@ -2904,7 +3293,7 @@ mod tests {
         tabs.key(ctrl('w'));
         assert!(tabs.step());
         tabs.current = tabs.tabs.len() - 1;
-        let origin = tabs.app_mut().origin.clone().expect("still knows");
+        let origin = joined(&mut tabs);
         assert_eq!((origin.left_tab, origin.right_tab), (0, 1), "moved down");
 
         // Closing a side it actually came from drops it: there would be nothing
