@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::app::{
-    App, FormulaProblem, InputKind, KeySort, KeyStage, Mode, NewKind, NumStyle, SortDir,
+    App, InputKind, KeySort, KeyStage, Mode, NewKind, Notice, NumStyle, SortDir,
     MAX_COL_WIDTH, MAX_SET_WIDTH, MIN_COL_WIDTH, MIN_SET_WIDTH,
 };
 use crate::browse::{Completions, VISIBLE};
@@ -98,6 +98,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         "Keeping and undoing",
         &[
             ("w", "remember this arrangement for the file (or a glob of files)"),
+            ("W", "remember every tab open here — joins included; `lambris` reopens"),
             ("z / Z", "undo / redo the last change to the view"),
         ],
     ),
@@ -207,9 +208,9 @@ pub fn render(
     if let Some(listing) = &app.completions {
         render_completions(frame, body_area, listing);
     }
-    // A formula that would not do is shown over the table, with the spot marked.
-    if let Some(problem) = &app.formula_problem {
-        render_formula_problem(frame, body_area, problem);
+    // Anything that will not fit on the status line is said in the middle.
+    if let Some(notice) = &app.notice {
+        render_notice(frame, body_area, notice);
     }
     Ok(())
 }
@@ -518,53 +519,84 @@ fn centred(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-/// Show a formula that would not do, with a caret under the spot and a word
-/// about what was expected there. Saying *where* is most of what makes a
-/// formula fixable, and a single status-bar line has nowhere to put it.
-fn render_formula_problem(frame: &mut Frame, area: Rect, problem: &FormulaProblem) {
-    let text: Vec<char> = problem.text.chars().collect();
-    let box_width = (problem.text.chars().count().max(40) as u16 + 6).min(area.width);
+/// Say something in the middle of the screen: a formula that would not do, with
+/// a caret under the spot, or anything else that needs more than the status
+/// line has room for. Saying *where* is most of what makes a formula fixable.
+fn render_notice(frame: &mut Frame, area: Rect, notice: &Notice) {
+    let widest = notice
+        .subject
+        .as_ref()
+        .map(|s| s.chars().count())
+        .unwrap_or(0)
+        .max(notice.message.chars().count())
+        .max(notice.hint.as_ref().map(|h| h.chars().count()).unwrap_or(0))
+        .min(70);
+    let box_width = (widest.max(40) as u16 + 6).min(area.width);
     let room = box_width.saturating_sub(4) as usize;
 
-    // Keep the marked spot on screen even when the formula is longer than the
-    // box: the window ends at the caret rather than starting at the beginning.
-    let caret = problem.at.unwrap_or(0).min(text.len());
-    let from = caret.saturating_sub(room.saturating_sub(2));
-    let shown: String = text.iter().skip(from).take(room).collect();
-    let elided = from > 0;
-    let formula = match elided {
-        true => format!("…{shown}"),
-        false => shown,
-    };
-    let marker_at = caret - from + elided as usize;
-
-    let mut lines = vec![Line::from(Span::styled(
-        formula,
-        Style::new().fg(Color::White),
-    ))];
-    if problem.at.is_some() {
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(subject) = &notice.subject {
+        let text: Vec<char> = subject.chars().collect();
+        // Keep the marked spot on screen even when the text is longer than the
+        // box: the window ends at the caret rather than starting at the front.
+        let caret = notice.at.unwrap_or(0).min(text.len());
+        let from = caret.saturating_sub(room.saturating_sub(2));
+        let shown: String = text.iter().skip(from).take(room).collect();
+        let elided = from > 0;
         lines.push(Line::from(Span::styled(
-            format!("{}↑", " ".repeat(marker_at)),
-            Style::new().fg(Color::Red).bold(),
+            match elided {
+                true => format!("…{shown}"),
+                false => shown,
+            },
+            Style::new().fg(Color::White),
+        )));
+        if notice.at.is_some() {
+            lines.push(Line::from(Span::styled(
+                format!("{}↑", " ".repeat(caret - from + elided as usize)),
+                Style::new().fg(Color::Red).bold(),
+            )));
+        }
+        lines.push(Line::raw(""));
+    }
+    for line in wrapped(&notice.message, room) {
+        lines.push(Line::from(Span::styled(
+            line,
+            Style::new().fg(Color::Yellow).bold(),
         )));
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        problem.message.clone(),
-        Style::new().fg(Color::Yellow).bold(),
-    )));
-    if let Some(hint) = &problem.hint {
-        lines.push(Line::from(Span::styled(hint.clone(), Style::new().dim())));
+    if let Some(hint) = &notice.hint {
+        for line in wrapped(hint, room) {
+            lines.push(Line::from(Span::styled(line, Style::new().dim())));
+        }
     }
 
     let height = lines.len() as u16 + 2;
     let box_area = centred(area, box_width, height);
     let block = Block::bordered()
-        .title(" formula ")
-        .title_bottom(" keep typing to fix it · Esc gives up ")
+        .title(format!(" {} ", notice.title))
+        .title_bottom(notice.footer)
         .border_style(Style::new().fg(Color::Red));
     frame.render_widget(Clear, box_area);
     frame.render_widget(Paragraph::new(lines).block(block), box_area);
+}
+
+/// Break text into lines of at most `width`, on spaces.
+fn wrapped(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 /// Draw the `?` key reference over the table, scrolled to `app.help_offset`.

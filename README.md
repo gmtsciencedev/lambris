@@ -26,6 +26,9 @@ cargo run --release -- --no-header data.csv
 
 # Open files as they come, ignoring any arrangement saved with `w`.
 cargo run --release -- --no-pattern data.csv
+
+# With no files at all: reopen whatever was last open in this folder.
+cargo run --release
 ```
 
 ### Keys
@@ -45,6 +48,7 @@ cargo run --release -- --no-pattern data.csv
 | `&` | Filter rows to those with a cell matching a regex |
 | `=` | Summary line: total, mean, sd, mean±sd — hold it to remove (see [Summary line](#summary-line)) |
 | `w` | Remember this arrangement for the file, or for a glob of files (see [Patterns](#patterns)) |
+| `W` | Remember every tab open here (see [Sessions](#sessions)) |
 | `z` / `Z` | Undo / redo the last change to the view (see [Undo](#undo)) |
 | `s` | Sort by the selected column: cycles ascending → descending → unsorted |
 | `S` | Sort by *part* of the selected column (see [Sorting by part of a column](#sorting-by-part-of-a-column)) |
@@ -279,10 +283,81 @@ one thing and leave the rest alone. An unreadable file is treated as no
 patterns — a viewer should still open the file you asked for.
 
 Patterns belong to files, so a join or a transposed view cannot have one; `w`
-there says so rather than saving something that could never be matched again.
+there says so at once — in the middle of the screen, where there is room for the
+reason — rather than collecting a name it could never use.
 The search is left out too: it moves the cursor, which makes it navigation rather
 than part of an arrangement. A pattern is the starting point for a view, not a
 change to walk back from, so `z` will not undo it.
+
+## Sessions
+
+A [pattern](#patterns) says how *a kind of file* should look wherever it turns
+up. A session says what was open **here**. They answer different questions, which
+is why one is tied to a name or a glob and the other to a folder.
+
+`W` remembers every tab open in the current folder — what each one holds, how it
+was arranged, and which was in front. Running `lambris` with
+**no files at all** reopens them:
+
+```sh
+cd ~/analysis/cohort-2026
+lambris meta.tsv results.xlsx      # arrange things, then press W
+…
+lambris                            # everything comes back
+```
+
+Files are recorded relative to the folder when they are inside it, so a project
+copied elsewhere still opens. Each tab's arrangement is stored in the session
+itself and **wins over any pattern** for that file: a session is a snapshot of
+how things actually were, not a rule about how they should be.
+
+**Every tab is remembered**, including the ones that hold no file. A transposed
+tab is noted as one and transposed again on the way back, with the file still
+underneath it — `t` steps back to it as usual. A joined tab holds no data of its
+own, so it is written down as the recipe it is — the two tabs and the key columns
+— and **made again** when the session reopens:
+
+```json
+{ "join": { "left": 0, "right": 1, "left_key": "sample", "right_key": "sample" } }
+```
+
+Tabs are saved in order and a join always points at earlier ones, so the whole
+lot rebuilds in a single pass — a join of a join included. Being a recipe rather
+than a copy, a joined tab **follows its sources**: change one after joining, save,
+and the reopened join reflects the change. That keeps a session self-consistent —
+what you get back is exactly what joining those tabs now would give.
+
+Closing a tab moves what the joins after it remember, so they keep pointing at
+the same tables. Closing a tab a join was actually made *from* drops it — there
+would be nothing left to make it from — and the count says so when the session is
+saved.
+
+### On the way out
+
+Once a folder has a session — saved with `W` or reopened from one — quitting
+with unsaved changes asks first:
+
+```
+┌ session ───────────────────────────────────────┐
+│this session has changed since it was saved      │
+└ y save · n discard · Esc stay ─────────────────┘
+```
+
+`y` saves on the way out, `n` leaves it as it was, and `Esc` goes back to the
+table. Any other key does nothing at all: this is the last thing standing
+between the work and losing it, so a stray keypress must not decide.
+
+Whether anything *has* changed is worked out by building what `W` would write
+and comparing it with what is stored — there is no flag to keep in step with the
+twenty things that change a view, so it cannot drift. A folder with no session
+has nothing to lose, so an ordinary `lambris file.csv` still quits without a
+word, and moving between tabs or around the table is not a change worth being
+asked about.
+
+`--forget-session` drops the one saved for the current folder. Sessions live
+beside the patterns, in `sessions.json`, so nothing is written into the folder
+being worked in. If a file has gone since, the rest still open and the status bar
+names what is missing.
 
 ## Sorting by part of a column
 
@@ -676,8 +751,8 @@ data could be misread as a header.
 Core viewer plus regex search, row filtering, type-aware sorting (whole column
 or a slice of one), column freeze, hiding, reordering and resizing columns,
 undo/redo over all of it, computed and renamed columns, a per-column summary
-line, saved per-file arrangements, a transposed view, joins between tabs, and
-tabs over several open files or workbook sheets. Nulls are shown as a highlighted `NA`. Sort
+line, saved per-file arrangements and per-folder sessions, a transposed view,
+joins between tabs, and tabs over several open files or workbook sheets. Nulls are shown as a highlighted `NA`. Sort
 composes with the active filter, and the cursor stays on the same record across
 a re-sort.
 

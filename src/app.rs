@@ -72,6 +72,17 @@ pub enum InputKind {
     ColumnName,
 }
 
+/// The two sides a joined view was made from: which tab, and which column of it
+/// held the key. Tabs are held by index, which the loop keeps straight as tabs
+/// come and go.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JoinOrigin {
+    pub left_tab: usize,
+    pub right_tab: usize,
+    pub left_key: String,
+    pub right_key: String,
+}
+
 /// Adding a column (`a`), one step at a time. The source column is the one
 /// under the cursor when it starts, so a regex extraction needs no more than
 /// the pattern itself.
@@ -85,16 +96,58 @@ pub struct NewColumn {
     pub recipe: Option<String>,
 }
 
-/// A formula that would not do, kept with the text it came from so the trouble
-/// can be pointed at rather than described.
+/// Something to say that will not fit on the status line, shown in the middle
+/// of the screen. A formula that would not do brings the text it came from, so
+/// the trouble can be pointed at rather than described; anything else is just
+/// the words.
 #[derive(Clone)]
-pub struct FormulaProblem {
-    /// The formula as it was typed.
-    pub text: String,
-    /// Character offset of the trouble, when it is in one place.
+pub struct Notice {
+    pub title: &'static str,
+    /// The text being complained about — a formula — when there is one.
+    pub subject: Option<String>,
+    /// Character offset of the trouble within `subject`.
     pub at: Option<usize>,
     pub message: String,
     pub hint: Option<String>,
+    /// Whether a keypress puts it away. A complaint about a formula stays until
+    /// the formula is edited, since the prompt it belongs to is still up; a
+    /// question stays until it is answered.
+    pub dismissable: bool,
+    /// What the bottom of the box says the keys are.
+    pub footer: &'static str,
+}
+
+impl Notice {
+    /// A plain complaint, put away by the next keypress.
+    pub fn say(title: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            title,
+            subject: None,
+            at: None,
+            message: message.into(),
+            hint: None,
+            dismissable: true,
+            footer: " any key ",
+        }
+    }
+
+    /// Something to answer rather than dismiss.
+    pub fn ask(title: &'static str, message: impl Into<String>, keys: &'static str) -> Self {
+        Self {
+            title,
+            subject: None,
+            at: None,
+            message: message.into(),
+            hint: None,
+            dismissable: false,
+            footer: keys,
+        }
+    }
+
+    pub fn hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -406,6 +459,13 @@ pub struct App {
     /// forget the pattern when the text is empty. Handled by the loop, which
     /// owns the store.
     pub save_pattern: Option<String>,
+    /// Set by `W`: remember every tab open here. The loop owns the tabs, so it
+    /// is the only thing that can.
+    pub save_session: bool,
+    /// Where a joined view came from: the tabs and key columns it was made
+    /// from. A join keeps no data of its own, so this is what lets a session
+    /// make it again.
+    pub origin: Option<JoinOrigin>,
     /// Set when the first row should switch between column names and data
     /// (handled by the loop, which reloads the file).
     pub toggle_header: bool,
@@ -423,8 +483,12 @@ pub struct App {
     pub cancel_join: bool,
     /// Adding a column, while that is going on.
     pub new_column: Option<NewColumn>,
-    /// Why the formula just typed would not do, while it is being shown.
-    pub formula_problem: Option<FormulaProblem>,
+    /// Something being said in the middle of the screen.
+    pub notice: Option<Notice>,
+    /// Whether the loop is asking what to do about an unsaved session.
+    pub quit_question: bool,
+    /// Set once that has been answered, so quitting is not questioned twice.
+    pub quit_anyway: bool,
     /// The `S` sort-key wizard, while one is running.
     pub key_sort: Option<KeySort>,
     /// Widths the user has set, keyed by dataset column. A column without one
@@ -490,6 +554,8 @@ impl App {
             close_tab: false,
             open_request: None,
             save_pattern: None,
+            save_session: false,
+            origin: None,
             toggle_header: false,
             promote_header: false,
             join_request: false,
@@ -497,7 +563,9 @@ impl App {
             confirm: false,
             cancel_join: false,
             new_column: None,
-            formula_problem: None,
+            notice: None,
+            quit_question: false,
+            quit_anyway: false,
             key_sort: None,
             col_widths: HashMap::new(),
             resize: None,
@@ -1008,6 +1076,16 @@ impl App {
     pub fn handle_key_at(&mut self, key: KeyEvent, now: Instant) {
         // The key reference swallows input while it is up, so a stray key can't
         // move the cursor behind it.
+        if self.quit_question {
+            return self.answer_quit_question(key);
+        }
+        // Something said in the middle of the screen is read, then dismissed by
+        // the next key — which does nothing else, so nothing happens unseen
+        // behind it.
+        if matches!(&self.notice, Some(n) if n.dismissable) {
+            self.notice = None;
+            return;
+        }
         if self.show_help {
             return self.handle_help(key);
         }
@@ -1026,6 +1104,27 @@ impl App {
             Mode::Normal => self.handle_normal(key, now),
             Mode::Input(kind) => self.handle_input(key, kind),
         }
+    }
+
+    /// Answer what to do about a session that has changed since it was saved.
+    /// Anything other than the three answers is ignored: this is the last thing
+    /// standing between the work and losing it, so a stray key must not decide.
+    fn answer_quit_question(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.save_session = true;
+                self.should_quit = true;
+                self.quit_anyway = true;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.should_quit = true;
+                self.quit_anyway = true;
+            }
+            KeyCode::Esc | KeyCode::Char('c') => {}
+            _ => return,
+        }
+        self.quit_question = false;
+        self.notice = None;
     }
 
     /// Scroll or dismiss the `?` key reference. Only `Ctrl-c` still quits.
@@ -1407,13 +1506,17 @@ impl App {
             // Back to the prompt with the text still there, and the trouble
             // shown over the table until it is edited.
             let detail = e.downcast_ref::<FormulaError>();
-            self.formula_problem = Some(FormulaProblem {
-                text: text.clone(),
+            self.notice = Some(Notice {
+                title: "formula",
+                subject: Some(text.clone()),
                 at: detail.and_then(|d| d.at),
                 message: detail
                     .map(|d| d.message.clone())
                     .unwrap_or_else(|| format!("{e}")),
                 hint: detail.and_then(|d| d.hint.clone()),
+                // The prompt is still up: this goes when the text changes.
+                dismissable: false,
+                footer: " keep typing to fix it · Esc gives up ",
             });
             self.mode = Mode::Input(InputKind::Recipe);
             self.input = text;
@@ -1669,7 +1772,27 @@ impl App {
             KeyCode::BackTab => self.switch_tab = Some(-1),
             KeyCode::Char('w') if ctrl => self.close_tab = true,
             KeyCode::Char('o') => self.enter_input(InputKind::Open),
-            KeyCode::Char('w') if !ctrl => self.enter_input(InputKind::Pattern),
+            // `w` writes one file's arrangement; `W` writes the whole folder's.
+            KeyCode::Char('W') => self.save_session = true,
+            KeyCode::Char('w') if !ctrl => {
+                // Asked before the name, not after: there is no point
+                // collecting one for something that cannot be saved.
+                if self.is_file_backed() {
+                    self.enter_input(InputKind::Pattern);
+                } else {
+                    self.notice = Some(
+                        Notice::say(
+                            "pattern",
+                            "a pattern belongs to a file, and this view is not one",
+                        )
+                        .hint(
+                            "a join and a transposed view are worked out from other \
+                             tabs, so there is no file to tie an arrangement to"
+                                .to_string(),
+                        ),
+                    );
+                }
+            }
             KeyCode::Char('?') => self.show_help = true,
             // `J` starts the join wizard; `Enter` then picks the key column
             // under the cursor, once on each side.
@@ -1765,7 +1888,7 @@ impl App {
         // Any edit clears the last complaint: it described text that has
         // changed since, and a stale caret points at nothing.
         if !matches!(key.code, KeyCode::Enter) {
-            self.formula_problem = None;
+            self.notice = None;
         }
         // The open prompt browses the filesystem; the others are plain text.
         if let InputKind::Open = kind
@@ -1778,7 +1901,7 @@ impl App {
                 self.mode = Mode::Normal;
                 self.input.clear();
                 self.completions = None;
-                self.formula_problem = None;
+                self.notice = None;
                 if self.new_column.take().is_some() {
                     self.status_msg = Some("no new column".into());
                 }

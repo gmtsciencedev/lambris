@@ -18,9 +18,11 @@ const CONFIG_ENV: &str = "LAMBRIS_CONFIG";
 
 /// One saved arrangement. Everything optional, so a hand-written pattern can
 /// set one thing and leave the rest alone.
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Pattern {
     /// The file this is tied to: a name, or a glob over one (`*stats1.tsv`).
+    /// Empty when the arrangement belongs to a session rather than a file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub bind: String,
     /// Which worksheet, when the file is a workbook.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -75,7 +77,7 @@ fn yes() -> bool {
 
 /// A computed column: its name and how it is worked out. Exactly one of
 /// `extract` (with `from`) or `formula` is set.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct SavedColumn {
     pub name: String,
     /// The column an extraction reads.
@@ -89,7 +91,7 @@ pub struct SavedColumn {
     pub formula: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
 pub struct SavedNumStyle {
     pub align: bool,
     pub log: bool,
@@ -97,7 +99,7 @@ pub struct SavedNumStyle {
     pub decimals: Option<u8>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct SavedSort {
     pub column: String,
     pub descending: bool,
@@ -105,7 +107,7 @@ pub struct SavedSort {
     pub key: Option<SavedSortKey>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct SavedSortKey {
     /// Character offsets, as `sort -k` would write them: 1-based, inclusive.
     pub from: usize,
@@ -115,7 +117,7 @@ pub struct SavedSortKey {
     pub method: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct SavedHeader {
     /// Rows ignored above the header.
     pub skip: usize,
@@ -227,6 +229,146 @@ impl Store {
         self.patterns
             .retain(|p| !(p.bind == bind && p.sheet.as_deref() == sheet));
         self.patterns.len() != before
+    }
+}
+
+/// Every tab that was open in a folder, and how each was arranged.
+///
+/// A pattern says how *a kind of file* should look wherever it turns up; a
+/// session says what was open *here*. The two answer different questions, which
+/// is why one is tied to a name or a glob and the other to a folder.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct Session {
+    /// The folder this belongs to, as an absolute path.
+    pub folder: String,
+    pub tabs: Vec<SessionTab>,
+    /// Which tab was in front.
+    #[serde(default)]
+    pub current: usize,
+}
+
+/// One tab of a session: which table, and how it looked.
+///
+/// A table is either read from a file or joined from two tabs saved before this
+/// one. A join keeps no data of its own, so it is written down as the recipe it
+/// is and made again when the session reopens.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct SessionTab {
+    /// Relative to the folder when the file is inside it, absolute otherwise —
+    /// so a project that is copied elsewhere still opens. Empty for a join.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sheet: Option<String>,
+    /// Set when this tab was joined rather than read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join: Option<SavedJoin>,
+    /// Whether the tab was showing a transposed view.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub transposed: bool,
+    /// The arrangement, recorded exactly as a pattern records one.
+    #[serde(default)]
+    pub view: Pattern,
+}
+
+/// A join, as the two tabs and key columns it was made from.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct SavedJoin {
+    /// Which tabs of this session, always ones saved before this one — so a
+    /// join of a join works, and the whole lot rebuilds in one pass.
+    pub left: usize,
+    pub right: usize,
+    /// The key columns, by name.
+    pub left_key: String,
+    pub right_key: String,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+/// The saved sessions, one per folder.
+pub struct Sessions {
+    sessions: Vec<Session>,
+    path: PathBuf,
+}
+
+impl Default for Sessions {
+    fn default() -> Self {
+        Self {
+            sessions: Vec::new(),
+            path: Self::default_path(),
+        }
+    }
+}
+
+impl Sessions {
+    /// Beside the patterns, and found the same way.
+    pub fn default_path() -> PathBuf {
+        let mut path = Store::default_path();
+        path.set_file_name("sessions.json");
+        path
+    }
+
+    pub fn load() -> Self {
+        Self::load_at(Self::default_path())
+    }
+
+    pub fn load_at(path: PathBuf) -> Self {
+        let sessions = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Vec<Session>>(&text).ok())
+            .unwrap_or_default();
+        Self { sessions, path }
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let path = &self.path;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("creating {}", dir.display()))?;
+        }
+        let text =
+            serde_json::to_string_pretty(&self.sessions).context("encoding sessions")?;
+        std::fs::write(path, text + "\n")
+            .with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// What was open in this folder, if anything.
+    pub fn for_folder(&self, folder: &Path) -> Option<&Session> {
+        let folder = folder.to_string_lossy();
+        self.sessions.iter().find(|s| s.folder == folder)
+    }
+
+    /// Remember this folder's session, replacing whatever was there.
+    pub fn put(&mut self, session: Session) {
+        self.sessions.retain(|s| s.folder != session.folder);
+        self.sessions.push(session);
+    }
+
+    /// Forget a folder's session.
+    pub fn forget(&mut self, folder: &Path) -> bool {
+        let folder = folder.to_string_lossy();
+        let before = self.sessions.len();
+        self.sessions.retain(|s| s.folder != folder);
+        self.sessions.len() != before
+    }
+}
+
+/// Where a file sits relative to a folder — a plain name when it is inside it,
+/// the whole path when it is not.
+pub fn relative_to(folder: &Path, file: &Path) -> String {
+    file.strip_prefix(folder)
+        .map(|rest| rest.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| file.to_string_lossy().into_owned())
+}
+
+/// The other way round: a name is taken as being inside the folder.
+pub fn resolve_in(folder: &Path, file: &str) -> PathBuf {
+    let path = PathBuf::from(file);
+    match path.is_absolute() {
+        true => path,
+        false => folder.join(path),
     }
 }
 

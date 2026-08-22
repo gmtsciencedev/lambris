@@ -6,7 +6,7 @@ mod pattern;
 mod interrupt;
 mod ui;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -14,15 +14,15 @@ use crossterm::event::{self, Event, KeyEventKind};
 
 use app::App;
 use data::{Dataset, HeaderSpec, JoinSide, JOIN_MAX_ROWS};
-use pattern::Store;
+use pattern::{relative_to, resolve_in, SavedJoin, Session, SessionTab, Sessions, Store};
 
 /// A terminal viewer for parquet, CSV/TSV (plain or gzipped) and Excel files,
 /// in the manner of csvlens.
 #[derive(Parser)]
 #[command(name = "lambris", version, about)]
 struct Args {
-    /// Paths to the data files to view; each one opens in its own tab.
-    #[arg(required = true, num_args = 1..)]
+    /// Paths to the data files to view; each one opens in its own tab. With
+    /// none, the session saved for this folder is reopened.
     files: Vec<PathBuf>,
 
     /// Treat the first row as data, not column names (columns become
@@ -33,6 +33,10 @@ struct Args {
     /// Open files as they come, ignoring any arrangement saved with `w`.
     #[arg(long)]
     no_pattern: bool,
+
+    /// Forget the session saved for this folder, and open nothing.
+    #[arg(long)]
+    forget_session: bool,
 }
 
 /// Largest number of records turned into columns when transposing, so a huge
@@ -53,7 +57,27 @@ fn main() -> Result<()> {
     } else {
         Store::load()
     };
-    let mut tabs = Tabs::open(&args.files, header, patterns)?;
+    let here = std::env::current_dir().context("finding the current folder")?;
+    let mut sessions = Sessions::load();
+    if args.forget_session {
+        let forgotten = sessions.forget(&here);
+        sessions.save()?;
+        println!(
+            "{}",
+            match forgotten {
+                true => format!("forgot the session for {}", here.display()),
+                false => format!("no session saved for {}", here.display()),
+            }
+        );
+        return Ok(());
+    }
+    // With no files named, pick up what was open here last.
+    let mut tabs = match args.files.is_empty() {
+        true => Tabs::reopen(&here, &sessions, header, patterns)?,
+        false => Tabs::open(&args.files, header, patterns)?,
+    };
+    tabs.folder = here;
+    tabs.sessions = sessions;
 
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut tabs);
@@ -71,6 +95,10 @@ struct Tabs {
     join: Option<JoinWizard>,
     /// Saved arrangements, applied as files are opened and written back by `w`.
     patterns: Store,
+    /// The folder a session belongs to.
+    folder: PathBuf,
+    /// Sessions, one per folder, written back by `W`.
+    sessions: Sessions,
 }
 
 /// The join wizard: the user walks to a key column and confirms, once on each
@@ -107,11 +135,232 @@ impl Tabs {
             current: 0,
             join: None,
             patterns,
+            folder: PathBuf::from("."),
+            sessions: Sessions::default(),
         };
         for tab in 0..opened.tabs.len() {
             opened.apply_saved_pattern(tab);
         }
         Ok(opened)
+    }
+
+    /// Reopen what was last open in `folder`.
+    ///
+    /// Each tab's own arrangement comes from the session rather than from a
+    /// pattern: a session is a snapshot of how things actually were, so it wins
+    /// over the general rule for that kind of file.
+    fn reopen(
+        folder: &Path,
+        sessions: &Sessions,
+        header: HeaderSpec,
+        patterns: Store,
+    ) -> Result<Self> {
+        let Some(session) = sessions.for_folder(folder) else {
+            anyhow::bail!(
+                "nothing saved for {} — name a file, or press W here to remember one",
+                folder.display()
+            );
+        };
+        let mut tabs: Vec<Vec<App>> = Vec::with_capacity(session.tabs.len());
+        let mut missing = Vec::new();
+        // Where each saved tab ended up, so a join can find its sides even if
+        // something before it failed to open and the positions shifted.
+        let mut built: Vec<Option<usize>> = Vec::with_capacity(session.tabs.len());
+        for saved in &session.tabs {
+            // A join is made again from tabs already built — which is why they
+            // are saved in order, and why a join of a join works.
+            if let Some(join) = &saved.join {
+                let sides = built
+                    .get(join.left)
+                    .copied()
+                    .flatten()
+                    .zip(built.get(join.right).copied().flatten());
+                let made = sides.and_then(|(left, right)| {
+                    let key = |tab: usize, name: &str| {
+                        tabs.get(tab)?
+                            .last()?
+                            .data
+                            .column_names
+                            .iter()
+                            .position(|n| n == name)
+                    };
+                    let left_key = key(left, &join.left_key)?;
+                    let right_key = key(right, &join.right_key)?;
+                    joined_view(&tabs, (left, left_key), (right, right_key))
+                });
+                match made {
+                    Some(mut app) => {
+                        app.apply_pattern(&saved.view);
+                        built.push(Some(tabs.len()));
+                        tabs.push(vec![app]);
+                    }
+                    None => {
+                        missing.push("a join".to_string());
+                        built.push(None);
+                    }
+                }
+                continue;
+            }
+            let path = resolve_in(folder, &saved.file);
+            // The session's own header reading, since it decides the schema.
+            let header = App::header_from(&saved.view).unwrap_or(header);
+            let dataset = Dataset::load_all(&path, header).ok().and_then(|sets| {
+                // A workbook gives several sheets; take the one this tab held.
+                sets.into_iter().find(|d| match &saved.sheet {
+                    Some(sheet) => d.sheet() == Some(sheet.as_str()),
+                    None => true,
+                })
+            });
+            let Some(dataset) = dataset else {
+                missing.push(saved.file.clone());
+                built.push(None);
+                continue;
+            };
+            let mut app = App::new(dataset);
+            app.apply_pattern(&saved.view);
+            built.push(Some(tabs.len()));
+            tabs.push(vec![app]);
+        }
+        if tabs.is_empty() {
+            anyhow::bail!(
+                "none of the {} files in the session for {} could be opened",
+                session.tabs.len(),
+                folder.display()
+            );
+        }
+        let current = built
+            .get(session.current)
+            .copied()
+            .flatten()
+            .unwrap_or(0)
+            .min(tabs.len() - 1);
+        let mut opened = Self {
+            tabs,
+            current,
+            join: None,
+            patterns,
+            folder: folder.to_path_buf(),
+            sessions: Sessions::default(),
+        };
+        // Transposed tabs are restored by transposing again, which is what the
+        // view was in the first place.
+        let transposed: Vec<usize> = session
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, saved)| saved.transposed)
+            .filter_map(|(tab, _)| built.get(tab).copied().flatten())
+            .collect();
+        for tab in transposed {
+            if let Some(stack) = opened.tabs.get(tab)
+                && let Some(app) = stack.last()
+                && let Ok(view) = transposed_view(app)
+            {
+                opened.tabs[tab].push(view);
+            }
+        }
+        if !missing.is_empty() {
+            opened.app_mut().status_msg =
+                Some(format!("{} file(s) gone: {}", missing.len(), missing.join(", ")));
+        }
+        Ok(opened)
+    }
+
+    /// Remember every tab open here, so `lambris` alone reopens them.
+    ///
+    /// A joined tab is written down as the two tabs and key columns it was made
+    /// from, since it holds no data of its own. Tabs are recorded in order and a
+    /// join always points at earlier ones, so the whole lot — including a join
+    /// of a join — rebuilds in a single pass.
+    fn remember_session(&mut self) {
+        let (session, lost) = self.snapshot_session();
+        if session.tabs.is_empty() {
+            self.app_mut().notice = Some(
+                app::Notice::say("session", "there is nothing here that could be reopened")
+                    .hint("a session remembers files and the joins made from them"),
+            );
+            return;
+        }
+        let count = session.tabs.len();
+        self.sessions.put(session);
+        let message = match self.sessions.save() {
+            Ok(()) => {
+                let note = match lost {
+                    0 => String::new(),
+                    n => format!(" · {n} left out"),
+                };
+                format!("remembered {count} tab(s) here{note}")
+            }
+            Err(e) => format!("session not saved: {e}"),
+        };
+        self.app_mut().status_msg = Some(message);
+    }
+
+    /// Whether what is open now differs from what was last saved for this
+    /// folder — worked out by building what `W` would write and comparing it,
+    /// so there is no flag to keep in step with the twenty things that change a
+    /// view. `false` when the folder has no session: an ordinary run of the
+    /// viewer has nothing to lose.
+    ///
+    /// Which tab is in front is left out of the comparison: looking at another
+    /// tab is not work worth being asked about on the way out.
+    fn session_changed(&self) -> bool {
+        let Some(saved) = self.sessions.for_folder(&self.folder) else {
+            return false;
+        };
+        let (now, _) = self.snapshot_session();
+        now.tabs != saved.tabs
+    }
+
+    /// What `W` would write: every tab, and how many could not be described.
+    fn snapshot_session(&self) -> (Session, usize) {
+        let folder = self.folder.clone();
+        let mut tabs = Vec::new();
+        let mut lost = 0;
+        for stack in &self.tabs {
+            // The bottom of the stack is the table; anything above it is a view
+            // of it, remembered as a flag rather than as a tab of its own.
+            let Some(base) = stack.first() else { continue };
+            let top = stack.last().unwrap_or(base);
+            let view = base.pattern(String::new());
+            let transposed = top.is_transposed;
+            if base.is_file_backed() {
+                tabs.push(SessionTab {
+                    file: relative_to(&folder, &base.data.path),
+                    sheet: base.data.sheet().map(str::to_string),
+                    join: None,
+                    transposed,
+                    view,
+                });
+                continue;
+            }
+            // Not a file: the only other thing a tab can hold is a join, and
+            // only one that still knows where it came from can be made again.
+            match &base.origin {
+                Some(origin) => tabs.push(SessionTab {
+                    file: String::new(),
+                    sheet: None,
+                    join: Some(SavedJoin {
+                        left: origin.left_tab,
+                        right: origin.right_tab,
+                        left_key: origin.left_key.clone(),
+                        right_key: origin.right_key.clone(),
+                    }),
+                    transposed,
+                    view,
+                }),
+                None => lost += 1,
+            }
+        }
+        let current = self.current.min(tabs.len().saturating_sub(1));
+        (
+            Session {
+                folder: folder.to_string_lossy().into_owned(),
+                tabs,
+                current,
+            },
+            lost,
+        )
     }
 
     /// Arrange a freshly opened tab as its saved pattern says, if it has one.
@@ -191,9 +440,10 @@ impl Tabs {
     /// Returns `false` when the program should exit.
     fn step(&mut self) -> bool {
         let app = self.app_mut();
-        if app.should_quit {
-            return false; // quit the whole program from any tab or level
-        }
+        // Taken before the rest, but acted on last: answering the question with
+        // `y` sets both this and `save_session`, and the saving has to happen
+        // on the way out rather than after it.
+        let quitting = std::mem::take(&mut app.should_quit);
         // Drain the requests first so the tab set can be mutated freely below.
         let exit_transpose = std::mem::take(&mut app.exit_transpose);
         let transpose = std::mem::take(&mut app.transpose_request);
@@ -202,6 +452,7 @@ impl Tabs {
         let open = app.open_request.take();
         let toggle_header = std::mem::take(&mut app.toggle_header);
         let save_pattern = app.save_pattern.take();
+        let save_session = std::mem::take(&mut app.save_session);
         let promote_header = std::mem::take(&mut app.promote_header);
         let join_request = std::mem::take(&mut app.join_request);
         let confirm = std::mem::take(&mut app.confirm);
@@ -235,6 +486,9 @@ impl Tabs {
         }
         if let Some(bind) = save_pattern {
             self.remember_pattern(bind);
+        }
+        if save_session {
+            self.remember_session();
         }
         if join_request {
             self.join = Some(JoinWizard { left: None });
@@ -273,11 +527,44 @@ impl Tabs {
                 Err(e) => self.app_mut().status_msg = Some(format!("open failed: {e}")),
             }
         }
+        if quitting {
+            // Nothing was saved for this folder, or nothing has changed since:
+            // leave without a word.
+            if self.app_mut().quit_anyway || !self.session_changed() {
+                return false;
+            }
+            let app = self.app_mut();
+            app.quit_question = true;
+            app.notice = Some(app::Notice::ask(
+                "session",
+                "this session has changed since it was saved",
+                " y save · n discard · Esc stay ",
+            ));
+            return true;
+        }
         if close {
             let closed = self.current;
             self.tabs.remove(closed);
-            // Tab indices shift, so a pending join pick has to move with them —
-            // otherwise it would quietly point at a different table.
+            // Tab indices shift, so what a joined view remembers about where it
+            // came from has to move with them — or be dropped when a side goes,
+            // since it could no longer be made again.
+            for stack in &mut self.tabs {
+                for app in stack.iter_mut() {
+                    let Some(origin) = &mut app.origin else { continue };
+                    let gone = origin.left_tab == closed || origin.right_tab == closed;
+                    if gone {
+                        app.origin = None;
+                        continue;
+                    }
+                    if origin.left_tab > closed {
+                        origin.left_tab -= 1;
+                    }
+                    if origin.right_tab > closed {
+                        origin.right_tab -= 1;
+                    }
+                }
+            }
+            // A pending join pick has to move with them too.
             let orphaned = match self.join.as_mut().and_then(|w| w.left.as_mut()) {
                 Some((tab, _)) if *tab == closed => true,
                 Some((tab, _)) if *tab > closed => {
@@ -393,53 +680,69 @@ impl Tabs {
     /// contributes the rows it is currently showing, so filters, sorts and
     /// transposed views all carry through.
     fn run_join(&mut self, left: (usize, usize), right: (usize, usize)) {
-        let ((left_tab, left_col), (right_tab, right_col)) = (left, right);
         // A tab could have been closed between the two picks.
-        let (Some(left_app), Some(right_app)) = (
-            self.tabs.get(left_tab).and_then(|s| s.last()),
-            self.tabs.get(right_tab).and_then(|s| s.last()),
-        ) else {
+        if self.tabs.get(left.0).is_none() || self.tabs.get(right.0).is_none() {
             self.app_mut().status_msg = Some("join: that tab is gone".into());
             return;
-        };
-        let left_rows = left_app.view_rows(JOIN_MAX_ROWS);
-        let right_rows = right_app.view_rows(JOIN_MAX_ROWS);
-        let joined = Dataset::join(
-            JoinSide {
-                data: &left_app.data,
-                rows: &left_rows,
-                cols: left_app.visible_cols(),
-                key: left_col,
-            },
-            JoinSide {
-                data: &right_app.data,
-                rows: &right_rows,
-                cols: right_app.visible_cols(),
-                key: right_col,
-            },
-            interrupt::requested,
-        );
-        match joined {
-            Ok(Some((dataset, report))) => {
-                let mut view = App::new(dataset);
-                let mut msg = format!(
-                    "{} rows · {} matched, {} unmatched",
-                    report.rows, report.matched, report.unmatched
-                );
-                if report.truncated {
-                    msg.push_str(&format!(" · cut at {JOIN_MAX_ROWS}"));
-                }
-                view.status_msg = Some(msg);
+        }
+        match joined_view(&self.tabs, left, right) {
+            Some(view) => {
                 self.tabs.push(vec![view]);
                 self.current = self.tabs.len() - 1;
             }
-            Ok(None) => {
-                interrupt::take();
-                self.app_mut().status_msg = Some("join cancelled".into());
+            None if interrupt::take() => {
+                self.app_mut().status_msg = Some("join cancelled".into())
             }
-            Err(e) => self.app_mut().status_msg = Some(format!("join failed: {e}")),
+            None => self.app_mut().status_msg = Some("join failed".into()),
         }
     }
+}
+
+/// Build the view a join produces, without deciding where it goes — so the
+/// wizard and a reopening session make one the same way.
+fn joined_view(
+    tabs: &[Vec<App>],
+    left: (usize, usize),
+    right: (usize, usize),
+) -> Option<App> {
+    let ((left_tab, left_col), (right_tab, right_col)) = (left, right);
+    let left_app = tabs.get(left_tab)?.last()?;
+    let right_app = tabs.get(right_tab)?.last()?;
+    let left_rows = left_app.view_rows(JOIN_MAX_ROWS);
+    let right_rows = right_app.view_rows(JOIN_MAX_ROWS);
+    let joined = Dataset::join(
+        JoinSide {
+            data: &left_app.data,
+            rows: &left_rows,
+            cols: left_app.visible_cols(),
+            key: left_col,
+        },
+        JoinSide {
+            data: &right_app.data,
+            rows: &right_rows,
+            cols: right_app.visible_cols(),
+            key: right_col,
+        },
+        interrupt::requested,
+    );
+    let (dataset, report) = joined.ok()??;
+    let mut view = App::new(dataset);
+    // Where it came from, so a session can make it again.
+    view.origin = Some(app::JoinOrigin {
+        left_tab,
+        right_tab,
+        left_key: left_app.data.column_names[left_col].clone(),
+        right_key: right_app.data.column_names[right_col].clone(),
+    });
+    let mut msg = format!(
+        "{} rows · {} matched, {} unmatched",
+        report.rows, report.matched, report.unmatched
+    );
+    if report.truncated {
+        msg.push_str(&format!(" · cut at {JOIN_MAX_ROWS}"));
+    }
+    view.status_msg = Some(msg);
+    Some(view)
 }
 
 /// Draw the current tab's top view, feed it one key, then let [`Tabs::step`]
@@ -1284,13 +1587,13 @@ mod tests {
     }
 
     /// Type a formula and commit it, expecting it to be refused.
-    fn bad_formula(app: &mut App, recipe: &str) -> app::FormulaProblem {
+    fn bad_formula(app: &mut App, recipe: &str) -> app::Notice {
         app.handle_key(key('a'));
         app.handle_key(key('f'));
         type_str(app, recipe);
         app.handle_key(code(KeyCode::Enter));
         let problem = app
-            .formula_problem
+            .notice
             .clone()
             .unwrap_or_else(|| panic!("{recipe} should have been refused"));
         // The prompt is still up, with the text still in it, so it can be fixed
@@ -1334,7 +1637,7 @@ mod tests {
         app.handle_key(key('a'));
         app.handle_key(key('f'));
         app.handle_key(code(KeyCode::Enter));
-        assert!(app.formula_problem.is_none());
+        assert!(app.notice.is_none());
         assert!(app.new_column.is_none());
         assert_eq!(app.status_msg.as_deref(), Some("no new column"));
 
@@ -1349,7 +1652,7 @@ mod tests {
         assert!(text.contains("stops here"), "and what is wrong: {text}");
         // Editing it clears the complaint, rather than leaving a stale caret.
         app.handle_key(code(KeyCode::Backspace));
-        assert!(app.formula_problem.is_none());
+        assert!(app.notice.is_none());
         app.handle_key(code(KeyCode::Esc));
 
         // A name already taken is refused at the naming step.
@@ -1730,6 +2033,285 @@ mod tests {
         assert!(summary_line(tabs.app_mut(), 40, 9).contains('2'), "the mean of 1..3");
     }
 
+    /// A session file of its own, and a folder to hold a project.
+    fn project() -> (PathBuf, PathBuf) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut folder = std::env::temp_dir();
+        folder.push(format!("lambris_test_project_{n}"));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut sessions = std::env::temp_dir();
+        sessions.push(format!("lambris_test_sessions_{n}.json"));
+        let _ = std::fs::remove_file(&sessions);
+        (folder, sessions)
+    }
+
+    #[test]
+    fn a_session_reopens_the_tabs_that_were_here() {
+        let (folder, store) = project();
+        std::fs::write(folder.join("meta.csv"), "sample,depth,junk\nS1,10,x\nS2,20,y\n")
+            .unwrap();
+        std::fs::write(folder.join("dict.csv"), "sample,label\nS1,control\n").unwrap();
+        let files = vec![folder.join("meta.csv"), folder.join("dict.csv")];
+
+        {
+            let mut tabs =
+                Tabs::open(&files, HeaderSpec::default(), Store::default()).unwrap();
+            tabs.folder = folder.clone();
+            tabs.sessions = Sessions::load_at(store.clone());
+            // Arrange the first tab, and leave the second one in front.
+            tabs.app_mut().selected_pos = 2;
+            tabs.key(key('x')); // hide junk
+            tabs.key(key('s')); // and sort
+            tabs.key(KeyEvent::from(KeyCode::Tab));
+            assert!(tabs.step());
+            tabs.key(key('W'));
+            assert!(tabs.step());
+            let msg = tabs.app_mut().status_msg.clone().unwrap_or_default();
+            assert!(msg.contains("remembered 2 tab"), "unexpected: {msg}");
+        }
+
+        // Files are written relative to the folder, so a project can move.
+        let text = std::fs::read_to_string(&store).unwrap();
+        assert!(text.contains("\"meta.csv\""), "{text}");
+        assert!(!text.contains(folder.join("meta.csv").to_str().unwrap()));
+
+        // Reopened with no files named at all.
+        let sessions = Sessions::load_at(store.clone());
+        let mut tabs =
+            Tabs::reopen(&folder, &sessions, HeaderSpec::default(), Store::default()).unwrap();
+        assert_eq!(tabs.tabs.len(), 2);
+        assert_eq!(tabs.current, 1, "the tab that was in front");
+        tabs.current = 0;
+        let app = tabs.app_mut();
+        assert_eq!(app.data.label, "meta.csv");
+        assert_eq!(app.visible_cols(), &[0, 1], "junk is still hidden");
+        assert!(app.sort.is_some(), "and it is still sorted");
+    }
+
+    #[test]
+    fn quitting_with_a_changed_session_asks_first() {
+        let (folder, store) = project();
+        std::fs::write(folder.join("a.csv"), "k,v\nx,1\ny,2\n").unwrap();
+        let files = vec![folder.join("a.csv")];
+        let open = |store: &PathBuf| {
+            let mut tabs =
+                Tabs::open(&files, HeaderSpec::default(), Store::default()).unwrap();
+            tabs.folder = folder.clone();
+            tabs.sessions = Sessions::load_at(store.clone());
+            tabs
+        };
+
+        // With nothing saved for this folder there is nothing to lose, so an
+        // ordinary run quits without a word.
+        let mut tabs = open(&store);
+        tabs.key(key('x'));
+        tabs.key(key('q'));
+        assert!(!tabs.step(), "no session here, so no question");
+
+        // Once saved, quitting unchanged is still silent.
+        let mut tabs = open(&store);
+        tabs.key(key('W'));
+        assert!(tabs.step());
+        tabs.key(key('q'));
+        assert!(!tabs.step(), "nothing has changed since");
+
+        // Change something, and it asks.
+        let mut tabs = open(&store);
+        tabs.key(key('x'));
+        tabs.key(key('q'));
+        assert!(tabs.step(), "quitting is held up");
+        assert!(tabs.app_mut().quit_question);
+        let text = buffer_text(tabs.app_mut(), 80, 16);
+        assert!(text.contains("changed since it was saved"), "{text}");
+        assert!(text.contains("y save · n discard"), "and how to answer: {text}");
+
+        // A key that is not an answer decides nothing.
+        tabs.key(key('j'));
+        assert!(tabs.app_mut().quit_question, "still asking");
+        assert!(tabs.step());
+
+        // Esc goes back to the table, with the change still there.
+        tabs.key(KeyEvent::from(KeyCode::Esc));
+        assert!(tabs.step(), "still running");
+        assert!(!tabs.app_mut().quit_question);
+        assert!(tabs.app_mut().notice.is_none());
+        assert_eq!(tabs.app_mut().visible_cols(), &[1], "the change is kept");
+
+        // `n` leaves without saving: what was stored is untouched.
+        tabs.key(key('q'));
+        assert!(tabs.step());
+        tabs.key(key('n'));
+        assert!(!tabs.step(), "quit");
+        let saved = Sessions::load_at(store.clone());
+        let session = saved.for_folder(&folder).expect("still there");
+        assert_eq!(session.tabs[0].view.hidden, Vec::<String>::new(), "not saved");
+
+        // `y` saves on the way out.
+        let mut tabs = open(&store);
+        tabs.key(key('x'));
+        tabs.key(key('q'));
+        assert!(tabs.step());
+        tabs.key(key('y'));
+        assert!(!tabs.step(), "quit");
+        let saved = Sessions::load_at(store);
+        let session = saved.for_folder(&folder).expect("still there");
+        assert_eq!(session.tabs[0].view.hidden, vec!["k".to_string()], "saved");
+    }
+
+    #[test]
+    fn looking_at_another_tab_is_not_a_change_worth_asking_about() {
+        let (folder, store) = project();
+        std::fs::write(folder.join("a.csv"), "k\n1\n").unwrap();
+        std::fs::write(folder.join("b.csv"), "k\n2\n").unwrap();
+        let files = vec![folder.join("a.csv"), folder.join("b.csv")];
+        let mut tabs = Tabs::open(&files, HeaderSpec::default(), Store::default()).unwrap();
+        tabs.folder = folder.clone();
+        tabs.sessions = Sessions::load_at(store);
+        tabs.key(key('W'));
+        assert!(tabs.step());
+
+        // Moving about, and moving the cursor, change nothing that is saved.
+        tabs.key(KeyEvent::from(KeyCode::Tab));
+        assert!(tabs.step());
+        tabs.key(key('j'));
+        tabs.key(key('q'));
+        assert!(!tabs.step(), "quits without asking");
+    }
+
+    #[test]
+    fn a_session_remakes_a_joined_tab() {
+        let (folder, store) = project();
+        std::fs::write(folder.join("a.csv"), "k,v\nx,1\ny,2\n").unwrap();
+        std::fs::write(folder.join("b.csv"), "k,w\nx,9\n").unwrap();
+        let files = vec![folder.join("a.csv"), folder.join("b.csv")];
+        let mut tabs = Tabs::open(&files, HeaderSpec::default(), Store::default()).unwrap();
+        tabs.folder = folder.clone();
+        tabs.sessions = Sessions::load_at(store.clone());
+
+        // A join makes a third tab that is worked out rather than read.
+        run_wizard(&mut tabs, 0, 1, 0);
+        assert_eq!(tabs.tabs.len(), 3);
+        // And transpose the first.
+        tabs.current = 0;
+        tabs.key(key('t'));
+        assert!(tabs.step());
+        assert!(tabs.app_mut().is_transposed);
+
+        tabs.key(key('W'));
+        assert!(tabs.step());
+        let msg = tabs.app_mut().status_msg.clone().unwrap_or_default();
+        assert!(msg.contains("remembered 3 tab"), "all three: {msg}");
+        assert!(!msg.contains("left out"), "including the join: {msg}");
+
+        // A join holds no data of its own, so it is written down as the recipe
+        // it is: the two tabs and the key columns.
+        let text = std::fs::read_to_string(&store).unwrap();
+        assert!(text.contains("\"join\""), "{text}");
+        assert!(text.contains("\"left_key\": \"k\""), "{text}");
+
+        let sessions = Sessions::load_at(store);
+        let mut tabs =
+            Tabs::reopen(&folder, &sessions, HeaderSpec::default(), Store::default()).unwrap();
+        assert_eq!(tabs.tabs.len(), 3, "the join was made again");
+        tabs.current = 0;
+        assert!(tabs.app_mut().is_transposed, "transposed again");
+        // …and `t` still steps back to the file underneath.
+        tabs.key(key('t'));
+        assert!(tabs.step());
+        assert_eq!(tabs.app_mut().data.column_names, vec!["k", "v"]);
+
+        // The joined tab holds what it held before.
+        tabs.current = 2;
+        let app = tabs.app_mut();
+        assert_eq!(app.data.column_names, vec!["k", "v", "w"]);
+        // A left join, so `y` is still there with nothing beside it.
+        assert_eq!(app.row_count(), 2);
+        assert_eq!(app.data.cell_display(2, 0).unwrap().as_deref(), Some("9"));
+        assert!(app.data.is_null(2, 1), "y matched nothing");
+        assert!(app.origin.is_some(), "and still knows where it came from");
+    }
+
+    #[test]
+    fn what_a_join_remembers_follows_the_tabs_it_came_from() {
+        let (folder, store) = project();
+        std::fs::write(folder.join("spare.csv"), "z\n1\n").unwrap();
+        std::fs::write(folder.join("a.csv"), "k,v\nx,1\n").unwrap();
+        std::fs::write(folder.join("b.csv"), "k,w\nx,9\n").unwrap();
+        let files = vec![
+            folder.join("spare.csv"),
+            folder.join("a.csv"),
+            folder.join("b.csv"),
+        ];
+        let mut tabs = Tabs::open(&files, HeaderSpec::default(), Store::default()).unwrap();
+        tabs.folder = folder.clone();
+        tabs.sessions = Sessions::load_at(store.clone());
+
+        tabs.current = 1; // join a × b
+        run_wizard(&mut tabs, 0, 2, 0);
+        let origin = tabs.app_mut().origin.clone().expect("where it came from");
+        assert_eq!((origin.left_tab, origin.right_tab), (1, 2));
+
+        // Closing an unrelated tab before them shifts both sides down with it.
+        tabs.current = 0;
+        tabs.key(ctrl('w'));
+        assert!(tabs.step());
+        tabs.current = tabs.tabs.len() - 1;
+        let origin = tabs.app_mut().origin.clone().expect("still knows");
+        assert_eq!((origin.left_tab, origin.right_tab), (0, 1), "moved down");
+
+        // Closing a side it actually came from drops it: there would be nothing
+        // to make it from again.
+        tabs.current = 0;
+        tabs.key(ctrl('w'));
+        assert!(tabs.step());
+        tabs.current = tabs.tabs.len() - 1;
+        assert!(tabs.app_mut().origin.is_none());
+        tabs.key(key('W'));
+        assert!(tabs.step());
+        let msg = tabs.app_mut().status_msg.clone().unwrap_or_default();
+        assert!(msg.contains("1 left out"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn a_session_says_when_it_has_nothing_to_reopen() {
+        let (folder, store) = project();
+        let sessions = Sessions::load_at(store.clone());
+        // Nothing saved here at all.
+        let err = match Tabs::reopen(&folder, &sessions, HeaderSpec::default(), Store::default())
+        {
+            Ok(_) => panic!("there is no session here to reopen"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("nothing saved for"), "{err}");
+        assert!(err.contains("press W"), "and says what to do: {err}");
+
+        // A session whose files have since gone.
+        std::fs::write(folder.join("gone.csv"), "a\n1\n").unwrap();
+        {
+            let mut tabs = Tabs::open(
+                std::slice::from_ref(&folder.join("gone.csv")),
+                HeaderSpec::default(),
+                Store::default(),
+            )
+            .unwrap();
+            tabs.folder = folder.clone();
+            tabs.sessions = Sessions::load_at(store.clone());
+            tabs.key(key('W'));
+            assert!(tabs.step());
+        }
+        std::fs::remove_file(folder.join("gone.csv")).unwrap();
+        let sessions = Sessions::load_at(store);
+        let err = match Tabs::reopen(&folder, &sessions, HeaderSpec::default(), Store::default())
+        {
+            Ok(_) => panic!("the file is gone, so there is nothing to show"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("could be opened"), "{err}");
+    }
+
     #[test]
     fn a_pattern_brings_the_arrangement_back() {
         let store = store_path();
@@ -1956,12 +2538,26 @@ mod tests {
             Tabs::open(&[file], HeaderSpec::default(), Store::load_at(store.clone())).unwrap();
         tabs.key(key('t')); // transpose: not the file's own layout
         assert!(tabs.step());
-        save_pattern(&mut tabs, "anything");
-        assert_eq!(
-            tabs.app_mut().status_msg.as_deref(),
-            Some("a pattern belongs to a file — this view is not one")
+        tabs.key(key('w'));
+
+        // Said at once, rather than after collecting a name that could never be
+        // used — and said in the middle of the screen, where there is room for
+        // the reason.
+        let notice = tabs.app_mut().notice.clone().expect("a notice");
+        assert!(notice.message.contains("belongs to a file"), "{}", notice.message);
+        assert!(notice.hint.is_some(), "and says why");
+        assert!(
+            matches!(tabs.app_mut().mode, app::Mode::Normal),
+            "no prompt should have opened"
         );
+        let text = buffer_text(tabs.app_mut(), 80, 16);
+        assert!(text.contains("belongs to a file"), "drawn over the table: {text}");
         assert!(!store.exists(), "nothing should have been written");
+
+        // The next key puts it away, and does nothing else.
+        tabs.key(key('j'));
+        assert!(tabs.app_mut().notice.is_none());
+        assert_eq!(tabs.app_mut().selected_row, 0, "the key was swallowed");
     }
 
     #[test]
@@ -3279,13 +3875,21 @@ mod tests {
                 })
                 .collect()
         };
-        let before = temporary().len();
+        // Only this file's copy: other tests expand their own at the same time,
+        // and counting all of them would race them.
+        let mine = path.file_name().unwrap().to_string_lossy().into_owned();
+        let copies = || temporary().iter().filter(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().ends_with(&mine))
+                .unwrap_or(false)
+        }).count();
+        assert_eq!(copies(), 0);
         {
             let ds = Dataset::load(&path).unwrap();
             assert_eq!(ds.nrows, 1);
-            assert!(temporary().len() > before, "an expanded copy exists while open");
+            assert_eq!(copies(), 1, "an expanded copy exists while open");
         }
-        assert_eq!(temporary().len(), before, "and goes when the dataset does");
+        assert_eq!(copies(), 0, "and goes when the dataset does");
     }
 
     #[test]
