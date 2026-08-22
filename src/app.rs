@@ -70,6 +70,8 @@ pub enum InputKind {
     Recipe,
     /// What to call a column: a new one, or one being renamed.
     ColumnName,
+    /// Where to write this view out to.
+    Export,
 }
 
 /// The two sides a joined view was made from: which tab, and which column of it
@@ -81,6 +83,15 @@ pub struct JoinOrigin {
     pub right_tab: usize,
     pub left_key: String,
     pub right_key: String,
+}
+
+/// Something the loop is waiting for a yes or a no about.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Question {
+    /// Quitting with a session that has changed since it was saved.
+    LoseSession,
+    /// Writing over a file that is already there.
+    Overwrite(std::path::PathBuf),
 }
 
 /// Adding a column (`a`), one step at a time. The source column is the one
@@ -459,6 +470,10 @@ pub struct App {
     /// forget the pattern when the text is empty. Handled by the loop, which
     /// owns the store.
     pub save_pattern: Option<String>,
+    /// A name typed at the `X` prompt: write this view out there.
+    pub export_request: Option<String>,
+    /// Set when writing over a file that is already there has been agreed to.
+    pub overwrite_allowed: bool,
     /// Set by `W`: remember every tab open here. The loop owns the tabs, so it
     /// is the only thing that can.
     pub save_session: bool,
@@ -485,9 +500,9 @@ pub struct App {
     pub new_column: Option<NewColumn>,
     /// Something being said in the middle of the screen.
     pub notice: Option<Notice>,
-    /// Whether the loop is asking what to do about an unsaved session.
-    pub quit_question: bool,
-    /// Set once that has been answered, so quitting is not questioned twice.
+    /// What the loop is waiting for an answer about.
+    pub question: Option<Question>,
+    /// Set once quitting has been answered, so it is not questioned twice.
     pub quit_anyway: bool,
     /// The `S` sort-key wizard, while one is running.
     pub key_sort: Option<KeySort>,
@@ -498,6 +513,10 @@ pub struct App {
     pub resize: Option<Resize>,
     /// A pending `(`/`)`: which columns the next column command covers.
     pub scope: Option<Scope>,
+    /// The folder lambris was started in, which is where a session belongs and
+    /// where `X` writes when given a bare name. Kept in step by the loop, the
+    /// way `join_active` is.
+    pub folder: std::path::PathBuf,
     /// Whether the summary line is on, and what a column shows unless it says
     /// otherwise.
     pub summary: Option<Summary>,
@@ -554,6 +573,8 @@ impl App {
             close_tab: false,
             open_request: None,
             save_pattern: None,
+            export_request: None,
+            overwrite_allowed: false,
             save_session: false,
             origin: None,
             toggle_header: false,
@@ -564,12 +585,13 @@ impl App {
             cancel_join: false,
             new_column: None,
             notice: None,
-            quit_question: false,
+            question: None,
             quit_anyway: false,
             key_sort: None,
             col_widths: HashMap::new(),
             resize: None,
             scope: None,
+            folder: std::path::PathBuf::from("."),
             summary: None,
             summary_cols: HashMap::new(),
             stats: HashMap::new(),
@@ -1076,8 +1098,8 @@ impl App {
     pub fn handle_key_at(&mut self, key: KeyEvent, now: Instant) {
         // The key reference swallows input while it is up, so a stray key can't
         // move the cursor behind it.
-        if self.quit_question {
-            return self.answer_quit_question(key);
+        if self.question.is_some() {
+            return self.answer(key);
         }
         // Something said in the middle of the screen is read, then dismissed by
         // the next key — which does nothing else, so nothing happens unseen
@@ -1106,24 +1128,37 @@ impl App {
         }
     }
 
-    /// Answer what to do about a session that has changed since it was saved.
-    /// Anything other than the three answers is ignored: this is the last thing
-    /// standing between the work and losing it, so a stray key must not decide.
-    fn answer_quit_question(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                self.save_session = true;
-                self.should_quit = true;
-                self.quit_anyway = true;
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') => {
-                self.should_quit = true;
-                self.quit_anyway = true;
-            }
-            KeyCode::Esc | KeyCode::Char('c') => {}
-            _ => return,
+    /// Answer a yes-or-no question. Anything other than the three answers is
+    /// ignored: a question is asked where something stands to be lost, so a
+    /// stray key must not decide it.
+    fn answer(&mut self, key: KeyEvent) {
+        let Some(question) = self.question.clone() else {
+            return;
+        };
+        let yes = matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'));
+        let no = matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N'));
+        let back = matches!(key.code, KeyCode::Esc);
+        if !(yes || no || back) {
+            return;
         }
-        self.quit_question = false;
+        match question {
+            Question::LoseSession => {
+                if yes {
+                    self.save_session = true;
+                }
+                if yes || no {
+                    self.should_quit = true;
+                    self.quit_anyway = true;
+                }
+            }
+            Question::Overwrite(path) => {
+                if yes {
+                    self.export_request = Some(path.to_string_lossy().into_owned());
+                    self.overwrite_allowed = true;
+                }
+            }
+        }
+        self.question = None;
         self.notice = None;
     }
 
@@ -1150,6 +1185,14 @@ impl App {
             KeyCode::Char('g') | KeyCode::Home => self.help_offset = 0,
             _ => {}
         }
+    }
+
+    /// A window of the current view's rows, as original row indices — so a very
+    /// large view can be walked a piece at a time without ever building the
+    /// whole list.
+    pub fn view_slice(&self, from: usize, len: usize) -> Vec<usize> {
+        let end = (from + len).min(self.row_count());
+        (from.min(end)..end).map(|i| self.orig_row(i)).collect()
     }
 
     /// Original row indices of the current view, capped at `max` (used to build
@@ -1772,7 +1815,9 @@ impl App {
             KeyCode::BackTab => self.switch_tab = Some(-1),
             KeyCode::Char('w') if ctrl => self.close_tab = true,
             KeyCode::Char('o') => self.enter_input(InputKind::Open),
-            // `w` writes one file's arrangement; `W` writes the whole folder's.
+            // `w` writes one file's arrangement; `W` writes the whole folder's;
+            // `X` writes the table itself.
+            KeyCode::Char('X') => self.enter_input(InputKind::Export),
             KeyCode::Char('W') => self.save_session = true,
             KeyCode::Char('w') if !ctrl => {
                 // Asked before the name, not after: there is no point
@@ -1891,9 +1936,8 @@ impl App {
             self.notice = None;
         }
         // The open prompt browses the filesystem; the others are plain text.
-        if let InputKind::Open = kind
-            && self.handle_open_key(key)
-        {
+        // Both prompts that name a file browse for it.
+        if matches!(kind, InputKind::Open | InputKind::Export) && self.handle_open_key(key, kind) {
             return;
         }
         match key.code {
@@ -1924,7 +1968,7 @@ impl App {
 
     /// Keys specific to the open prompt. Returns `true` when the key was one of
     /// them, so ordinary typing falls through to the shared handler.
-    fn handle_open_key(&mut self, key: KeyEvent) -> bool {
+    fn handle_open_key(&mut self, key: KeyEvent, kind: InputKind) -> bool {
         match key.code {
             // First `Tab` lists the folder (completing as far as it can);
             // afterwards it walks the list.
@@ -1935,7 +1979,7 @@ impl App {
             KeyCode::BackTab => self.step_completion(-1),
             KeyCode::Down => self.step_completion(1),
             KeyCode::Up => self.step_completion(-1),
-            KeyCode::Enter if self.completions.is_some() => self.accept_completion(),
+            KeyCode::Enter if self.completions.is_some() => self.accept_completion(kind),
             // `Esc` puts the picker away first, leaving what was typed.
             KeyCode::Esc if self.completions.is_some() => self.completions = None,
             _ => return false,
@@ -1944,6 +1988,19 @@ impl App {
     }
 
     /// The folder a bare name is taken against: where the file on screen lives.
+    /// Where the prompt now open takes a relative path from. `o` works from
+    /// the file on screen, since that is what you are looking at and near.
+    /// `X` works from the folder lambris was started in: a bare name typed
+    /// there should land where the command was typed, not beside whichever
+    /// input a join happened to start from — which is somewhere the tab itself
+    /// never mentions.
+    fn prompt_dir(&self) -> std::path::PathBuf {
+        match self.mode {
+            Mode::Input(InputKind::Export) => self.folder.clone(),
+            _ => self.base_dir(),
+        }
+    }
+
     pub fn base_dir(&self) -> std::path::PathBuf {
         self.data
             .path
@@ -1961,7 +2018,7 @@ impl App {
     /// the listing is the point, and finishing the path under someone's fingers
     /// would swallow the characters they type next.
     fn open_completions(&mut self, complete: bool) {
-        let listing = Completions::for_input(&self.input, &self.base_dir());
+        let listing = Completions::for_input(&self.input, &self.prompt_dir());
         if complete {
             if let Some(common) = listing.common_prefix() {
                 self.input = common;
@@ -1981,7 +2038,7 @@ impl App {
     }
 
     /// Take the highlighted entry: step into a directory, or open a file.
-    fn accept_completion(&mut self) {
+    fn accept_completion(&mut self, kind: InputKind) {
         let Some(listing) = &self.completions else { return };
         let Some(entry_is_dir) = listing.selected_entry().map(|e| e.is_dir) else {
             return;
@@ -1989,9 +2046,13 @@ impl App {
         let Some(text) = listing.selected_input() else { return };
         self.input = text;
         if entry_is_dir {
-            self.open_completions(false); // list what is inside it
-        } else {
-            self.completions = None;
+            return self.open_completions(false); // list what is inside it
+        }
+        self.completions = None;
+        // Picking an existing file when opening one means open it. When writing
+        // one out it means write over it, which is not something a single key
+        // should set going: it fills the name in and waits.
+        if let InputKind::Open = kind {
             self.commit_input(InputKind::Open);
         }
     }
@@ -2019,7 +2080,7 @@ impl App {
             InputKind::Pattern => Some(self.pattern_bind()),
             // Renaming starts from the name it has now.
             InputKind::ColumnName => Some(self.data.column_names[self.selected_col()].clone()),
-            InputKind::Goto | InputKind::Open | InputKind::Recipe => None,
+            InputKind::Goto | InputKind::Open | InputKind::Recipe | InputKind::Export => None,
         }
         .unwrap_or_default();
     }
@@ -2033,6 +2094,13 @@ impl App {
             InputKind::Goto => return self.goto_line(&query),
             InputKind::Pattern => {
                 self.save_pattern = Some(query.trim().to_string());
+                return;
+            }
+            InputKind::Export => {
+                let name = query.trim();
+                if !name.is_empty() {
+                    self.export_request = Some(name.to_string());
+                }
                 return;
             }
             InputKind::Recipe => return self.take_recipe(query),
@@ -2054,7 +2122,8 @@ impl App {
                 | InputKind::Open
                 | InputKind::Pattern
                 | InputKind::Recipe
-                | InputKind::ColumnName => unreachable!(),
+                | InputKind::ColumnName
+                | InputKind::Export => unreachable!(),
             }
             return;
         }
@@ -2073,7 +2142,8 @@ impl App {
                 | InputKind::Open
                 | InputKind::Pattern
                 | InputKind::Recipe
-                | InputKind::ColumnName => unreachable!(),
+                | InputKind::ColumnName
+                | InputKind::Export => unreachable!(),
         }
     }
 

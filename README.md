@@ -49,6 +49,7 @@ cargo run --release
 | `=` | Summary line: total, mean, sd, mean±sd — hold it to remove (see [Summary line](#summary-line)) |
 | `w` | Remember this arrangement for the file, or for a glob of files (see [Patterns](#patterns)) |
 | `W` | Remember every tab open here (see [Sessions](#sessions)) |
+| `X` | Write this view out to a file (see [Exporting](#exporting)) |
 | `z` / `Z` | Undo / redo the last change to the view (see [Undo](#undo)) |
 | `s` | Sort by the selected column: cycles ascending → descending → unsorted |
 | `S` | Sort by *part* of the selected column (see [Sorting by part of a column](#sorting-by-part-of-a-column)) |
@@ -289,6 +290,75 @@ The search is left out too: it moves the cursor, which makes it navigation rathe
 than part of an arrangement. A pattern is the starting point for a view, not a
 change to walk back from, so `z` will not undo it.
 
+## Exporting
+
+`X` writes the current view out to a file. **The name decides the format**, the
+same way it decides how a file is read when opening one — so there is nothing to
+choose beyond where it goes:
+
+| Name | What is written |
+| --- | --- |
+| `out.csv` | comma-separated |
+| `out.tsv` | tab-separated |
+| `out.parquet` | parquet, types and all |
+| `out.csv.gz` | gzipped, either delimited form |
+
+A bare name lands in the folder `lambris` was started in, and `Tab` browses from
+there — which is not always where the tab's own file lives. A joined tab is the
+case that makes the difference: it was built from files that may sit in
+different subfolders, and nothing on screen says which of them the join started
+from, so resolving a name against it would put the file somewhere you would have
+to go looking for.
+
+What leaves is **the view as arranged**: the columns on display, in the order
+they are displayed, with computed columns included and renamed ones renamed, and
+the rows in the order they are shown — so a filter narrows what is written and a
+sort decides its order. This is what lets the rest of the viewer out: a join, a
+computed column or a `H`-repaired header only pays off in a pipeline if it can
+be written down, and export is the one operation that works the same on every
+kind of tab, including the joined and transposed ones that cannot have a
+pattern.
+
+The *values* leave, not the presentation. A cell clipped to `…` on screen is
+written in full; a gap stays a gap rather than becoming an empty string; column
+widths, the header row's position and the rest of the arrangement have already
+done their work by deciding what is written.
+
+**The summary line does not leave.** `=` shows a reading *of* the rows, not one
+*among* them, and a total written down as a final row stops being a total: it
+reads back as data, turns a numeric column into something a type-guesser has to
+argue about, and is counted a second time by whatever sums the file next. It
+stays on screen, where it says what it means.
+
+Rows are gathered and written a batch at a time, so the size of the view decides
+how long it takes rather than how much memory it needs — a filtered slice of a
+file far too large to hold is written the same way as a small one. `Esc` or
+`Ctrl-C` gives up part way, and the half-written file is removed: half a file is
+worse than none, since it looks like data.
+
+### Writing over something
+
+**Only over its own exports.** A file that is already there is written over in
+one case: this session wrote it, and it has not changed since. Then `X` asks —
+`y` or `n` — and takes the answer.
+
+Anything else is refused. Not asked about: refused. The reason is that lambris
+cannot tell what depends on a file it did not write. A tab open here reads from
+its file as you scroll, a saved session names the files it reopens, and the rest
+of the machine is out of sight entirely — so *may I write over this?* is a
+question the program cannot answer, and putting it to the person at the keyboard
+only passes on a question they cannot answer either. They would be vouching for
+something neither of you knows. The file stays; give the export another name, or
+clear the old one yourself, which is a deliberate act in a way that pressing `y`
+is not.
+
+Two details make "this session wrote it" mean what it says. A file open in a tab
+is caught before that test even runs, with a message that names the reason, and
+paths are compared as the filesystem sees them rather than as they are spelt, so
+a symlink cannot be used to walk around it. And provenance is remembered as size
+and modification time, not merely as a name — if something else takes that name
+in the meantime, the export is refused again.
+
 ## Sessions
 
 A [pattern](#patterns) says how *a kind of file* should look wherever it turns
@@ -334,8 +404,8 @@ saved.
 
 ### On the way out
 
-Once a folder has a session — saved with `W` or reopened from one — quitting
-with unsaved changes asks first:
+Once *this run* belongs to a session — it reopened one, or `W` has been pressed —
+quitting with unsaved changes asks first:
 
 ```
 ┌ session ───────────────────────────────────────┐
@@ -349,10 +419,14 @@ between the work and losing it, so a stray keypress must not decide.
 
 Whether anything *has* changed is worked out by building what `W` would write
 and comparing it with what is stored — there is no flag to keep in step with the
-twenty things that change a view, so it cannot drift. A folder with no session
-has nothing to lose, so an ordinary `lambris file.csv` still quits without a
-word, and moving between tabs or around the table is not a change worth being
-asked about.
+twenty things that change a view, so it cannot drift. Moving between tabs or
+around the table is not a change worth being asked about.
+
+It is the run that matters here, not the folder. `lambris some.csv` in a folder
+that happens to have a session saved is not editing that session: it opened one
+file and named it. Asking on the way out would invite a `y` that quietly
+replaced work the run never opened, and there is no undo for that — so it quits
+without a word, and the saved session waits for the next bare `lambris`.
 
 `--forget-session` drops the one saved for the current folder. Sessions live
 beside the patterns, in `sessions.json`, so nothing is written into the folder
@@ -752,7 +826,8 @@ Core viewer plus regex search, row filtering, type-aware sorting (whole column
 or a slice of one), column freeze, hiding, reordering and resizing columns,
 undo/redo over all of it, computed and renamed columns, a per-column summary
 line, saved per-file arrangements and per-folder sessions, a transposed view,
-joins between tabs, and tabs over several open files or workbook sheets. Nulls are shown as a highlighted `NA`. Sort
+joins between tabs, tabs over several open files or workbook sheets, and writing
+any of it back out as CSV, TSV or parquet. Nulls are shown as a highlighted `NA`. Sort
 composes with the active filter, and the cursor stays on the same record across
 a re-sort.
 

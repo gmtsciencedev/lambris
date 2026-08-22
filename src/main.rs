@@ -1,11 +1,13 @@
 mod app;
 mod browse;
 mod data;
+mod export;
 mod formula;
 mod pattern;
 mod interrupt;
 mod ui;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -88,6 +90,24 @@ fn main() -> Result<()> {
 /// The open files. Each tab owns a stack of views — the base table plus any
 /// transposed views pushed on top — so transposing or filtering one tab leaves
 /// the others untouched, and only the top of the current tab's stack is drawn.
+/// What a file looked like the moment this finished writing it: enough to
+/// recognise it later, and to notice when something else has taken its place.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FileMark {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+impl FileMark {
+    fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self {
+            modified: meta.modified().ok(),
+            len: meta.len(),
+        })
+    }
+}
+
 struct Tabs {
     tabs: Vec<Vec<App>>,
     current: usize,
@@ -99,6 +119,14 @@ struct Tabs {
     folder: PathBuf,
     /// Sessions, one per folder, written back by `W`.
     sessions: Sessions,
+    /// Whether this run belongs to the session saved here: it was started by
+    /// reopening one, or `W` has been pressed. A run that named its files owns
+    /// nothing that was saved, so it has nothing to lose on the way out.
+    session_attached: bool,
+    /// Files this session has written out, and what they looked like when it
+    /// did. This writes over its own work and nothing else, so provenance has
+    /// to be remembered rather than assumed from the name.
+    exported: HashMap<PathBuf, FileMark>,
 }
 
 /// The join wizard: the user walks to a key column and confirms, once on each
@@ -137,6 +165,8 @@ impl Tabs {
             patterns,
             folder: PathBuf::from("."),
             sessions: Sessions::default(),
+            exported: HashMap::new(),
+            session_attached: false,
         };
         for tab in 0..opened.tabs.len() {
             opened.apply_saved_pattern(tab);
@@ -241,6 +271,8 @@ impl Tabs {
             patterns,
             folder: folder.to_path_buf(),
             sessions: Sessions::default(),
+            exported: HashMap::new(),
+            session_attached: true,
         };
         // Transposed tabs are restored by transposing again, which is what the
         // view was in the first place.
@@ -266,6 +298,149 @@ impl Tabs {
         Ok(opened)
     }
 
+    /// Write the current view out to `name`.
+    ///
+    /// What leaves is what is on display: the columns shown, in the order shown,
+    /// with computed ones included and renamed ones renamed, and the rows in
+    /// view order. Written a batch at a time, so the size of the view decides
+    /// how long it takes and not how much memory it needs.
+    fn export(&mut self, name: String, overwrite_allowed: bool) {
+        // From the folder lambris was started in, not from the tab's own file:
+        // a joined tab's `data.path` points at whichever input it was built
+        // from, and nothing on screen says which. `out.parquet` should land
+        // where the command was typed.
+        let path = browse::resolve(&name, &self.folder.clone());
+        let target = match export::Target::for_name(&path) {
+            Ok(target) => target,
+            Err(e) => {
+                self.app_mut().notice = Some(
+                    app::Notice::say("export", format!("{e}"))
+                        .hint("the name decides the format, the way it does when opening one"),
+                );
+                return;
+            }
+        };
+        // Never over a file that is open here: it is being read from as this
+        // writes, and the tab would be left describing something that is gone.
+        //
+        // Compared as the filesystem sees them, not as they are spelt: `/var`
+        // and `/private/var` are the same file on macOS, and a guard that can be
+        // walked round by a symlink is no guard.
+        let same_file = |a: &Path, b: &Path| {
+            let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            real(a) == real(b)
+        };
+        // A name for the file that holds whether or not it exists yet: the
+        // folder as the filesystem sees it, plus the name. `canonicalize` alone
+        // cannot give one, since it fails on a file that is not there.
+        let key_of = |p: &Path| match (p.parent(), p.file_name()) {
+            (Some(dir), Some(name)) => std::fs::canonicalize(dir)
+                .unwrap_or_else(|_| dir.to_path_buf())
+                .join(name),
+            _ => p.to_path_buf(),
+        };
+        let open_here = self
+            .tabs
+            .iter()
+            .flatten()
+            .any(|app| app.data.is_file_backed() && same_file(&app.data.path, &path));
+        if open_here {
+            self.app_mut().notice = Some(
+                app::Notice::say("export", "that file is open in a tab here")
+                    .hint("writing over it would pull the table out from under itself"),
+            );
+            return;
+        }
+        // Whether a file that is already there may be written over turns on
+        // one question: did this session write it? Anything else may be
+        // depended on — by a tab here, by a saved session, by something else on
+        // the machine entirely — and there is no way from here to be sure that
+        // it is not. Putting that as a yes-or-no only hands the question to
+        // someone who cannot answer it either, so it is not asked: the file
+        // stays, and the export is refused.
+        if path.exists() {
+            let ours = FileMark::of(&path)
+                .zip(self.exported.get(&key_of(&path)).copied())
+                .is_some_and(|(now, then)| now == then);
+            if !ours {
+                self.app_mut().notice = Some(
+                    app::Notice::say(
+                        "export",
+                        format!(
+                            "{} is already there, and this session did not write it",
+                            path.display()
+                        ),
+                    )
+                    .hint(
+                        "this writes over its own exports and nothing else — \
+                         give it another name, or clear that one yourself",
+                    ),
+                );
+                return;
+            }
+            // Its own work, written earlier in this session and so known to
+            // hold nothing that anything here reads. Worth confirming all the
+            // same, since it is still a file about to be lost.
+            if !overwrite_allowed {
+                let app = self.app_mut();
+                app.question = Some(app::Question::Overwrite(path.clone()));
+                app.notice = Some(app::Notice::ask(
+                    "export",
+                    format!("{} is one this session wrote earlier", path.display()),
+                    " y write over it · n / Esc leave it ",
+                ));
+                return;
+            }
+        }
+
+        let app = self.app_mut();
+        let (total, cols) = (app.row_count(), app.visible_cols().to_vec());
+        let schema = app.data.schema_for(&cols);
+        let written = (|| -> Result<Option<usize>> {
+            let mut out = export::Export::create(&path, target, schema)?;
+            let mut rows_out = 0;
+            for start in (0..total).step_by(export::BATCH) {
+                if interrupt::requested() {
+                    return Ok(None);
+                }
+                let rows = app.view_slice(start, export::BATCH);
+                out.write(&app.data.gather(&rows, &cols)?)?;
+                rows_out += rows.len();
+            }
+            out.finish()?;
+            Ok(Some(rows_out))
+        })();
+        let message = match written {
+            Ok(Some(rows)) => {
+                // Remembered as it now stands, so that a second export to the
+                // same name is recognised as its own — and so that a file
+                // something else has since put there is not.
+                if let Some(mark) = FileMark::of(&path) {
+                    self.exported.insert(key_of(&path), mark);
+                }
+                format!(
+                    "wrote {rows} rows × {} cols to {} as {}",
+                    cols.len(),
+                    path.display(),
+                    target.label()
+                )
+            }
+            // Half a file is worse than none: it looks like data.
+            Ok(None) => {
+                interrupt::take();
+                export::abandon(&path);
+                self.exported.remove(&key_of(&path));
+                "export cancelled".to_string()
+            }
+            Err(e) => {
+                export::abandon(&path);
+                self.exported.remove(&key_of(&path));
+                format!("export failed: {e}")
+            }
+        };
+        self.app_mut().status_msg = Some(message);
+    }
+
     /// Remember every tab open here, so `lambris` alone reopens them.
     ///
     /// A joined tab is written down as the two tabs and key columns it was made
@@ -285,6 +460,9 @@ impl Tabs {
         self.sessions.put(session);
         let message = match self.sessions.save() {
             Ok(()) => {
+                // From here on this run owns what is saved here, so leaving
+                // with it changed is worth a word.
+                self.session_attached = true;
                 let note = match lost {
                     0 => String::new(),
                     n => format!(" · {n} left out"),
@@ -299,12 +477,20 @@ impl Tabs {
     /// Whether what is open now differs from what was last saved for this
     /// folder — worked out by building what `W` would write and comparing it,
     /// so there is no flag to keep in step with the twenty things that change a
-    /// view. `false` when the folder has no session: an ordinary run of the
-    /// viewer has nothing to lose.
+    /// view.
+    ///
+    /// `false` unless this run belongs to that session — it reopened one, or
+    /// `W` has been pressed. `lambris some.csv` in a folder that happens to
+    /// have a session saved is not editing that session and must not be asked
+    /// about it on the way out: the answer `y` would quietly replace work the
+    /// run never opened.
     ///
     /// Which tab is in front is left out of the comparison: looking at another
     /// tab is not work worth being asked about on the way out.
     fn session_changed(&self) -> bool {
+        if !self.session_attached {
+            return false;
+        }
         let Some(saved) = self.sessions.for_folder(&self.folder) else {
             return false;
         };
@@ -392,8 +578,10 @@ impl Tabs {
     /// running — which changes what `Enter` and `Esc` mean.
     fn key(&mut self, key: crossterm::event::KeyEvent) {
         let active = self.join.is_some();
+        let folder = self.folder.clone();
         let app = self.app_mut();
         app.join_active = active;
+        app.folder = folder;
         app.handle_key(key);
     }
 
@@ -453,6 +641,8 @@ impl Tabs {
         let toggle_header = std::mem::take(&mut app.toggle_header);
         let save_pattern = app.save_pattern.take();
         let save_session = std::mem::take(&mut app.save_session);
+        let export_request = app.export_request.take();
+        let overwrite_allowed = std::mem::take(&mut app.overwrite_allowed);
         let promote_header = std::mem::take(&mut app.promote_header);
         let join_request = std::mem::take(&mut app.join_request);
         let confirm = std::mem::take(&mut app.confirm);
@@ -489,6 +679,9 @@ impl Tabs {
         }
         if save_session {
             self.remember_session();
+        }
+        if let Some(name) = export_request {
+            self.export(name, overwrite_allowed);
         }
         if join_request {
             self.join = Some(JoinWizard { left: None });
@@ -534,7 +727,7 @@ impl Tabs {
                 return false;
             }
             let app = self.app_mut();
-            app.quit_question = true;
+            app.question = Some(app::Question::LoseSession);
             app.notice = Some(app::Notice::ask(
                 "session",
                 "this session has changed since it was saved",
@@ -2091,52 +2284,362 @@ mod tests {
         assert!(app.sort.is_some(), "and it is still sorted");
     }
 
+    /// Drive the `X` prompt to write the current view somewhere.
+    fn export_to(tabs: &mut Tabs, path: &Path) {
+        tabs.key(key('X'));
+        type_str(tabs.app_mut(), path.to_str().unwrap());
+        tabs.key(KeyEvent::from(KeyCode::Enter));
+        assert!(tabs.step());
+    }
+
+    /// Read a written file back as its own dataset.
+    fn read_back(path: &Path) -> Dataset {
+        Dataset::load(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
+    }
+
+    #[test]
+    fn exporting_writes_the_view_as_it_is_arranged() {
+        let (folder, _) = project();
+        let tsv = "sample\treads\tjunk\nS2\t2500\tx\nS1\t4300\ty\n";
+        let file = write_text_fixture("tsv", tsv);
+        let mut tabs = Tabs::open(
+            std::slice::from_ref(&file),
+            HeaderSpec::default(),
+            Store::default(),
+        )
+        .unwrap();
+
+        // Arrange it: a computed column, a rename, a hidden column, a sort.
+        add_column(tabs.app_mut(), 'f', "{reads} / 100", "hundreds");
+        tabs.app_mut().selected_pos = 2;
+        tabs.key(key('x')); // hide junk
+        tabs.app_mut().selected_pos = 0;
+        tabs.key(key('R'));
+        for _ in 0.."sample".len() {
+            tabs.key(KeyEvent::from(KeyCode::Backspace));
+        }
+        type_str(tabs.app_mut(), "id");
+        tabs.key(KeyEvent::from(KeyCode::Enter));
+        tabs.key(key('s')); // sort by id
+
+        let out = folder.join("out.tsv");
+        export_to(&mut tabs, &out);
+        let msg = tabs.app_mut().status_msg.clone().unwrap_or_default();
+        assert!(msg.contains("wrote 2 rows × 3 cols"), "unexpected: {msg}");
+
+        // What comes back is what was on screen: renamed, computed, without the
+        // hidden column, in the order it was sorted into.
+        let written = read_back(&out);
+        assert_eq!(written.column_names, vec!["id", "reads", "hundreds"]);
+        assert_eq!(written.nrows, 2);
+        assert_eq!(written.cell_display(0, 0).unwrap().as_deref(), Some("S1"));
+        assert_eq!(written.cell_display(2, 0).unwrap().as_deref(), Some("43"));
+        assert_eq!(written.cell_display(0, 1).unwrap().as_deref(), Some("S2"));
+        // A tsv, because that is what the name said.
+        assert!(std::fs::read_to_string(&out).unwrap().contains('\t'));
+    }
+
+    #[test]
+    fn the_name_decides_the_format() {
+        let (folder, _) = project();
+        let file = write_text_fixture("csv", "a,b\n1,x\n2,y\n");
+        let mut tabs = Tabs::open(
+            std::slice::from_ref(&file),
+            HeaderSpec::default(),
+            Store::default(),
+        )
+        .unwrap();
+
+        for name in ["out.csv", "out.tsv", "out.parquet", "out.csv.gz"] {
+            let out = folder.join(name);
+            export_to(&mut tabs, &out);
+            let msg = tabs.app_mut().status_msg.clone().unwrap_or_default();
+            assert!(msg.contains("wrote 2 rows"), "{name}: {msg}");
+            // Every one of them reads back as the same table.
+            let written = read_back(&out);
+            assert_eq!(written.column_names, vec!["a", "b"], "{name}");
+            assert_eq!(written.nrows, 2, "{name}");
+            assert_eq!(
+                written.cell_display(1, 1).unwrap().as_deref(),
+                Some("y"),
+                "{name}"
+            );
+        }
+        // Types survive a round trip through parquet, which carries them.
+        let written = read_back(&folder.join("out.parquet"));
+        assert_eq!(written.column_types[0], "Int64");
+
+        // A name that says nothing, or something unwritable, is refused.
+        for (name, expected) in [
+            ("out", "give the name an extension"),
+            ("out.docx", "is not something this can write"),
+            ("out.parquet.gz", "holds its own compression"),
+        ] {
+            let out = folder.join(name);
+            export_to(&mut tabs, &out);
+            let notice = tabs.app_mut().notice.clone().expect("a notice");
+            assert!(
+                notice.message.contains(expected),
+                "{name}: {}",
+                notice.message
+            );
+            assert!(!out.exists(), "{name} should not have been created");
+            tabs.key(key('j')); // dismiss
+        }
+    }
+
+    #[test]
+    fn a_bare_export_name_lands_where_lambris_was_started() {
+        let (folder, _) = project();
+        let sub = folder.join("S18572");
+        std::fs::create_dir_all(&sub).unwrap();
+        let file = sub.join("a.csv");
+        std::fs::write(&file, "k,v\nx,1\n").unwrap();
+        let mut tabs = Tabs::open(
+            std::slice::from_ref(&file),
+            HeaderSpec::default(),
+            Store::default(),
+        )
+        .unwrap();
+        tabs.folder = folder.clone();
+
+        // `Tab` browses from the folder the command was typed in, not from the
+        // subfolder this tab's file happens to sit in.
+        tabs.key(key('X'));
+        tabs.key(KeyEvent::from(KeyCode::Tab));
+        let text = buffer_text(tabs.app_mut(), 80, 16);
+        assert!(text.contains("S18572"), "listed the wrong folder: {text}");
+        // One Esc puts the listing away, a second the prompt.
+        tabs.key(KeyEvent::from(KeyCode::Esc));
+        tabs.key(KeyEvent::from(KeyCode::Esc));
+
+        // And a bare name lands there, matching what was listed. A joined tab
+        // is the case that made this matter: its `data.path` points at one of
+        // its inputs, which may be anywhere and is named nowhere on screen.
+        export_to(&mut tabs, Path::new("out.csv"));
+        assert!(folder.join("out.csv").exists(), "where the command was typed");
+        assert!(!sub.join("out.csv").exists(), "not beside the tab's own file");
+    }
+
+    #[test]
+    fn the_summary_line_is_a_reading_and_does_not_leave() {
+        let (folder, _) = project();
+        let file = write_text_fixture("csv", "sample,reads\nS1,10\nS2,20\n");
+        let mut tabs = Tabs::open(
+            std::slice::from_ref(&file),
+            HeaderSpec::default(),
+            Store::default(),
+        )
+        .unwrap();
+
+        tabs.app_mut().selected_pos = 1;
+        tabs.key(key('='));
+        assert!(tabs.app_mut().summary.is_some(), "the line is on");
+
+        let out = folder.join("summed.csv");
+        export_to(&mut tabs, &out);
+        // The 30 on screen is a reading of the rows, not one of them. A total
+        // written as a row comes back as data, and poisons every sum after it.
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "sample,reads\nS1,10\nS2,20\n");
+    }
+
+    #[test]
+    fn exporting_writes_over_its_own_work_and_nothing_else() {
+        let (folder, _) = project();
+        let file = write_text_fixture("csv", "a\n1\n");
+        let mut tabs = Tabs::open(
+            std::slice::from_ref(&file),
+            HeaderSpec::default(),
+            Store::default(),
+        )
+        .unwrap();
+
+        // Never over a file open here, whatever the answer would have been.
+        export_to(&mut tabs, &file);
+        let notice = tabs.app_mut().notice.clone().expect("a notice");
+        assert!(
+            notice.message.contains("open in a tab here"),
+            "{}",
+            notice.message
+        );
+        assert!(tabs.app_mut().question.is_none(), "not even asked");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "a\n1\n",
+            "untouched"
+        );
+        tabs.key(key('j'));
+
+        // Nor over anything else that was there first. Something may be reading
+        // it — a tab, a saved session, another program — and nothing here can
+        // tell. So it is not offered as a choice; it is refused.
+        let taken = folder.join("taken.csv");
+        std::fs::write(&taken, "keep me\n").unwrap();
+        export_to(&mut tabs, &taken);
+        let notice = tabs.app_mut().notice.clone().expect("a notice");
+        assert!(
+            notice.message.contains("this session did not write it"),
+            "{}",
+            notice.message
+        );
+        assert!(tabs.app_mut().question.is_none(), "not offered");
+        assert_eq!(std::fs::read_to_string(&taken).unwrap(), "keep me\n");
+        // Said in the middle of the screen, with the way out, not in passing.
+        let text = buffer_text(tabs.app_mut(), 80, 16);
+        assert!(text.contains("clear that one yourself"), "drawn: {text}");
+        tabs.key(key('j'));
+
+        // Its own work is the one case it can be sure about. Written first
+        // without a question, since nothing was there.
+        let out = folder.join("out.csv");
+        export_to(&mut tabs, &out);
+        assert!(tabs.app_mut().question.is_none(), "nothing to ask about yet");
+        assert_eq!(read_back(&out).column_names, vec!["a"]);
+
+        // Now the view changes, so what a second export would write differs
+        // from what is on disk, and the answer shows.
+        add_column(tabs.app_mut(), 'f', "{a} * 2", "b");
+        export_to(&mut tabs, &out);
+        // Canonical, since that is how the target was resolved.
+        let asked = match tabs.app_mut().question.clone() {
+            Some(app::Question::Overwrite(path)) => path,
+            other => panic!("expected an overwrite question, got {other:?}"),
+        };
+        assert_eq!(asked, std::fs::canonicalize(&out).unwrap());
+
+        // `n` leaves the earlier one standing.
+        tabs.key(key('n'));
+        assert!(tabs.step());
+        assert_eq!(read_back(&out).column_names, vec!["a"]);
+
+        // `y` writes over it.
+        export_to(&mut tabs, &out);
+        tabs.key(key('y'));
+        assert!(tabs.step());
+        assert_eq!(read_back(&out).column_names, vec!["a", "b"]);
+
+        // And if something else takes that name in the meantime, it is no
+        // longer this session's to write over, whatever the name says.
+        std::fs::write(&out, "not yours anymore\n").unwrap();
+        export_to(&mut tabs, &out);
+        let notice = tabs.app_mut().notice.clone().expect("a notice");
+        assert!(
+            notice.message.contains("this session did not write it"),
+            "{}",
+            notice.message
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "not yours anymore\n"
+        );
+    }
+
+    #[test]
+    fn exporting_a_join_and_a_filtered_view() {
+        // Export is the one thing that works the same on every kind of tab —
+        // which is what lets a join out of the viewer at all.
+        let (folder, _) = project();
+        let left = write_text_fixture("csv", "k,v\nx,1\ny,2\n");
+        let right = write_text_fixture("csv", "k,w\nx,9\n");
+        let mut tabs = Tabs::open(&[left, right], HeaderSpec::default(), Store::default()).unwrap();
+        run_wizard(&mut tabs, 0, 1, 0);
+
+        let out = folder.join("joined.csv");
+        export_to(&mut tabs, &out);
+        let written = read_back(&out);
+        assert_eq!(written.column_names, vec!["k", "v", "w"]);
+        assert_eq!(written.nrows, 2, "a left join keeps the unmatched row");
+        assert!(written.is_null(2, 1), "and its gap stays a gap");
+
+        // A filter narrows what leaves, since the rows on display are the rows
+        // written.
+        tabs.key(key('&'));
+        type_str(tabs.app_mut(), "^x$");
+        tabs.key(KeyEvent::from(KeyCode::Enter));
+        let out = folder.join("filtered.csv");
+        export_to(&mut tabs, &out);
+        assert_eq!(read_back(&out).nrows, 1);
+    }
+
     #[test]
     fn quitting_with_a_changed_session_asks_first() {
         let (folder, store) = project();
         std::fs::write(folder.join("a.csv"), "k,v\nx,1\ny,2\n").unwrap();
         let files = vec![folder.join("a.csv")];
-        let open = |store: &PathBuf| {
+        // A run that names its files: it owns nothing that was saved here.
+        let named = |store: &PathBuf| {
             let mut tabs =
                 Tabs::open(&files, HeaderSpec::default(), Store::default()).unwrap();
             tabs.folder = folder.clone();
             tabs.sessions = Sessions::load_at(store.clone());
             tabs
         };
+        // A run that reopened what was saved here, and so is editing it.
+        let restored = |store: &PathBuf| {
+            let sessions = Sessions::load_at(store.clone());
+            let mut tabs =
+                Tabs::reopen(&folder, &sessions, HeaderSpec::default(), Store::default())
+                    .unwrap();
+            tabs.folder = folder.clone();
+            tabs.sessions = sessions;
+            tabs
+        };
 
         // With nothing saved for this folder there is nothing to lose, so an
         // ordinary run quits without a word.
-        let mut tabs = open(&store);
+        let mut tabs = named(&store);
         tabs.key(key('x'));
         tabs.key(key('q'));
         assert!(!tabs.step(), "no session here, so no question");
 
-        // Once saved, quitting unchanged is still silent.
-        let mut tabs = open(&store);
+        // `W` saves, and takes this run on: quitting unchanged is still silent.
+        let mut tabs = named(&store);
         tabs.key(key('W'));
         assert!(tabs.step());
         tabs.key(key('q'));
         assert!(!tabs.step(), "nothing has changed since");
 
-        // Change something, and it asks.
-        let mut tabs = open(&store);
+        // …and changing something after `W` is worth a word.
         tabs.key(key('x'));
         tabs.key(key('q'));
         assert!(tabs.step(), "quitting is held up");
-        assert!(tabs.app_mut().quit_question);
+        assert_eq!(tabs.app_mut().question, Some(app::Question::LoseSession));
+        tabs.key(KeyEvent::from(KeyCode::Esc));
+        assert!(tabs.step());
+
+        // But a run that named its files is not editing the session, however
+        // much it differs from it. Being asked here invites a `y` that would
+        // replace work this run never opened.
+        let mut tabs = named(&store);
+        tabs.key(key('x'));
+        tabs.key(key('q'));
+        assert!(!tabs.step(), "not this run's session to lose");
+        let saved = Sessions::load_at(store.clone());
+        assert_eq!(
+            saved.for_folder(&folder).expect("still there").tabs[0].view.hidden,
+            Vec::<String>::new(),
+            "and nothing of it was touched"
+        );
+
+        // Reopened, changed: now it asks.
+        let mut tabs = restored(&store);
+        tabs.key(key('x'));
+        tabs.key(key('q'));
+        assert!(tabs.step(), "quitting is held up");
+        assert_eq!(tabs.app_mut().question, Some(app::Question::LoseSession));
         let text = buffer_text(tabs.app_mut(), 80, 16);
         assert!(text.contains("changed since it was saved"), "{text}");
         assert!(text.contains("y save · n discard"), "and how to answer: {text}");
 
         // A key that is not an answer decides nothing.
         tabs.key(key('j'));
-        assert!(tabs.app_mut().quit_question, "still asking");
+        assert!(tabs.app_mut().question.is_some(), "still asking");
         assert!(tabs.step());
 
         // Esc goes back to the table, with the change still there.
         tabs.key(KeyEvent::from(KeyCode::Esc));
         assert!(tabs.step(), "still running");
-        assert!(!tabs.app_mut().quit_question);
+        assert!(tabs.app_mut().question.is_none());
         assert!(tabs.app_mut().notice.is_none());
         assert_eq!(tabs.app_mut().visible_cols(), &[1], "the change is kept");
 
@@ -2150,7 +2653,7 @@ mod tests {
         assert_eq!(session.tabs[0].view.hidden, Vec::<String>::new(), "not saved");
 
         // `y` saves on the way out.
-        let mut tabs = open(&store);
+        let mut tabs = restored(&store);
         tabs.key(key('x'));
         tabs.key(key('q'));
         assert!(tabs.step());

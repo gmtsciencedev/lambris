@@ -1017,6 +1017,52 @@ impl Dataset {
         Ok(out)
     }
 
+    /// The schema of a chosen set of columns, as the viewer shows them —
+    /// renamed, and including any that are worked out here.
+    pub fn schema_for(&self, cols: &[usize]) -> SchemaRef {
+        let fields: Vec<Field> = cols
+            .iter()
+            .map(|&c| self.schema.field(c).as_ref().clone())
+            .collect();
+        Arc::new(Schema::new(fields))
+    }
+
+    /// The given rows and columns as one batch, gathered from the chunks they
+    /// live in rather than from a copy of the table — so writing out a slice of
+    /// a very large view costs only the slice.
+    ///
+    /// `rows` are original row indices in the order wanted, so a sorted or
+    /// filtered view comes out in the order it is being shown.
+    pub fn gather(&self, rows: &[usize], cols: &[usize]) -> Result<RecordBatch> {
+        let schema = self.schema_for(cols);
+        if rows.is_empty() {
+            return Ok(RecordBatch::new_empty(schema));
+        }
+        // Each chunk the rows touch, loaded once however scattered they are.
+        let mut needed: Vec<usize> = rows.iter().map(|r| r / CHUNK).collect();
+        needed.sort_unstable();
+        needed.dedup();
+        let mut slot_of = HashMap::with_capacity(needed.len());
+        let mut chunks = Vec::with_capacity(needed.len());
+        for k in needed {
+            slot_of.insert(k, chunks.len());
+            chunks.push(self.chunk(k)?);
+        }
+        let picks: Vec<(usize, usize)> = rows
+            .iter()
+            .map(|&r| (slot_of[&(r / CHUNK)], r % CHUNK))
+            .collect();
+        let mut columns = Vec::with_capacity(cols.len());
+        for &col in cols {
+            let arrays: Vec<&dyn Array> = chunks.iter().map(|b| b.column(col).as_ref()).collect();
+            columns.push(
+                arrow::compute::interleave(&arrays, &picks)
+                    .with_context(|| format!("gathering {}", self.column_names[col]))?,
+            );
+        }
+        RecordBatch::try_new(schema, columns).context("gathering rows")
+    }
+
     /// Materialise one whole column into a single array (used for sorting).
     /// Returns `None` if `cancel` fires while reading chunks.
     fn full_column(&self, col: usize, cancel: &dyn Fn() -> bool) -> Result<Option<ArrayRef>> {
