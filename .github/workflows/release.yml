@@ -1,0 +1,147 @@
+name: release
+
+# Tagging is what publishes. `git push --follow-tags` after a version bump
+# builds the binaries and hangs them off the GitHub release.
+on:
+  push:
+    tags: ["v*"]
+  # …and by hand, for a tag pushed before this workflow existed.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The tag to build and attach binaries to
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  binaries:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          # musl rather than gnu: statically linked, so it runs on cluster
+          # nodes whose glibc is a decade old, which is where the big files are.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+      # parquet's zstd is C, so a musl build needs a musl C compiler.
+      - name: Install the musl C toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          name="lambris-${tag}-${{ matrix.target }}"
+          mkdir -p "$name"
+          cp "target/${{ matrix.target }}/release/lambris" README.md LICENSE "$name/"
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: lambris-*.tar.gz*
+
+  # A .deb for `apt install ./lambris_*.deb`, which is most of the good of
+  # being in Debian without the years. Built with dpkg-deb, already on the
+  # runner, rather than another tool to trust: a .deb is an ar archive with a
+  # control file, and doing it plainly is a dozen lines.
+  deb:
+    name: deb (amd64)
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: x86_64-unknown-linux-musl
+      - name: Build the package
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          # Swap this for a role address if a personal one should not sit in
+          # package metadata.
+          MAINTAINER: GMT Science <raynald.delahondes@gmt.bio>
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          tar xzf "lambris-${TAG}-x86_64-unknown-linux-musl.tar.gz"
+          root=deb/lambris_${version}_amd64
+          mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/share/doc/lambris"
+          install -m 755 "lambris-${TAG}-x86_64-unknown-linux-musl/lambris" "$root/usr/bin/lambris"
+          install -m 644 README.md LICENSE "$root/usr/share/doc/lambris/"
+          # Written line by line rather than with a heredoc: this script is
+          # indented inside the workflow file, and a control field must start
+          # at column 0 while a continuation line must start with exactly one
+          # space. Statically linked, so it depends on nothing.
+          {
+            echo "Package: lambris"
+            echo "Version: ${version}"
+            echo "Section: utils"
+            echo "Priority: optional"
+            echo "Architecture: amd64"
+            echo "Maintainer: ${MAINTAINER}"
+            echo "Homepage: https://github.com/${{ github.repository }}"
+            echo "Description: Terminal viewer for parquet, CSV/TSV and Excel files"
+            echo " Reads big files lazily, joins and crops them, works out new"
+            echo " columns, writes the result out, and can put the whole session"
+            echo " down as a script that does it again."
+          } > "$root/DEBIAN/control"
+          dpkg-deb --build --root-owner-group "$root"
+          mv "$root.deb" .
+          shasum -a 256 lambris_*.deb > lambris_${version}_amd64.deb.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: lambris_*.deb*
+
+  attach:
+    name: attach to the release
+    needs: [binaries, deb]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ls -l dist
+          # The release may already exist — a tag can be pushed before this
+          # workflow runs, or run again to replace a bad build.
+          if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* -R "$REPO" --clobber
+          else
+            gh release create "$TAG" dist/* -R "$REPO" --title "$TAG" --generate-notes
+          fi

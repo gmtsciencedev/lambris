@@ -1517,10 +1517,11 @@ impl ChunkCache {
     }
 
     fn put(&mut self, k: usize, batch: Arc<RecordBatch>) {
-        if self.map.insert(k, batch).is_none() && self.map.len() > self.capacity {
-            if let Some(evict) = self.order.pop_front() {
-                self.map.remove(&evict);
-            }
+        if self.map.insert(k, batch).is_none()
+            && self.map.len() > self.capacity
+            && let Some(evict) = self.order.pop_front()
+        {
+            self.map.remove(&evict);
         }
         self.touch(k);
     }
@@ -1974,7 +1975,7 @@ fn build_index_from(path: &Path, data_start: u64) -> Result<(Vec<u64>, usize)> {
                 b'\n' if !in_quotes => {
                     rows += 1;
                     // `pos` is now the start of the next row.
-                    if rows % CHUNK == 0 {
+                    if rows.is_multiple_of(CHUNK) {
                         offsets.push(pos);
                     }
                     record_has_content = false;

@@ -1,8 +1,25 @@
 [package]
 name = "lambris"
-version = "0.9.1"
+version = "0.9.2"
 edition = "2024"
+# The oldest toolchain this is known to build on. Declared so an older one
+# says so, rather than failing with a page of syntax errors.
+rust-version = "1.89"
 license = "MIT"
+description = "A terminal viewer for parquet, CSV/TSV and Excel files, with joins, computed columns, crops and a script language"
+repository = "https://github.com/gmtsciencedev/lambris"
+homepage = "https://github.com/gmtsciencedev/lambris"
+readme = "README.md"
+keywords = ["csv", "parquet", "tsv", "excel", "tui"]
+categories = ["command-line-utilities", "science", "visualization"]
+# Sample and benchmark data are not part of what is published. They are already
+# untracked, and cargo packages what git tracks, but saying so costs nothing.
+exclude = ["/big.*", "/sample*"]
+
+[profile.release]
+# What is shipped is downloaded far more often than it is debugged, and a
+# backtrace from a release build is not much use anyway.
+strip = true
 
 [dependencies]
 anyhow = "1.0.103"
