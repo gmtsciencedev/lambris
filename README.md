@@ -51,6 +51,7 @@ cargo run --release
 | `w` | Remember this arrangement for the file, or for a glob of files (see [Patterns](#patterns)) |
 | `W` | Remember every tab open here (see [Sessions](#sessions)) |
 | `X` | Write this view out to a file (see [Exporting](#exporting)) |
+| `M` | Write this session down as a script that can do it again (see [Macros](#macros)) |
 | `z` / `Z` | Undo / redo the last change to the view (see [Undo](#undo)) |
 | `s` | Sort by the selected column: cycles ascending → descending → unsorted |
 | `S` | Sort by *part* of the selected column (see [Sorting by part of a column](#sorting-by-part-of-a-column)) |
@@ -398,6 +399,108 @@ paths are compared as the filesystem sees them rather than as they are spelt, so
 a symlink cannot be used to walk around it. And provenance is remembered as size
 and modification time, not merely as a name — if something else takes that name
 in the meantime, the export is refused again.
+
+## Macros
+
+An export is the end of a cascade: you opened files, read a header properly,
+worked out a column, joined, cropped, sorted, filtered — and then wrote a file.
+`M` writes that cascade down as a **script**, which lambris can run again on
+other data.
+
+```sh
+#!/usr/bin/env lambris
+open meta.csv as meta
+hide meta junk
+sort meta sample
+open depth.csv as depth
+join meta.sample with depth.sample as joined
+compute joined ratio = "{reads} / {depth}"
+filter joined /^S[12]/
+export joined to out.csv
+```
+
+`M` asks for a name the way `X` does — bare names land in the folder lambris
+was started in, `Tab` browses, and a name with no extension gets `.lam`. After
+an export the status bar says so: *`… · M saves this as a macro`*.
+
+### Running one
+
+**Naming a `.lam` file runs it**, the same way naming a `.parquet` reads
+parquet — the name decides, here as everywhere:
+
+```sh
+lambris report.lam                 # run it
+lambris report.lam march.tsv       # with $1 = march.tsv
+chmod +x report.lam && ./report.lam march.tsv
+```
+
+That last one is why the extension decides rather than a flag: a shebang can
+carry only the interpreter, so `#!/usr/bin/env lambris` has to be enough on its
+own. `$1`, `$2` … stand for the arguments after the script, and are put in after
+the line has been broken into words — a path with a space or a quote in it
+arrives as one value and cannot turn into more syntax.
+
+Nothing is drawn. A script is a *transformation*; [patterns](#patterns) are the
+tool for looking at something.
+
+### What is in one
+
+A script is a **declaration, not a recording of keystrokes**. Each line states
+something true of the finished view rather than an action that only means
+something from a particular starting point — so running it twice does what
+running it once did. Order matters exactly where it genuinely does: a rename
+changes the name later lines use, a computed column may refer to an earlier one,
+and `header` changes what everything else refers to.
+
+What it carries is what an export carries: **the values, as arranged**. Widths,
+frozen columns, the row-number gutter, numeric styles and the summary line
+cannot change a written file, so they are not in a script. That is not a
+separate judgement — it is the line `X` already draws.
+
+| | |
+| --- | --- |
+| `open "f.xlsx" sheet "S1" as h` | a file, under a name to refer to it by |
+| `header h row 2` / `header h none` | where the column names are |
+| `extract h name from col /re/` | a column pulled out with a regex |
+| `compute h name = "{a} / {b}"` | a column worked out |
+| `rename h old to new` | |
+| `hide h a b` / `columns h a b c` | out of the way / exactly these, in order |
+| `sort h col [desc] [chars 1..4 nat]` | |
+| `filter h /re/` | |
+| `mask h col "v"` / `mask h rows 4` | |
+| `join a.k with b.k as h` | |
+| `crop h rows col "a".."b" cols x y as c` | |
+| `transpose h` | |
+| `export h to out.parquet` | |
+
+Tabs are named, never numbered, so lines can be moved and read. `#` starts a
+comment, `;` separates statements on a line.
+
+### Strict, where the viewer is forgiving
+
+A pattern naming a column that has gone is skipped so the rest still applies —
+right in front of someone who can see what happened. A script runs unattended,
+where a sort quietly not happening puts out a file that looks right and is not.
+So a script **stops**, naming the line:
+
+```
+Error: in report.lam
+
+Caused by:
+    line 2: `meta` has no column called `smaple`
+```
+
+Exit status is non-zero, and each file written is named on stdout.
+
+Two things follow from a script being a rule rather than a snapshot. A crop
+carries no row count — the count is a check worth making when reopening the
+same data, and meaningless when the point is that the data has moved on. And an
+export writes over whatever is at that name: a script that could not write its
+own output twice could only ever be run once.
+
+`M` warns about the one thing that does not travel well — masks taken with no
+sort are row numbers, and will hide *those rows* of whatever the script runs on.
+[Sort first](#masking-rows) and the mask is by value, and portable.
 
 ## Sessions
 

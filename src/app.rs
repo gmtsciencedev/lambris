@@ -74,6 +74,8 @@ pub enum InputKind {
     ColumnName,
     /// Where to write this view out to.
     Export,
+    /// What to call the script this session would be.
+    Macro,
 }
 
 /// The rectangle a crop covers: a run of view rows and a run of columns, both
@@ -519,6 +521,11 @@ pub struct App {
     pub save_pattern: Option<String>,
     /// A name typed at the `X` prompt: write this view out there.
     pub export_request: Option<String>,
+    /// A macro asked for, by the name to write it under.
+    pub macro_request: Option<String>,
+    /// Where this tab has been written out to this run, in order — what the
+    /// `export` lines of a macro are made from.
+    pub exports: Vec<String>,
     /// Set when writing over a file that is already there has been agreed to.
     pub overwrite_allowed: bool,
     /// Set by `W`: remember every tab open here. The loop owns the tabs, so it
@@ -627,6 +634,8 @@ impl App {
             open_request: None,
             save_pattern: None,
             export_request: None,
+            macro_request: None,
+            exports: Vec::new(),
             overwrite_allowed: false,
             save_session: false,
             origin: None,
@@ -2039,6 +2048,9 @@ impl App {
             // `w` writes one file's arrangement; `W` writes the whole folder's;
             // `X` writes the table itself.
             KeyCode::Char('X') => self.enter_input(InputKind::Export),
+            // `M` writes down what this session did, as a script that can do
+            // it again to other data.
+            KeyCode::Char('M') => self.enter_input(InputKind::Macro),
             KeyCode::Char('W') => self.save_session = true,
             KeyCode::Char('w') if !ctrl => {
                 // Asked before the name, not after: there is no point
@@ -2168,7 +2180,9 @@ impl App {
         }
         // The open prompt browses the filesystem; the others are plain text.
         // Both prompts that name a file browse for it.
-        if matches!(kind, InputKind::Open | InputKind::Export) && self.handle_open_key(key, kind) {
+        if matches!(kind, InputKind::Open | InputKind::Export | InputKind::Macro)
+            && self.handle_open_key(key, kind)
+        {
             return;
         }
         match key.code {
@@ -2227,7 +2241,7 @@ impl App {
     /// never mentions.
     fn prompt_dir(&self) -> std::path::PathBuf {
         match self.mode {
-            Mode::Input(InputKind::Export) => self.folder.clone(),
+            Mode::Input(InputKind::Export) | Mode::Input(InputKind::Macro) => self.folder.clone(),
             _ => self.base_dir(),
         }
     }
@@ -2264,7 +2278,12 @@ impl App {
         // purpose — it got us to the folder — so it goes rather than sitting
         // there saying nothing starts with the name of a file that does not
         // exist yet, with Enter caught on a pick that will never come.
-        if listing.entries.is_empty() && matches!(self.mode, Mode::Input(InputKind::Export)) {
+        if listing.entries.is_empty()
+            && matches!(
+                self.mode,
+                Mode::Input(InputKind::Export) | Mode::Input(InputKind::Macro)
+            )
+        {
             self.completions = None;
             return;
         }
@@ -2320,7 +2339,11 @@ impl App {
             InputKind::Pattern => Some(self.pattern_bind()),
             // Renaming starts from the name it has now.
             InputKind::ColumnName => Some(self.data.column_names[self.selected_col()].clone()),
-            InputKind::Goto | InputKind::Open | InputKind::Recipe | InputKind::Export => None,
+            InputKind::Goto
+            | InputKind::Open
+            | InputKind::Recipe
+            | InputKind::Export
+            | InputKind::Macro => None,
         }
         .unwrap_or_default();
     }
@@ -2340,6 +2363,13 @@ impl App {
                 let name = query.trim();
                 if !name.is_empty() {
                     self.export_request = Some(name.to_string());
+                }
+                return;
+            }
+            InputKind::Macro => {
+                let name = query.trim();
+                if !name.is_empty() {
+                    self.macro_request = Some(name.to_string());
                 }
                 return;
             }
@@ -2363,7 +2393,8 @@ impl App {
                 | InputKind::Pattern
                 | InputKind::Recipe
                 | InputKind::ColumnName
-                | InputKind::Export => unreachable!(),
+                | InputKind::Export
+                | InputKind::Macro => unreachable!(),
             }
             return;
         }
@@ -2383,7 +2414,8 @@ impl App {
                 | InputKind::Pattern
                 | InputKind::Recipe
                 | InputKind::ColumnName
-                | InputKind::Export => unreachable!(),
+                | InputKind::Export
+                | InputKind::Macro => unreachable!(),
         }
     }
 

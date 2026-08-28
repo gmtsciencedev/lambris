@@ -4,6 +4,7 @@ mod data;
 mod export;
 mod formula;
 mod pattern;
+mod script;
 mod interrupt;
 mod ui;
 
@@ -26,7 +27,8 @@ use pattern::{
 #[command(name = "lambris", version, about)]
 struct Args {
     /// Paths to the data files to view; each one opens in its own tab. With
-    /// none, the session saved for this folder is reopened.
+    /// none, the session saved for this folder is reopened. A `.lam` script
+    /// is run instead of shown, with any files after it as its arguments
     files: Vec<PathBuf>,
 
     /// Treat the first row as data, not column names (columns become
@@ -74,6 +76,19 @@ fn main() -> Result<()> {
             }
         );
         return Ok(());
+    }
+    // A `.lam` file says what to do rather than what to show, so naming one
+    // runs it — the same way naming a `.parquet` reads parquet. That is what
+    // lets a script carry `#!/usr/bin/env lambris` and be run as itself:
+    // nothing has to reach the interpreter but the file.
+    if let Some(first) = args.files.first()
+        && first.extension().is_some_and(|e| e.eq_ignore_ascii_case("lam"))
+    {
+        let rest: Vec<String> = args.files[1..]
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        return run_script(first, &rest, patterns, header, &here);
     }
     // With no files named, pick up what was open here last.
     let mut tabs = match args.files.is_empty() {
@@ -193,6 +208,30 @@ impl Tabs {
                 folder.display()
             );
         };
+        let (mut opened, missing) = Self::from_session(session, folder, header, patterns)?;
+        opened.session_attached = true;
+        if !missing.is_empty() {
+            opened.app_mut().status_msg = Some(format!(
+                "{} file(s) gone: {}",
+                missing.len(),
+                missing.join(", ")
+            ));
+        }
+        Ok(opened)
+    }
+
+    /// Build the tabs a session describes, and say what could not be built.
+    ///
+    /// Shared with the script runner: a script is the same description written
+    /// as text, so making one happen is the same work. What differs is what is
+    /// done about a gap — the viewer opens what it can and says what is
+    /// missing, a script stops.
+    fn from_session(
+        session: &Session,
+        folder: &Path,
+        header: HeaderSpec,
+        patterns: Store,
+    ) -> Result<(Self, Vec<String>)> {
         let mut tabs: Vec<Vec<App>> = Vec::with_capacity(session.tabs.len());
         let mut missing = Vec::new();
         // Where each saved tab ended up, so a join can find its sides even if
@@ -271,7 +310,7 @@ impl Tabs {
                         rows: rows.len(),
                         columns: crop.columns.clone(),
                     }));
-                    if rows.len() != crop.rows {
+                    if crop.rows != 0 && rows.len() != crop.rows {
                         view.status_msg = Some(format!(
                             "crop came back with {} rows, not {} — a boundary value is shared",
                             rows.len(),
@@ -316,11 +355,7 @@ impl Tabs {
             tabs.push(vec![app]);
         }
         if tabs.is_empty() {
-            anyhow::bail!(
-                "none of the {} files in the session for {} could be opened",
-                session.tabs.len(),
-                folder.display()
-            );
+            anyhow::bail!("nothing could be opened: {}", missing.join(", "));
         }
         let current = built
             .get(session.current)
@@ -336,7 +371,7 @@ impl Tabs {
             folder: folder.to_path_buf(),
             sessions: Sessions::default(),
             exported: HashMap::new(),
-            session_attached: true,
+            session_attached: false,
         };
         // Transposed tabs are restored by transposing again, which is what the
         // view was in the first place.
@@ -355,11 +390,7 @@ impl Tabs {
                 opened.tabs[tab].push(view);
             }
         }
-        if !missing.is_empty() {
-            opened.app_mut().status_msg =
-                Some(format!("{} file(s) gone: {}", missing.len(), missing.join(", ")));
-        }
-        Ok(opened)
+        Ok((opened, missing))
     }
 
     /// Write the current view out to `name`.
@@ -405,15 +436,6 @@ impl Tabs {
             let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
             real(a) == real(b)
         };
-        // A name for the file that holds whether or not it exists yet: the
-        // folder as the filesystem sees it, plus the name. `canonicalize` alone
-        // cannot give one, since it fails on a file that is not there.
-        let key_of = |p: &Path| match (p.parent(), p.file_name()) {
-            (Some(dir), Some(name)) => std::fs::canonicalize(dir)
-                .unwrap_or_else(|_| dir.to_path_buf())
-                .join(name),
-            _ => p.to_path_buf(),
-        };
         let open_here = self
             .tabs
             .iter()
@@ -437,7 +459,10 @@ impl Tabs {
             let ours = FileMark::of(&path)
                 .zip(self.exported.get(&key_of(&path)).copied())
                 .is_some_and(|(now, then)| now == then);
-            if !ours {
+            // `overwrite_allowed` means the caller has the authority: the user
+            // answered `y`, or a script line said to write here. A script that
+            // could not write over its own output would run exactly once.
+            if !ours && !overwrite_allowed {
                 self.app_mut().notice = Some(
                     app::Notice::say(
                         "export",
@@ -486,14 +511,23 @@ impl Tabs {
         })();
         let message = match written {
             Ok(Some(rows)) => {
+                let hint = " · M saves this as a macro";
                 // Remembered as it now stands, so that a second export to the
                 // same name is recognised as its own — and so that a file
                 // something else has since put there is not.
                 if let Some(mark) = FileMark::of(&path) {
                     self.exported.insert(key_of(&path), mark);
                 }
+                // Kept on the tab rather than beside it, so it goes where the
+                // tab goes and dies when the tab closes — which is what makes
+                // `M` able to say which view each file came from.
+                let written = relative_to(&self.folder, &path);
+                let app = self.app_mut();
+                if !app.exports.contains(&written) {
+                    app.exports.push(written);
+                }
                 format!(
-                    "wrote {rows} rows × {} cols to {} as {}",
+                    "wrote {rows} rows × {} cols to {} as {}{hint}",
                     cols.len(),
                     path.display(),
                     target.label()
@@ -609,6 +643,139 @@ impl Tabs {
         });
         self.tabs.push(vec![view]);
         self.current = self.tabs.len() - 1;
+    }
+
+    /// Write this session down as a script.
+    ///
+    /// The session already knows how to describe itself — `snapshot_session`
+    /// derives what `W` would save — so this turns that description into text
+    /// rather than working anything out afresh. What a script leaves out is
+    /// what an export leaves out: widths, frozen columns, the gutter, numeric
+    /// styles and the summary line cannot change a written file.
+    fn save_macro(&mut self, name: String) {
+        let mut path = browse::resolve(&name, &self.folder.clone());
+        // The extension is what makes a script runnable by name, so a name
+        // given without one gets it.
+        if path.extension().is_none() {
+            path.set_extension("lam");
+        }
+        // The same rule `X` follows: over its own work, and nothing else. A
+        // script is the one kind of file here likely to have been edited by
+        // hand since, and flattening that would be the worst of it.
+        let key = key_of(&path);
+        if path.exists()
+            && !FileMark::of(&path)
+                .zip(self.exported.get(&key).copied())
+                .is_some_and(|(now, then)| now == then)
+        {
+            self.app_mut().notice = Some(
+                app::Notice::say(
+                    "macro",
+                    format!(
+                        "{} is already there, and this session did not write it",
+                        path.display()
+                    ),
+                )
+                .hint("give it another name, or clear that one yourself"),
+            );
+            return;
+        }
+        let (text, warnings) = self.macro_text();
+        if let Err(e) = std::fs::write(&path, text) {
+            self.app_mut().status_msg = Some(format!("macro not saved: {e}"));
+            return;
+        }
+        if let Some(mark) = FileMark::of(&path) {
+            self.exported.insert(key, mark);
+        }
+        let app = self.app_mut();
+        match warnings.is_empty() {
+            true => {
+                app.status_msg = Some(format!("wrote {}", path.display()));
+            }
+            // Said once, now, while it can still be put right.
+            false => {
+                app.status_msg = Some(format!("wrote {}", path.display()));
+                app.notice = Some(app::Notice::say("macro", warnings.join(" · ")).hint(
+                    "the script is written; this is what it will and will not carry over",
+                ));
+            }
+        }
+    }
+
+    /// The script this session would be, and anything worth saying about it.
+    fn macro_text(&self) -> (String, Vec<String>) {
+        let (session, _) = self.snapshot_session();
+        let mut warnings = Vec::new();
+        let mut commands: Vec<script::Command> = Vec::new();
+        let mut handles: Vec<String> = Vec::new();
+        for (index, saved) in session.tabs.iter().enumerate() {
+            let app = self
+                .tabs
+                .get(index)
+                .and_then(|stack| stack.first())
+                .expect("a session tab comes from a tab");
+            // Named for what it is: a file by its stem, and the tabs made
+            // here by what made them. A script is read by people.
+            let base = match (&saved.join, &saved.crop) {
+                (Some(_), _) => "joined".to_string(),
+                (_, Some(_)) => "crop".to_string(),
+                _ => Path::new(&saved.file)
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| app.data.label.clone()),
+            };
+            let handle = fresh_handle(&base, &handles);
+            handles.push(handle.clone());
+            match (&saved.join, &saved.crop) {
+                (Some(join), _) => commands.push(script::Command::Join {
+                    left: (handles[join.left].clone(), join.left_key.clone()),
+                    right: (handles[join.right].clone(), join.right_key.clone()),
+                    handle: handle.clone(),
+                }),
+                (_, Some(crop)) => commands.push(script::Command::Crop {
+                    source: handles[crop.source].clone(),
+                    rows: match crop.column.is_empty() {
+                        false => script::CropRows::Between {
+                            column: crop.column.clone(),
+                            from: crop.from.clone(),
+                            to: crop.to.clone(),
+                        },
+                        true => script::CropRows::Numbers {
+                            from: crop.from.parse().unwrap_or(1),
+                            to: crop.to.parse().unwrap_or(1),
+                        },
+                    },
+                    cols: crop.columns.clone(),
+                    handle: handle.clone(),
+                }),
+                _ => commands.push(script::Command::Open {
+                    path: saved.file.clone(),
+                    sheet: saved.sheet.clone(),
+                    handle: handle.clone(),
+                }),
+            }
+            commands.extend(shaping_commands(&handle, saved, app, &mut warnings));
+            if saved.transposed {
+                commands.push(script::Command::Transpose {
+                    handle: handle.clone(),
+                });
+            }
+            for written in &app.exports {
+                commands.push(script::Command::Export {
+                    handle: handle.clone(),
+                    path: written.clone(),
+                });
+            }
+        }
+        if !commands.iter().any(|c| matches!(c, script::Command::Export { .. })) {
+            warnings.push("nothing was exported, so the script writes no files".to_string());
+        }
+        let mut text = String::from("#!/usr/bin/env lambris\n");
+        for command in &commands {
+            text.push_str(&format!("{command}\n"));
+        }
+        (text, warnings)
     }
 
     /// Whether what is open now differs from what was last saved for this
@@ -806,6 +973,7 @@ impl Tabs {
         let save_pattern = app.save_pattern.take();
         let save_session = std::mem::take(&mut app.save_session);
         let export_request = app.export_request.take();
+        let macro_request = app.macro_request.take();
         let crop_request = app.crop_request.take();
         let overwrite_allowed = std::mem::take(&mut app.overwrite_allowed);
         let promote_header = std::mem::take(&mut app.promote_header);
@@ -847,6 +1015,9 @@ impl Tabs {
         }
         if let Some(name) = export_request {
             self.export(name, overwrite_allowed);
+        }
+        if let Some(name) = macro_request {
+            self.save_macro(name);
         }
         if let Some(span) = crop_request {
             self.crop(span);
@@ -1115,6 +1286,257 @@ fn joined_view(
     }
     view.status_msg = Some(msg);
     Some(view)
+}
+
+/// A name for a file that holds whether or not it exists yet: the folder as the
+/// filesystem sees it, plus the name. `canonicalize` alone cannot give one,
+/// since it fails on a file that is not there.
+fn key_of(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(dir), Some(name)) => std::fs::canonicalize(dir)
+            .unwrap_or_else(|_| dir.to_path_buf())
+            .join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// A name for a tab in a script: its label, cut down to something that can be
+/// written bare, and never one already taken.
+fn fresh_handle(label: &str, taken: &[String]) -> String {
+    let mut name = String::new();
+    for c in label.chars() {
+        match c.is_alphanumeric() {
+            true => name.push(c.to_ascii_lowercase()),
+            // One underscore for a run of anything else, so a label full of
+            // punctuation does not become a wall of them.
+            false if !name.ends_with('_') => name.push('_'),
+            false => {}
+        }
+    }
+    let mut name = name.trim_matches('_').to_string();
+    name.truncate(24);
+    // A handle is a word, so it cannot start with a digit or be empty.
+    if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+        name.insert(0, 't');
+    }
+    if !taken.contains(&name) {
+        return name;
+    }
+    (2..).map(|n| format!("{name}{n}")).find(|n| !taken.contains(n)).expect("a free name")
+}
+
+/// The lines that shape one tab: everything a written file would carry.
+fn shaping_commands(
+    handle: &str,
+    saved: &SessionTab,
+    app: &App,
+    warnings: &mut Vec<String>,
+) -> Vec<script::Command> {
+    let view = &saved.view;
+    let handle = handle.to_string();
+    let mut out = Vec::new();
+    if let Some(header) = view.header {
+        out.push(script::Command::Header {
+            handle: handle.clone(),
+            row: header.named.then_some(header.skip + 1),
+        });
+    }
+    for column in &view.computed {
+        out.push(match (&column.from, &column.extract, &column.formula) {
+            (Some(from), Some(pattern), _) => script::Command::Extract {
+                handle: handle.clone(),
+                name: column.name.clone(),
+                from: from.clone(),
+                pattern: pattern.clone(),
+            },
+            _ => script::Command::Compute {
+                handle: handle.clone(),
+                name: column.name.clone(),
+                formula: column.formula.clone().unwrap_or_default(),
+            },
+        });
+    }
+    for (from, to) in &view.renamed {
+        out.push(script::Command::Rename {
+            handle: handle.clone(),
+            from: from.clone(),
+            to: to.clone(),
+        });
+    }
+    // `hide` where only some columns were taken out, so a file that has gained
+    // a column since still shows it; `columns` where the order was changed too,
+    // since only the list can say what the order is.
+    let natural: Vec<String> = app
+        .data
+        .column_names
+        .iter()
+        .filter(|name| !view.hidden.contains(name))
+        .cloned()
+        .collect();
+    if view.columns != natural {
+        out.push(script::Command::Columns {
+            handle: handle.clone(),
+            names: view.columns.clone(),
+        });
+    } else if !view.hidden.is_empty() {
+        out.push(script::Command::Hide {
+            handle: handle.clone(),
+            names: view.hidden.clone(),
+        });
+    }
+    if let Some(sort) = &view.sort {
+        out.push(script::Command::Sort {
+            handle: handle.clone(),
+            column: sort.column.clone(),
+            descending: sort.descending,
+            key: sort
+                .key
+                .as_ref()
+                .map(|k| (k.from, k.to, k.method.clone())),
+        });
+    }
+    if let Some(regex) = &view.filter {
+        out.push(script::Command::Filter {
+            handle: handle.clone(),
+            regex: regex.clone(),
+        });
+    }
+    if let Some(masks) = &view.masked {
+        out.push(match masks.column.is_empty() {
+            false => script::Command::MaskValues {
+                handle: handle.clone(),
+                column: masks.column.clone(),
+                values: masks.values.clone(),
+            },
+            true => {
+                warnings.push(format!(
+                    "{} mask(s) on {handle} are row numbers and will hide those rows of \
+                     whatever it runs on — sort first to mask by value",
+                    masks.values.len()
+                ));
+                script::Command::MaskRows {
+                    handle: handle.clone(),
+                    rows: masks.values.iter().filter_map(|v| v.parse().ok()).collect(),
+                }
+            }
+        });
+    }
+    out
+}
+
+/// Run a script: build what it describes, then write the files it asks for.
+///
+/// Nothing is drawn. A script is a transformation — that is what makes it worth
+/// having over a pattern, which is the right tool for looking at something.
+///
+/// It is **strict**, where the viewer is forgiving. A pattern naming a column
+/// that has gone is skipped so the rest of the arrangement still applies, which
+/// is right in front of someone who can see what happened. A script runs
+/// unattended, and a sort quietly not happening would put out a file that looks
+/// right and is not, so anything a line names and does not find stops the run.
+fn run_script(
+    path: &Path,
+    args: &[String],
+    patterns: Store,
+    header: HeaderSpec,
+    here: &Path,
+) -> Result<()> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let script = script::Script::parse(&text, args)
+        .with_context(|| format!("in {}", path.display()))?;
+    let plan = script
+        .plan(&here.to_string_lossy())
+        .with_context(|| format!("in {}", path.display()))?;
+
+    let (mut tabs, missing) = Tabs::from_session(&plan.session, here, header, patterns)?;
+    if !missing.is_empty() {
+        anyhow::bail!("could not open: {}", missing.join(", "));
+    }
+    tabs.folder = here.to_path_buf();
+    verify(&script, &plan, &tabs).with_context(|| format!("in {}", path.display()))?;
+
+    for (tab, name) in &plan.exports {
+        tabs.current = *tab;
+        // Over anything of the same name: a script that could not write its
+        // own output twice could only ever be run once.
+        tabs.export(name.clone(), true);
+        let app = tabs.app_mut();
+        if let Some(notice) = app.notice.take() {
+            anyhow::bail!("{name}: {}", notice.message);
+        }
+        match app.status_msg.take() {
+            // Without the hint about `M`, which is for someone at a screen.
+            Some(said) if said.starts_with("wrote") => {
+                println!("{}", said.split(" · ").next().unwrap_or(&said))
+            }
+            Some(said) => anyhow::bail!("{said}"),
+            None => anyhow::bail!("{name}: nothing was written"),
+        }
+    }
+    Ok(())
+}
+
+/// Check that every column a script names is really there.
+///
+/// Done against what was built rather than threaded through the building: the
+/// arrangement is applied by the same forgiving code the viewer uses, and this
+/// is where the strictness lives instead.
+fn verify(script: &script::Script, plan: &script::Plan, tabs: &Tabs) -> Result<()> {
+    let index = |handle: &str| {
+        plan.handles
+            .iter()
+            .find(|(h, _)| h == handle)
+            .map(|(_, i)| *i)
+    };
+    let columns = |handle: &str| -> Vec<String> {
+        index(handle)
+            .and_then(|tab| tabs.tabs.get(tab))
+            .and_then(|stack| stack.first())
+            .map(|app| app.data.column_names.clone())
+            .unwrap_or_default()
+    };
+    for (line, command) in &script.commands {
+        // Each line's claims: which tab, and which of its columns it names.
+        let (handle, wanted): (&str, Vec<&String>) = match command {
+            script::Command::Sort { handle, column, .. } => (handle, vec![column]),
+            script::Command::Filter { handle, .. } => (handle, vec![]),
+            script::Command::Rename { handle, from, .. } => (handle, vec![from]),
+            script::Command::Extract { handle, from, .. } => (handle, vec![from]),
+            script::Command::Columns { handle, names } | script::Command::Hide { handle, names } => {
+                (handle, names.iter().collect())
+            }
+            script::Command::MaskValues { handle, column, .. } => (handle, vec![column]),
+            // A crop names columns of the tab it is taken *from*, not of the
+            // one it makes.
+            script::Command::Crop {
+                source, cols, rows, ..
+            } => {
+                let mut wanted: Vec<&String> = cols.iter().collect();
+                if let script::CropRows::Between { column, .. } = rows {
+                    wanted.push(column);
+                }
+                (source, wanted)
+            }
+            script::Command::Join { left, right, .. } => {
+                for (handle, key) in [left, right] {
+                    let held = columns(handle);
+                    if !held.iter().any(|name| name == key) {
+                        anyhow::bail!("line {line}: `{handle}` has no column called `{key}`");
+                    }
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        let held = columns(handle);
+        for name in wanted {
+            if !held.iter().any(|held| held == name) {
+                anyhow::bail!("line {line}: `{handle}` has no column called `{name}`");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Draw the current tab's top view, feed it one key, then let [`Tabs::step`]
@@ -2939,6 +3361,145 @@ mod tests {
         assert_eq!(app.row_count(), 3, "both S2 rows and the S3");
         let said = app.status_msg.clone().unwrap_or_default();
         assert!(said.contains("boundary value is shared"), "{said}");
+    }
+
+    /// Drive the `M` prompt to write the session down as a script.
+    fn save_macro_as(tabs: &mut Tabs, name: &str) {
+        tabs.key(key('M'));
+        type_str(tabs.app_mut(), name);
+        tabs.key(KeyEvent::from(KeyCode::Enter));
+        assert!(tabs.step());
+    }
+
+    #[test]
+    fn a_macro_carries_a_crop_and_says_what_it_cannot_carry() {
+        let (folder, _) = project();
+        let path = folder.join("a.csv");
+        std::fs::write(&path, "batch,reads\nA,10\nB,20\nC,30\nD,40\n").unwrap();
+        let mut tabs = Tabs::open(
+            std::slice::from_ref(&path),
+            HeaderSpec::default(),
+            Store::default(),
+        )
+        .unwrap();
+        tabs.folder = folder.clone();
+
+        // A mask taken with no sort is a row number, which means something for
+        // this file and probably not for the next one.
+        tabs.app_mut().selected_row = 3;
+        tabs.key(key('d'));
+        assert!(tabs.step());
+        crop_cells(&mut tabs, (0, 0), (1, 1));
+        let out = folder.join("cut.csv");
+        export_to(&mut tabs, &out);
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "batch,reads\nA,10\nB,20\n"
+        );
+
+        save_macro_as(&mut tabs, "cut.lam");
+        let text = std::fs::read_to_string(folder.join("cut.lam")).unwrap();
+        assert!(text.contains("mask a rows 4"), "{text}");
+        assert!(text.contains("crop a rows 1..2 cols batch reads as crop"), "{text}");
+        assert!(text.contains("export crop to cut.csv"), "{text}");
+        // Said while it can still be put right.
+        let notice = tabs.app_mut().notice.clone().expect("a word about the masks");
+        assert!(notice.message.contains("are row numbers"), "{}", notice.message);
+
+        // It runs, and puts out what it put out before.
+        std::fs::remove_file(&out).unwrap();
+        run_script(
+            &folder.join("cut.lam"),
+            &[],
+            Store::default(),
+            HeaderSpec::default(),
+            &folder,
+        )
+        .unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "batch,reads\nA,10\nB,20\n"
+        );
+
+        // And it will not write over a script it did not write. (The notice
+        // above is still up, and the next key puts it away — as any notice
+        // does — so that key is spent before the prompt will open.)
+        tabs.key(key('j'));
+        assert!(tabs.step());
+        std::fs::write(folder.join("mine.lam"), "# hand written\n").unwrap();
+        save_macro_as(&mut tabs, "mine.lam");
+        let notice = tabs.app_mut().notice.clone().expect("refused");
+        assert!(notice.message.contains("did not write it"), "{}", notice.message);
+        assert_eq!(
+            std::fs::read_to_string(folder.join("mine.lam")).unwrap(),
+            "# hand written\n"
+        );
+    }
+
+    #[test]
+    fn a_macro_does_again_what_the_session_did() {
+        let (folder, _) = project();
+        std::fs::write(
+            folder.join("meta.csv"),
+            "sample,reads,junk\nS3,30,x\nS1,10,y\nS2,20,z\n",
+        )
+        .unwrap();
+        std::fs::write(folder.join("depth.csv"), "sample,depth\nS1,1.5\nS2,2.5\nS3,3.5\n")
+            .unwrap();
+        let files = vec![folder.join("meta.csv"), folder.join("depth.csv")];
+        let mut tabs = Tabs::open(&files, HeaderSpec::default(), Store::default()).unwrap();
+        tabs.folder = folder.clone();
+
+        // A session worth writing down: hide, sort, join, compute, filter.
+        tabs.current = 0;
+        tabs.app_mut().selected_pos = 2;
+        tabs.key(key('x')); // junk
+        tabs.app_mut().selected_pos = 0;
+        tabs.key(key('s')); // sort by sample
+        assert!(tabs.step());
+        run_wizard(&mut tabs, 0, 1, 0); // meta.sample × depth.sample
+        assert_eq!(tabs.tabs.len(), 3, "the join is a tab of its own");
+        add_column(tabs.app_mut(), 'f', "{reads} / {depth}", "ratio");
+        tabs.key(key('&'));
+        type_str(tabs.app_mut(), "^S[12]");
+        tabs.key(KeyEvent::from(KeyCode::Enter));
+        assert!(tabs.step());
+        let out = folder.join("out.csv");
+        export_to(&mut tabs, &out);
+        let wanted = std::fs::read_to_string(&out).unwrap();
+
+        save_macro_as(&mut tabs, "report");
+        let script = folder.join("report.lam");
+        assert!(script.exists(), "named without an extension, it gets .lam");
+        let text = std::fs::read_to_string(&script).unwrap();
+        assert!(text.starts_with("#!/usr/bin/env lambris\n"), "{text}");
+        // Files are named as the session names them: relative, so the script
+        // travels with the folder.
+        assert!(text.contains("open meta.csv as meta"), "{text}");
+        assert!(text.contains("hide meta junk"), "{text}");
+        assert!(text.contains("sort meta sample"), "{text}");
+        assert!(text.contains("join meta.sample with depth.sample as"), "{text}");
+        assert!(text.contains("filter"), "{text}");
+        assert!(text.contains("export"), "{text}");
+        // Presentation is not in it: it cannot change a written file.
+        assert!(!text.contains("width"), "{text}");
+
+        // Now run it, and it produces the same bytes.
+        std::fs::remove_file(&out).unwrap();
+        run_script(
+            &script,
+            &[],
+            Store::default(),
+            HeaderSpec::default(),
+            &folder,
+        )
+        .unwrap_or_else(|e| panic!("running {}: {e:#}", script.display()));
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), wanted);
+
+        // And again, over its own output: a script that could only run once
+        // would be no use at all.
+        run_script(&script, &[], Store::default(), HeaderSpec::default(), &folder).unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), wanted);
     }
 
     #[test]

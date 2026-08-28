@@ -103,6 +103,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("w", "remember this arrangement for the file (or a glob of files)"),
             ("W", "remember every tab open here — joins included; `lambris` reopens"),
             ("X", "write this view out: .csv .tsv .parquet .xlsx .csv.gz"),
+            ("M", "write this session down as a script that can do it again"),
             ("z / Z", "undo / redo the last change to the view"),
         ],
     ),
@@ -957,6 +958,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App, clipped: &Clipped) {
             },
             InputKind::ColumnName => "name ",
             InputKind::Export => "write to ",
+            InputKind::Macro => "macro ",
         };
         let line = Line::from(vec![
             Span::styled(
@@ -1189,6 +1191,10 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App, banner: Option<&str>) {
         )),
         Mode::Input(InputKind::Export) => Line::from(Span::styled(
             " the name decides the format · .csv .tsv .parquet .xlsx .gz · Tab browses",
+            Style::new().dim(),
+        )),
+        Mode::Input(InputKind::Macro) => Line::from(Span::styled(
+            " a script that does all this again · .lam · Tab browses",
             Style::new().dim(),
         )),
         Mode::Input(InputKind::Open) => Line::from(Span::styled(
