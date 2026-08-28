@@ -46,6 +46,7 @@ cargo run --release
 | `-` | Column search — same as `/` but confined to the selected column |
 | `n` / `N` | Jump to next / previous search match (within scope) |
 | `&` | Filter rows to those with a cell matching a regex |
+| `d` / `D` | Take the row under the cursor out of the view / put every one back (see [Masking rows](#masking-rows)) |
 | `=` | Summary line: total, mean, sd, mean±sd — hold it to remove (see [Summary line](#summary-line)) |
 | `w` | Remember this arrangement for the file, or for a glob of files (see [Patterns](#patterns)) |
 | `W` | Remember every tab open here (see [Sessions](#sessions)) |
@@ -219,8 +220,8 @@ matched. `--no-pattern` opens files as they come.
 What is remembered: computed columns and renamed ones, which columns are shown
 and in what order, which are hidden,
 widths, numeric styles, the sort (including a keyed `S` sort), the frozen prefix,
-the row filter, the row-number gutter, the summary line and what each column
-shows on it, and **how the top of the file is read** —
+the row filter, [masked rows](#masking-rows), the row-number gutter, the summary
+line and what each column shows on it, and **how the top of the file is read** —
 so a spreadsheet with two junk rows above its real header opens correctly for
 good, rather than needing `H` every time.
 
@@ -235,6 +236,7 @@ Everything is stored by **column name**, never by position:
   "numeric": { "depth": { "align": true, "log": true } },
   "sort": { "column": "sample", "descending": false,
             "key": { "from": 1, "to": 2, "method": "nat" } },
+  "masked": { "column": "sample", "values": ["S18572Nr2"] },
   "frozen_through": "sample",
   "header": { "skip": 0, "named": true },
   "row_numbers": true,
@@ -756,6 +758,45 @@ key columns, and the result can address any row of either side. Both sides are
 therefore materialised, and each is capped at **200 000 rows** — enough that the
 columns stay in the chunk cache. Past that it declines rather than trying; a long
 join can be abandoned with `Esc`/`Ctrl-C` like any other heavy operation.
+
+## Masking rows
+
+`d` takes the row under the cursor out of the view. **Nothing is deleted** — the
+file is not touched — but the row's part in everything downstream goes with it:
+it is out of the view, out of the totals on the summary line, and out of
+anything written with `X`, because all of those read the view rather than the
+file. It is the row-wise counterpart of hiding a column with `x`.
+
+The cursor stays where it is rather than following the row that left, so the
+next row comes up under it and a run can be taken out with a run of presses.
+
+`D` puts every masked row back, and `z` undoes a mask like any other change to
+the view. The status bar counts what is out (`✂3`).
+
+**Under a sort, `d` masks by value.** Sorted by `batch`, masking a row whose
+batch is `A` takes every `A` row with it, and the status bar says so (`2 rows
+share that batch and are masked`). As far as that ordering is concerned those
+rows *are* the same row, so taking one and leaving its twins would be a
+distinction the view does not make — and it is what lets the mask be written
+down (below). With no sort the view is in the file's own order, a row there is
+only itself, and `d` takes exactly one.
+
+### Remembered
+
+Masks go into a pattern (`w`) and a session (`W`) with everything else, written
+down the way the view was ordered when they were taken:
+
+- **Sorted** — by the value in the sort column. The same rows are found again
+  however the file has been added to since, and every row holding that value
+  goes, which is what masking under that sort meant to begin with.
+- **Unsorted** — by row number, 1-based, as the gutter and `:` show them. That
+  is only as stable as the file: a line added above will shift what a saved mask
+  hides. Sorting first is what makes a mask durable.
+
+Masking is not a poor relation of `&`. A filter says *keep what matches*; a mask
+says *not this one*, which is often the honest description — a control sample, a
+run that failed, a header line the file should not have had. Both are yours to
+keep.
 
 ## Cropping
 

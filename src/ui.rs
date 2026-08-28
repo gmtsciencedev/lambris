@@ -35,6 +35,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("-", "search within the selected column only"),
             ("n / N", "next / previous match"),
             ("&", "keep only rows matching a regex"),
+            ("d / D", "take this row out of the view / put every one back"),
             ("Esc", "clear the search, then the filter"),
         ],
     ),
@@ -1033,6 +1034,12 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App, clipped: &Clipped) {
         spans.push(Span::styled(
             format!("  ❄{}", app.frozen_cols),
             Style::new().fg(Color::Magenta),
+        ));
+    }
+    if !app.masked.is_empty() {
+        spans.push(Span::styled(
+            format!("  ✂{}", app.masked.len()),
+            Style::new().fg(Color::Yellow),
         ));
     }
     if let Some(st) = app.num_styles.get(&app.selected_col()) {

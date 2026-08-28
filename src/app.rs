@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -9,7 +9,7 @@ use crate::browse::Completions;
 use crate::data::{ColumnStats, Dataset, Derived, HeaderSpec, Recipe, SortKey, SortMethod};
 use crate::formula::FormulaError;
 use crate::pattern::{
-    Pattern, SavedColumn, SavedHeader, SavedNumStyle, SavedSort, SavedSortKey,
+    Pattern, SavedColumn, SavedHeader, SavedMasks, SavedNumStyle, SavedSort, SavedSortKey,
 };
 use crate::interrupt;
 
@@ -225,6 +225,7 @@ const MAX_UNDO_ROWS: usize = 8_000_000;
 struct ViewState {
     filter: Option<Arc<Vec<usize>>>,
     filter_query: Option<String>,
+    masked: HashSet<usize>,
     view: View,
     sort: Option<SortSpec>,
     search: Option<Search>,
@@ -489,6 +490,9 @@ pub struct App {
     pub completions: Option<Completions>,
     pub search: Option<Search>,
     pub filter_query: Option<String>,
+    /// Rows taken out of the view by hand with `d`, as original row indices.
+    /// Nothing is deleted: the file is untouched and `D` puts them all back.
+    pub masked: HashSet<usize>,
     /// Transient message shown in the status bar (errors, match info).
     pub status_msg: Option<String>,
     /// When set, the bottom line shows the selected column's info instead of
@@ -611,6 +615,7 @@ impl App {
             completions: None,
             search: None,
             filter_query: None,
+            masked: HashSet::new(),
             status_msg: None,
             show_info: false,
             show_line_numbers: true,
@@ -709,6 +714,34 @@ impl App {
                     )
                 })
                 .collect(),
+            // Written down here rather than kept alongside: the rows are what
+            // is masked, and how to name them follows from how the view is
+            // ordered now.
+            masked: (!self.masked.is_empty()).then(|| {
+                let mut rows: Vec<usize> = self.masked.iter().copied().collect();
+                rows.sort_unstable();
+                match self.sort {
+                    Some(spec) => {
+                        let mut values: Vec<String> = rows
+                            .iter()
+                            .filter_map(|&row| {
+                                self.data.cell_display(spec.col, row).ok().flatten()
+                            })
+                            .collect();
+                        values.dedup();
+                        SavedMasks {
+                            column: name(spec.col),
+                            values,
+                        }
+                    }
+                    // The file's own order, so the rows are their numbers —
+                    // 1-based, as the gutter and `:` show them.
+                    None => SavedMasks {
+                        column: String::new(),
+                        values: rows.iter().map(|row| (row + 1).to_string()).collect(),
+                    },
+                }
+            }),
             sort: self.sort.map(|s| SavedSort {
                 column: name(s.col),
                 descending: s.dir == SortDir::Desc,
@@ -886,6 +919,25 @@ impl App {
                 }),
             });
         }
+        // After the sort, since that is what the values were named against, and
+        // before the view is built, since the masks decide what goes into it.
+        if let Some(saved) = &pattern.masked {
+            self.masked = match saved.column.is_empty() {
+                true => saved
+                    .values
+                    .iter()
+                    .filter_map(|text| text.parse::<usize>().ok())
+                    .filter_map(|number| number.checked_sub(1))
+                    .filter(|&row| row < self.data.nrows)
+                    .collect(),
+                false => match index_of(&saved.column) {
+                    Some(col) => self.rows_holding(col, &saved.values),
+                    // The column has gone, so nothing can be named in it; the
+                    // rest of the arrangement still applies.
+                    None => HashSet::new(),
+                },
+            };
+        }
         let default = pattern.summary.as_deref().and_then(Summary::from_name);
         // Worked out here, while the name lookup is still in hand.
         let modes: HashMap<usize, Summary> = pattern
@@ -921,6 +973,7 @@ impl App {
         ViewState {
             filter: self.filter.clone(),
             filter_query: self.filter_query.clone(),
+            masked: self.masked.clone(),
             view: self.view.clone(),
             sort: self.sort,
             search: self.search.clone(),
@@ -941,6 +994,7 @@ impl App {
     fn restore(&mut self, state: ViewState) {
         self.filter = state.filter;
         self.filter_query = state.filter_query;
+        self.masked = state.masked;
         self.view = state.view;
         self.sort = state.sort;
         self.search = state.search;
@@ -1410,7 +1464,10 @@ impl App {
         if self.summary.is_none() {
             return;
         }
-        let rows = self.filter.clone();
+        // Over the rows in play, so a masked row is out of the totals as well
+        // as out of the view: it stopped being part of the data when `d` took
+        // it out, and a total that still counted it would be wrong.
+        let rows = self.rows_in_play();
         let rows = rows.as_deref().map(Vec::as_slice);
         let missing: Vec<usize> = self
             .cols
@@ -2028,6 +2085,11 @@ impl App {
             KeyCode::Char(')') => self.scope = Some(Scope::Leftward),
             KeyCode::Char('%') => self.toggle_numeric(),
             KeyCode::Char('E') => self.toggle_scientific(),
+            // `d` takes the row under the cursor out of the view; `D` puts
+            // every masked row back. Plain `d` only: `Ctrl-d` is half a page
+            // down, and matching it here would swallow it.
+            KeyCode::Char('d') if !ctrl => self.mask_row(),
+            KeyCode::Char('D') if !ctrl => self.unmask_rows(),
             KeyCode::Char('>') => self.adjust_decimals(1),
             KeyCode::Char('<') => self.adjust_decimals(-1),
             KeyCode::Char('s') => self.cycle_sort(),
@@ -2196,6 +2258,15 @@ impl App {
                 self.completions = None;
                 return;
             }
+        }
+        // At the export prompt a name matching nothing is the ordinary case:
+        // the file is being named, not chosen. The picker has served its
+        // purpose — it got us to the folder — so it goes rather than sitting
+        // there saying nothing starts with the name of a file that does not
+        // exist yet, with Enter caught on a pick that will never come.
+        if listing.entries.is_empty() && matches!(self.mode, Mode::Input(InputKind::Export)) {
+            self.completions = None;
+            return;
         }
         self.completions = Some(listing);
     }
@@ -2448,6 +2519,127 @@ impl App {
         self.note_scope(what);
     }
 
+    /// Take the row under the cursor out of the view.
+    ///
+    /// Nothing is deleted: the file is not touched, and `D` puts every masked
+    /// row back. What goes is the row's part in everything downstream — it is
+    /// out of the view, out of the totals, and out of anything written with
+    /// `X`, because those all read the view rather than the file.
+    fn mask_row(&mut self) {
+        if self.row_count() == 0 {
+            return;
+        }
+        // Where the cursor is, rather than which row it is on: that row is
+        // about to go, and the next one should come up under the cursor so a
+        // run can be taken out with a run of presses.
+        let at = self.selected_row;
+        let taken = self.rows_sharing_the_key(at);
+        let took = taken.len();
+        self.record("mask row");
+        for row in taken {
+            self.masked.insert(row);
+        }
+        self.rebuild_view();
+        self.invalidate_stats();
+        self.selected_row = at.min(self.last_row());
+        let total = self.masked.len();
+        self.status_msg = Some(match (took, self.sort) {
+            (1, _) => format!("{total} row(s) masked · D puts them back"),
+            (n, Some(spec)) => format!(
+                "{n} rows share that {} and are masked · {total} in all",
+                self.data.column_names[spec.col]
+            ),
+            (n, None) => format!("{n} rows masked · {total} in all"),
+        });
+    }
+
+    /// Every row whose `col` holds one of `values`.
+    ///
+    /// A pass over the column, read a block at a time — the same shape as
+    /// re-running a saved filter, and done once when the arrangement is
+    /// applied rather than every time the view is rebuilt.
+    fn rows_holding(&self, col: usize, values: &[String]) -> HashSet<usize> {
+        let wanted: HashSet<&str> = values.iter().map(String::as_str).collect();
+        let mut found = HashSet::new();
+        const BLOCK: usize = 8192;
+        for base in (0..self.data.nrows).step_by(BLOCK) {
+            let rows: Vec<usize> = (base..(base + BLOCK).min(self.data.nrows)).collect();
+            let Ok(cells) = self.data.cells(col, &rows) else {
+                break;
+            };
+            for (row, cell) in rows.iter().zip(cells) {
+                if wanted.contains(cell.as_deref().unwrap_or_default()) {
+                    found.insert(*row);
+                }
+            }
+        }
+        found
+    }
+
+    /// The rows a mask at view position `at` takes out.
+    ///
+    /// With no sort that is the one row: the view is in the file's own order,
+    /// and a row there is only itself. Under a sort it is every row holding the
+    /// same value in the column being sorted by — as far as the ordering is
+    /// concerned those rows *are* the same row, and taking one while leaving
+    /// its twins would be a distinction the view does not make. They sit
+    /// together, so finding them costs only the walk.
+    fn rows_sharing_the_key(&self, at: usize) -> Vec<usize> {
+        let Some(spec) = self.sort else {
+            return vec![self.orig_row(at)];
+        };
+        let value = |i: usize| {
+            self.data
+                .cell_display(spec.col, self.orig_row(i))
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+        };
+        // Contiguity comes from the sort *key*, which under `S` is a slice of
+        // the value rather than the whole of it. Two rows sharing a value
+        // necessarily share its slice, so the run bounded by the key holds
+        // every row that could match.
+        let key = |text: &str| match spec.key {
+            Some(k) => text
+                .chars()
+                .skip(k.start)
+                .take(k.end.saturating_sub(k.start))
+                .collect::<String>(),
+            None => text.to_string(),
+        };
+        let wanted = value(at);
+        let wanted_key = key(&wanted);
+        let mut rows = vec![self.orig_row(at)];
+        let walk = |steps: &mut dyn Iterator<Item = usize>, rows: &mut Vec<usize>| {
+            for i in steps {
+                let text = value(i);
+                if key(&text) != wanted_key {
+                    break;
+                }
+                if text == wanted {
+                    rows.push(self.orig_row(i));
+                }
+            }
+        };
+        walk(&mut (0..at).rev(), &mut rows);
+        walk(&mut (at + 1..self.row_count()), &mut rows);
+        rows
+    }
+
+    /// Put every masked row back.
+    fn unmask_rows(&mut self) {
+        if self.masked.is_empty() {
+            self.status_msg = Some("no rows are masked".into());
+            return;
+        }
+        let n = self.masked.len();
+        self.record("unmask rows");
+        self.masked.clear();
+        self.rebuild_view();
+        self.invalidate_stats();
+        self.status_msg = Some(format!("{n} row(s) back"));
+    }
+
     /// Show this column's values in scientific notation, or stop. The digits
     /// after the point are whatever `<`/`>` has asked for, so the two commands
     /// work together rather than each having its own idea of precision.
@@ -2525,9 +2717,32 @@ impl App {
     /// With no filter and no sort the view is `All` (no allocation). A sort
     /// materialises a permutation — over the filtered subset, or over all rows
     /// when unfiltered (unavoidable: the result *is* an explicit ordering).
+    /// The rows in play: what the filter left, less anything masked with `d`.
+    ///
+    /// `None` means every row, and costs nothing — the common case never builds
+    /// a row list at all. Masking does build one, the same way filtering does:
+    /// once some rows are out, the ones that are left have to be written down.
+    fn rows_in_play(&self) -> Option<Arc<Vec<usize>>> {
+        if self.masked.is_empty() {
+            return self.filter.clone();
+        }
+        let kept: Vec<usize> = match &self.filter {
+            Some(rows) => rows
+                .iter()
+                .copied()
+                .filter(|row| !self.masked.contains(row))
+                .collect(),
+            None => (0..self.data.nrows)
+                .filter(|row| !self.masked.contains(row))
+                .collect(),
+        };
+        Some(Arc::new(kept))
+    }
+
     fn rebuild_view(&mut self) -> bool {
         let keep = (self.row_count() > 0).then(|| self.selected_orig());
-        let new_view = match (&self.filter, self.sort) {
+        let in_play = self.rows_in_play();
+        let new_view = match (&in_play, self.sort) {
             (None, None) => View::All,
             (Some(f), None) => View::Rows(f.clone()),
             (filter, Some(s)) => {
@@ -2556,7 +2771,7 @@ impl App {
                         // Rare (e.g. incomparable type): drop the sort, show why.
                         self.status_msg = Some(format!("sort failed: {e}"));
                         self.sort = None;
-                        match &self.filter {
+                        match &in_play {
                             Some(f) => View::Rows(f.clone()),
                             None => View::All,
                         }

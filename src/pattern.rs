@@ -46,6 +46,9 @@ pub struct Pattern {
     /// it still means the same thing if a column before it has gone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frozen_through: Option<String>,
+    /// Rows taken out of the view by hand (`d`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub masked: Option<SavedMasks>,
     /// The row filter, as the regex that produced it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
@@ -274,6 +277,21 @@ pub struct SessionTab {
     /// The arrangement, recorded exactly as a pattern records one.
     #[serde(default)]
     pub view: Pattern,
+}
+
+/// Rows masked with `d`, written down the way the view was ordered when they
+/// were taken out.
+///
+/// Under a sort that is the column's *value*, so the same rows are found again
+/// however the file has been added to since — and every row sharing the value
+/// goes, which is what masking under that sort meant in the first place. With
+/// no sort the order is the file's own, and then the rows are their numbers.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct SavedMasks {
+    /// The column the values are read in; empty when they are row numbers.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub column: String,
+    pub values: Vec<String>,
 }
 
 /// A join, as the two tabs and key columns it was made from.

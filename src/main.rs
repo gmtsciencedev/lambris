@@ -1749,6 +1749,155 @@ mod tests {
     }
 
     #[test]
+    fn masking_takes_a_row_out_of_the_view_and_everything_downstream() {
+        let (folder, _) = project();
+        let csv = "sample,reads\nS1,10\nS2,20\nS3,30\nS4,40\n";
+        let file = write_text_fixture("csv", csv);
+        let mut tabs = Tabs::open(
+            std::slice::from_ref(&file),
+            HeaderSpec::default(),
+            Store::default(),
+        )
+        .unwrap();
+
+        // Totals over all four to begin with.
+        tabs.app_mut().selected_pos = 1;
+        tabs.key(key('='));
+        assert!(tabs.step());
+        assert!(summary_line(tabs.app_mut(), 60, 10).contains("100"));
+
+        // Mask the second row. The cursor stays where it is, so the next row
+        // comes up under it and a run can be taken out with a run of presses.
+        tabs.app_mut().selected_row = 1;
+        tabs.key(key('d'));
+        assert!(tabs.step());
+        let app = tabs.app_mut();
+        assert_eq!(app.row_count(), 3);
+        assert_eq!(app.selected_row, 1, "the cursor did not jump");
+        assert_eq!(column_values(app, 0), vec!["S1", "S3", "S4"]);
+        // The file itself is untouched: nothing was deleted.
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), csv);
+        // And the total no longer counts it.
+        assert!(summary_line(tabs.app_mut(), 60, 10).contains("80"));
+
+        // What is written out is the view, so a masked row is not in it.
+        let out = folder.join("kept.csv");
+        export_to(&mut tabs, &out);
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "sample,reads\nS1,10\nS3,30\nS4,40\n"
+        );
+
+        // `z` puts it back, like any other change to the view.
+        tabs.key(key('z'));
+        assert!(tabs.step());
+        assert_eq!(tabs.app_mut().row_count(), 4);
+
+        // …and so does `D`, however many are masked.
+        tabs.app_mut().selected_row = 0;
+        tabs.key(key('d'));
+        assert!(tabs.step());
+        tabs.key(key('d'));
+        assert!(tabs.step());
+        assert_eq!(tabs.app_mut().row_count(), 2, "two rows taken out");
+        let text = buffer_text(tabs.app_mut(), 60, 10);
+        assert!(text.contains("✂2"), "the status bar counts them: {text}");
+        tabs.key(key('D'));
+        assert!(tabs.step());
+        assert_eq!(tabs.app_mut().row_count(), 4);
+        assert_eq!(tabs.app_mut().status_msg.as_deref(), Some("2 row(s) back"));
+    }
+
+    #[test]
+    fn a_masked_row_stays_out_when_the_view_is_rearranged() {
+        let csv = "sample,reads\nS1,10\nS2,20\nS3,30\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+
+        app.selected_row = 1;
+        app.handle_key(key('d'));
+        assert_eq!(column_values(&app, 0), vec!["S1", "S3"]);
+
+        // `Ctrl-d` is still half a page down, not a mask.
+        let before = app.row_count();
+        app.handle_key(ctrl('d'));
+        assert_eq!(app.row_count(), before, "Ctrl-d moves, it does not mask");
+
+        // Masks are held as the file's own row numbers, so rearranging the view
+        // cannot bring one back by moving it somewhere else.
+        app.selected_pos = 0;
+        app.handle_key(key('s'));
+        app.handle_key(key('s')); // descending
+        assert_eq!(column_values(&app, 0), vec!["S3", "S1"]);
+
+        app.handle_key(key('&'));
+        type_str(&mut app, "^S");
+        app.handle_key(code(KeyCode::Enter));
+        assert_eq!(column_values(&app, 0), vec!["S3", "S1"], "still out");
+    }
+
+    #[test]
+    fn masking_under_a_sort_takes_every_row_with_that_value() {
+        let csv = "batch,reads\nA,10\nB,20\nA,30\nC,40\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+
+        // Sorted by batch, the two `A` rows sit together and are the same row
+        // as far as the ordering is concerned, so masking takes both.
+        app.selected_pos = 0;
+        app.handle_key(key('s'));
+        assert_eq!(column_values(&app, 0), vec!["A", "A", "B", "C"]);
+        app.selected_row = 0;
+        app.handle_key(key('d'));
+        assert_eq!(column_values(&app, 0), vec!["B", "C"]);
+        let said = app.status_msg.clone().unwrap();
+        assert!(said.contains("2 rows share that batch"), "{said}");
+
+        // Unsorted, a row is only itself.
+        let mut plain = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        plain.selected_row = 0;
+        plain.handle_key(key('d'));
+        assert_eq!(column_values(&plain, 0), vec!["B", "A", "C"]);
+    }
+
+    #[test]
+    fn masks_are_written_into_a_pattern_and_found_again() {
+        let csv = "batch,reads\nA,10\nB,20\nC,30\n";
+        let path = write_text_fixture("csv", csv);
+        let mut app = App::new(Dataset::load(&path).unwrap());
+
+        // Sorted: the mask is written down as the value, so it survives the
+        // file gaining rows above it.
+        app.selected_pos = 0;
+        app.handle_key(key('s'));
+        app.selected_row = 1; // B
+        app.handle_key(key('d'));
+        let pattern = app.pattern("*.csv".to_string());
+        let saved = pattern.masked.clone().expect("written down");
+        assert_eq!(saved.column, "batch");
+        assert_eq!(saved.values, vec!["B"]);
+
+        let grown = write_text_fixture("csv", "batch,reads\nZ,5\nA,10\nB,20\nC,30\n");
+        let mut back = App::new(Dataset::load(&grown).unwrap());
+        back.apply_pattern(&pattern);
+        assert_eq!(
+            column_values(&back, 0),
+            vec!["A", "C", "Z"],
+            "B is out, wherever it moved to"
+        );
+
+        // Unsorted, there is nothing to name a row by but its number.
+        let mut plain = App::new(Dataset::load(&path).unwrap());
+        plain.selected_row = 1;
+        plain.handle_key(key('d'));
+        let pattern = plain.pattern("*.csv".to_string());
+        let saved = pattern.masked.clone().expect("written down");
+        assert_eq!(saved.column, "", "no column to name it by");
+        assert_eq!(saved.values, vec!["2"], "the row number, as the gutter shows it");
+        let mut back = App::new(Dataset::load(&path).unwrap());
+        back.apply_pattern(&pattern);
+        assert_eq!(column_values(&back, 0), vec!["A", "C"]);
+    }
+
+    #[test]
     fn scientific_notation_lines_a_column_up() {
         // Orders of magnitude apart, one negative, and a gap.
         let csv = "gene,reads\nA,622904\nB,0.0014\nC,-5\nD,\n";
@@ -3013,6 +3162,50 @@ mod tests {
             back.cell_display(1, export::BATCH).unwrap().as_deref(),
             Some(format!("row{}", export::BATCH).as_str())
         );
+    }
+
+    #[test]
+    fn browsing_then_naming_a_new_file_takes_the_name_straight_away() {
+        let (folder, _) = project();
+        let sub = folder.join("out");
+        std::fs::create_dir_all(&sub).unwrap();
+        let file = folder.join("a.csv");
+        std::fs::write(&file, "a\n1\n").unwrap();
+        let mut tabs = Tabs::open(
+            std::slice::from_ref(&file),
+            HeaderSpec::default(),
+            Store::default(),
+        )
+        .unwrap();
+        tabs.folder = folder.clone();
+
+        // Browse into a folder, then type a name for a file that is not there.
+        tabs.key(key('X'));
+        tabs.key(KeyEvent::from(KeyCode::Tab));
+        assert!(tabs.app_mut().completions.is_some(), "the picker is up");
+        type_str(tabs.app_mut(), "out/x.parquet");
+        // Nothing starts with that, because nothing is meant to: the picker has
+        // done its job and goes, rather than holding on to Enter.
+        assert!(tabs.app_mut().completions.is_none(), "the picker stood down");
+
+        // So Enter writes it, with no Esc needed first.
+        tabs.key(KeyEvent::from(KeyCode::Enter));
+        assert!(tabs.step());
+        assert!(sub.join("x.parquet").exists(), "written where it was named");
+
+        // At the `o` prompt the picker stays: there a name matching nothing is
+        // a name that cannot be opened, and saying so is the point.
+        tabs.key(key('o'));
+        tabs.key(KeyEvent::from(KeyCode::Tab));
+        type_str(tabs.app_mut(), "nope.csv");
+        let note = tabs
+            .app_mut()
+            .completions
+            .as_ref()
+            .expect("still listing")
+            .note
+            .clone();
+        assert!(note.is_some(), "and it says nothing starts with that");
     }
 
     #[test]
