@@ -22,6 +22,8 @@ pub struct NumStyle {
     pub log: bool,
     /// Fixed number of decimals; `None` keeps each value's natural form.
     pub decimals: Option<u8>,
+    /// Show values in scientific notation (`E`).
+    pub scientific: bool,
 }
 
 /// Bounds on how wide a column is drawn. `MIN`/`MAX_COL_WIDTH` bound the width
@@ -702,6 +704,7 @@ impl App {
                             align: style.align,
                             log: style.log,
                             decimals: style.decimals,
+                            scientific: style.scientific,
                         },
                     )
                 })
@@ -831,6 +834,7 @@ impl App {
                             align: style.align,
                             log: style.log,
                             decimals: style.decimals,
+                            scientific: style.scientific,
                         },
                     )
                 })
@@ -1866,23 +1870,34 @@ impl App {
                 }
                 KeyStage::End | KeyStage::Method => wizard.stage = KeyStage::Method,
             },
-            KeyCode::Char('a') if wizard.stage == KeyStage::Method => {
-                return self.apply_key_sort(wizard, SortMethod::Alphabetic);
-            }
-            KeyCode::Char('n') if wizard.stage == KeyStage::Method => {
-                return self.apply_key_sort(wizard, SortMethod::Numeric);
-            }
-            KeyCode::Char('v') if wizard.stage == KeyStage::Method => {
-                return self.apply_key_sort(wizard, SortMethod::Natural);
+            // The method, and with it the direction: the capital of each
+            // letter is the same comparison read backwards. Choosing both at
+            // once saves following the wizard with an `s` that would only be
+            // there to turn it round.
+            KeyCode::Char(c) if wizard.stage == KeyStage::Method => {
+                let method = match c.to_ascii_lowercase() {
+                    'a' => SortMethod::Alphabetic,
+                    'n' => SortMethod::Numeric,
+                    'v' => SortMethod::Natural,
+                    _ => {
+                        self.key_sort = Some(wizard);
+                        return;
+                    }
+                };
+                let dir = match c.is_ascii_uppercase() {
+                    true => SortDir::Desc,
+                    false => SortDir::Asc,
+                };
+                return self.apply_key_sort(wizard, method, dir);
             }
             _ => {}
         }
         self.key_sort = Some(wizard);
     }
 
-    /// Sort by the chosen slice, ascending. `s` afterwards cycles the direction
-    /// as usual, keeping the slice.
-    fn apply_key_sort(&mut self, wizard: KeySort, method: SortMethod) {
+    /// Sort by the chosen slice. `s` afterwards cycles the direction as usual,
+    /// keeping the slice.
+    fn apply_key_sort(&mut self, wizard: KeySort, method: SortMethod, dir: SortDir) {
         self.key_sort = None;
         let key = SortKey {
             start: wizard.start,
@@ -1893,7 +1908,7 @@ impl App {
         self.record("sort");
         self.sort = Some(SortSpec {
             col: wizard.col,
-            dir: SortDir::Asc,
+            dir,
             key: Some(key),
         });
         if !self.rebuild_view() {
@@ -1904,7 +1919,11 @@ impl App {
             return;
         }
         self.status_msg = Some(format!(
-            "sorted ↑ {}[{}-{}] {}",
+            "sorted {} {}[{}-{}] {}",
+            match dir {
+                SortDir::Asc => "↑",
+                SortDir::Desc => "↓",
+            },
             self.data.column_names[wizard.col],
             wizard.start + 1,
             wizard.end,
@@ -2008,6 +2027,7 @@ impl App {
             KeyCode::Char('(') => self.scope = Some(Scope::Rightward),
             KeyCode::Char(')') => self.scope = Some(Scope::Leftward),
             KeyCode::Char('%') => self.toggle_numeric(),
+            KeyCode::Char('E') => self.toggle_scientific(),
             KeyCode::Char('>') => self.adjust_decimals(1),
             KeyCode::Char('<') => self.adjust_decimals(-1),
             KeyCode::Char('s') => self.cycle_sort(),
@@ -2417,7 +2437,7 @@ impl App {
         }
         let mut style = self.num_styles.get(&selected).copied().unwrap_or_default();
         style.log = !style.log;
-        style.align = style.log || style.decimals.is_some();
+        style.align = style.log || style.decimals.is_some() || style.scientific;
         self.record("numeric style");
         self.apply_num_style(style);
         let what = match (style.align, style.log) {
@@ -2426,6 +2446,27 @@ impl App {
             _ => "numeric",
         };
         self.note_scope(what);
+    }
+
+    /// Show this column's values in scientific notation, or stop. The digits
+    /// after the point are whatever `<`/`>` has asked for, so the two commands
+    /// work together rather than each having its own idea of precision.
+    fn toggle_scientific(&mut self) {
+        let selected = self.selected_col();
+        if !self.data.is_numeric(selected) {
+            self.status_msg = Some("column is not numeric".into());
+            return;
+        }
+        let mut style = self.num_styles.get(&selected).copied().unwrap_or_default();
+        style.scientific = !style.scientific;
+        // A style is kept only while it is doing something.
+        style.align = style.scientific || style.log || style.decimals.is_some();
+        self.record("scientific");
+        self.apply_num_style(style);
+        self.note_scope(match style.scientific {
+            true => "scientific",
+            false => "plain",
+        });
     }
 
     /// Give every covered numeric column this style, or clear it when the style
@@ -2608,7 +2649,7 @@ fn format_stat(value: f64, decimals: Option<u8>) -> String {
 fn is_column_command(code: KeyCode) -> bool {
     matches!(
         code,
-        KeyCode::Char('(' | ')' | 'r' | '%' | '<' | '>' | '=' | 'x')
+        KeyCode::Char('(' | ')' | 'r' | '%' | 'E' | '<' | '>' | '=' | 'x')
     )
 }
 

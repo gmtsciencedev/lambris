@@ -1749,6 +1749,100 @@ mod tests {
     }
 
     #[test]
+    fn scientific_notation_lines_a_column_up() {
+        // Orders of magnitude apart, one negative, and a gap.
+        let csv = "gene,reads\nA,622904\nB,0.0014\nC,-5\nD,\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        app.selected_pos = 1;
+        app.handle_key(key('E'));
+
+        let text = buffer_text(&mut app, 60, 10);
+        assert!(text.contains("6.23e+05"), "{text}");
+        assert!(text.contains("1.40e-03"), "{text}");
+        assert!(text.contains("-5.00e+00"), "{text}");
+        // The status bar says the style is on.
+        assert!(text.contains("num e"), "{text}");
+
+        // Every value is the same width, which is the point: the exponent is
+        // padded, so a change of magnitude does not shift the text sideways.
+        let widths: Vec<usize> = (2..5u16)
+            .map(|y| buffer_line(&mut app, 60, 10, y).trim_end().len())
+            .collect();
+        assert_eq!(
+            widths[0], widths[1],
+            "622904 and 0.0014 come out the same width"
+        );
+        assert_eq!(
+            widths[1], widths[2],
+            "and so does the negative one, the sign being padded for too"
+        );
+
+        // It survives being written to a pattern and read back.
+        let pattern = app.pattern("*.csv".to_string());
+        assert!(pattern.numeric["reads"].scientific, "kept in the pattern");
+        let mut fresh = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        fresh.apply_pattern(&pattern);
+        assert!(buffer_text(&mut fresh, 60, 10).contains("6.23e+05"), "and applied again");
+
+        // `<`/`>` set the digits rather than each command keeping its own.
+        app.handle_key(key('>'));
+        let text = buffer_text(&mut app, 60, 10);
+        assert!(text.contains("6.229e+05"), "three digits now: {text}");
+
+        // `E` again puts it back, and the style goes with it.
+        app.handle_key(key('E'));
+        let text = buffer_text(&mut app, 60, 10);
+        assert!(text.contains("622904"), "{text}");
+        assert!(!text.contains("e+05"), "{text}");
+
+        // Not a numeric column: said, not silently ignored.
+        app.selected_pos = 0;
+        app.handle_key(key('E'));
+        assert_eq!(app.status_msg.as_deref(), Some("column is not numeric"));
+    }
+
+    #[test]
+    fn a_capital_method_letter_sorts_the_other_way() {
+        let csv = "chrom\nchr10\nchr2\nchr1\n";
+        let path = write_text_fixture("csv", csv);
+        let full = 5;
+
+        // `v` is natural ascending; `V` is the same comparison read backwards,
+        // chosen in one step rather than by following the wizard with an `s`.
+        let mut up = App::new(Dataset::load(&path).unwrap());
+        key_sort_wizard(&mut up, 0, full, 'v');
+        assert_eq!(column_values(&up, 0), vec!["chr1", "chr2", "chr10"]);
+        assert!(up.status_msg.clone().unwrap().contains('↑'));
+
+        let mut down = App::new(Dataset::load(&path).unwrap());
+        key_sort_wizard(&mut down, 0, full, 'V');
+        assert_eq!(column_values(&down, 0), vec!["chr10", "chr2", "chr1"]);
+        let said = down.status_msg.clone().unwrap();
+        assert!(said.contains('↓'), "{said}");
+        assert!(said.contains("nat"), "the method is still named: {said}");
+
+        // And `s` picks the cycle up where the wizard left it: already
+        // descending, so the next press is no sort at all — the file's order.
+        down.handle_key(key('s'));
+        assert!(down.sort.is_none(), "the third state of the cycle");
+        assert_eq!(column_values(&down, 0), vec!["chr10", "chr2", "chr1"]);
+        // Past that the cycle starts over as an ordinary column sort: taking
+        // the sort off takes the slice with it, so `chr10` is back before
+        // `chr2` where a plain alphabetic comparison puts it.
+        down.handle_key(key('s'));
+        assert!(down.sort.unwrap().key.is_none(), "the slice went with the sort");
+        assert_eq!(column_values(&down, 0), vec!["chr1", "chr10", "chr2"]);
+
+        // The prompt says the capital is there.
+        let mut app = App::new(Dataset::load(&path).unwrap());
+        app.handle_key(key('S'));
+        app.handle_key(code(KeyCode::Enter));
+        app.handle_key(code(KeyCode::Enter));
+        let text = buffer_text(&mut app, 100, 10);
+        assert!(text.contains("capital reverses it"), "{text}");
+    }
+
+    #[test]
     fn key_sort_puts_rows_without_the_slice_last() {
         let csv = "id\nAA_9\nBB\nCC_1\n";
         let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
@@ -2251,6 +2345,12 @@ mod tests {
         );
 
         // The scope lasts for a run of column commands …
+        app.handle_key(key('E'));
+        assert!(
+            app.num_styles[&2].scientific && app.num_styles[&3].scientific,
+            "E takes the block too"
+        );
+        app.handle_key(key('E'));
         app.handle_key(key('>'));
         assert_eq!(app.num_styles[&2].decimals, app.num_styles[&3].decimals);
         // … and a scoped command evens the block out rather than nudging each

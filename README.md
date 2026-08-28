@@ -68,6 +68,7 @@ cargo run --release
 | `o` | Open another file in a new tab; at the prompt `Tab` browses the folder |
 | `Ctrl-w` | Close the current tab; closing the last one quits |
 | `%` | Numeric column: toggle decimal-point alignment + colouring by log magnitude |
+| `E` | Numeric column: scientific notation (`6.23e+05`); `<`/`>` set the digits |
 | `<` / `>` | Decrease / increase displayed decimals (also aligns on the dot, no colouring) |
 | `?` | Full key reference (`j`/`k` scrolls, `?`/`Esc`/`q` closes) |
 | `T` | Toggle whether the first row is column names or data (re-reads the file) |
@@ -494,14 +495,19 @@ back with `←` only when you want less than that.
 `j`/`k` scroll while you choose, so the offsets can be checked further down the
 table, and `Esc` gives up at any point.
 
-Three ways to compare, all ascending (`s` afterwards cycles the direction,
-keeping the slice):
+Three ways to compare, and the direction chosen with them — **the capital of
+each letter is the same comparison reversed**, so `V` is natural descending. The
+prompt says so. `s` afterwards still cycles the direction, keeping the slice.
 
 | Key | Method | |
 | --- | --- | --- |
-| `a` | alphabetic | character by character |
-| `n` | numeric | parsed as a number; anything that won't parse sorts last |
-| `v` | natural | digits inside text compared as numbers, so `chr2` comes before `chr10` |
+| `a` / `A` | alphabetic | character by character |
+| `n` / `N` | numeric | parsed as a number; anything that won't parse sorts last |
+| `v` / `V` | natural | digits inside text compared as numbers, so `chr2` comes before `chr10` |
+
+Picking the direction here rather than afterwards matters because the wizard
+ends by *applying* the sort: on a large table, `S` … `v` then `s` to turn it
+round sorts twice, and the first one was never wanted.
 
 **Natural** is there because the other two both get identifiers wrong:
 alphabetically `chr10` precedes `chr2`, and numerically neither parses at all.
@@ -509,8 +515,8 @@ It is `sort -V`'s behaviour. The other methods `sort(1)` offers — month,
 human-numeric, random — have no place in a viewer, so they aren't here.
 
 A row whose field is too short to reach the slice has no key and sorts **last**
-ascending, whichever method is chosen, rather than being treated as an empty
-string. Offsets are characters, shown 1-based and inclusive (`id[10-11]` in the
+ascending — first descending, since reversing reverses everything — whichever
+method is chosen, rather than being treated as an empty string. Offsets are characters, shown 1-based and inclusive (`id[10-11]` in the
 status bar) to match `sort -k`.
 
 ## Columns
@@ -630,7 +636,7 @@ names the range while the aim is pending:
 
 ```
 #  name a   b     c
- columns 2-4  the next column command takes all of them · r % < > = x
+ columns 2-4  the next column command takes all of them · r % E < > = x
 ```
 
 It applies to `r` (width), `%` (numeric styling), `<`/`>` (decimals), `=`
@@ -933,7 +939,20 @@ On a numeric column, `%` switches to a numeric display: values are aligned on
 the decimal point and coloured by the base-10 log of their magnitude (cool for
 small values, warm for large), which makes the shape of the data pop out. `<`
 and `>` set a fixed number of decimals (and turn on alignment without the
-colouring). The status bar shows the active style (e.g. `num.3 log`).
+colouring). The status bar shows the active style (e.g. `num.3 e log`).
+
+`E` shows the column in **scientific notation** — `6.23e+05`, `1.40e-03`. The
+digits after the point are whatever `<` and `>` have asked for (two by default),
+so the two commands work together rather than each keeping its own idea of
+precision. The exponent is always signed and never shorter than two digits:
+Rust would write `6.23e5`, which is the same number but a different width from
+one row to the next, and a column of them then fails to line up. Padded, a
+change of magnitude shows as a change in the digits instead of as text sliding
+sideways — which is most of the reason to ask for the notation in the first
+place.
+
+All three are [scoped commands](#scope), so `(` or `)` first applies them to a
+whole block of columns at once. `E` again puts the column back.
 
 ## Big files
 

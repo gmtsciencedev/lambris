@@ -97,6 +97,8 @@ pub struct SavedNumStyle {
     pub log: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decimals: Option<u8>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub scientific: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

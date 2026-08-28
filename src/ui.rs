@@ -42,7 +42,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         "Sorting",
         &[
             ("s", "by the selected column: ascending → descending → off"),
-            ("S", "by part of it: pick the characters, then how to compare"),
+            ("S", "by part of it: pick the characters, then how to compare (capital reverses)"),
         ],
     ),
     (
@@ -59,6 +59,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("  %", "in a resize: fit each column to its values, name aside"),
             ("%", "numeric: align on the dot, colour by magnitude"),
             ("< / >", "fewer / more decimals"),
+            ("E", "scientific notation: 6.23e+05 (< / > set the digits)"),
             ("f", "freeze the columns up to this one"),
             ("u", "put every hidden column back, in the file's order"),
         ],
@@ -860,9 +861,10 @@ fn build_numeric(
         .zip(&values)
         .map(|(cell, value)| {
             let (cell, value) = (cell.as_ref()?, (*value)?);
-            let text = match st.decimals {
-                Some(n) => format!("{value:.*}", n as usize),
-                None => cell.trim().to_string(),
+            let text = match (st.scientific, st.decimals) {
+                (true, decimals) => scientific(value, decimals.unwrap_or(2) as usize),
+                (false, Some(n)) => format!("{value:.*}", n as usize),
+                (false, None) => cell.trim().to_string(),
             };
             let (int, frac) = match text.split_once('.') {
                 Some((i, f)) => (i.to_string(), f.to_string()),
@@ -893,6 +895,24 @@ fn build_numeric(
         .log
         .then(|| values.iter().map(|v| v.map(log_color)).collect());
     (cells, colors)
+}
+
+/// A value in scientific notation, with the exponent always signed and never
+/// shorter than two digits — `6.23e+05`, `1.40e-03`.
+///
+/// Rust writes `6.23e5`, which is the same number but a different width from
+/// one row to the next; padding the exponent means a column of them lines up on
+/// its own, and a change of magnitude shows as a change in the digits rather
+/// than as text shifting sideways.
+fn scientific(value: f64, decimals: usize) -> String {
+    let text = format!("{value:.*e}", decimals);
+    // Infinities and NaN have no exponent to pad; they are already themselves.
+    let Some((mantissa, exponent)) = text.split_once('e') else {
+        return text;
+    };
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    let sign = if exponent < 0 { '-' } else { '+' };
+    format!("{mantissa}e{sign}{:02}", exponent.abs())
 }
 
 /// Colour a value by the base-10 log of its magnitude, cool (small) to warm
@@ -1018,8 +1038,9 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App, clipped: &Clipped) {
     if let Some(st) = app.num_styles.get(&app.selected_col()) {
         let dec = st.decimals.map(|n| format!(".{n}")).unwrap_or_default();
         let log = if st.log { " log" } else { "" };
+        let sci = if st.scientific { " e" } else { "" };
         spans.push(Span::styled(
-            format!("  num{dec}{log}"),
+            format!("  num{dec}{sci}{log}"),
             Style::new().fg(Color::Green),
         ));
     }
@@ -1090,7 +1111,7 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App, banner: Option<&str>) {
                 Style::new().fg(Color::Black).bg(Color::Yellow).bold(),
             ),
             Span::styled(
-                " the next column command takes all of them · r % < > = x",
+                " the next column command takes all of them · r % E < > = x",
                 Style::new().dim(),
             ),
         ]);
@@ -1125,7 +1146,7 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App, banner: Option<&str>) {
             KeyStage::End => ("end of the sort key", "←/→ move · Enter next · Esc cancel"),
             KeyStage::Method => (
                 "how to compare it",
-                "a alphabetic · n numeric · v natural · Esc cancel",
+                "a alphabetic · n numeric · v natural · capital reverses it · Esc cancel",
             ),
         };
         let line = Line::from(vec![
