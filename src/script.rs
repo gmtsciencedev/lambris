@@ -15,6 +15,7 @@
 //! line is the one `X` already draws.
 
 use std::fmt;
+use std::path::Path;
 
 use anyhow::{Result, bail};
 
@@ -305,27 +306,124 @@ fn tokenise(statement: &str, line: usize) -> Result<Vec<Token>> {
     Ok(tokens)
 }
 
-/// Put the run's arguments in for `$1`, `$2`, … A whole token is replaced, so
-/// what arrives is a value and never more syntax.
+/// Put the run's arguments in for `$1`, `$2`, … and their modifiers.
+///
+/// Done after the text has been broken into words, so what arrives is a value
+/// and never more syntax: a path holding a space or a quote cannot turn into
+/// extra words or an unbalanced string. A word that held an argument comes back
+/// as a quoted one for the same reason.
+///
+/// Left alone inside a `/pattern/`, where `$` is an anchor and means itself.
 fn substitute(tokens: Vec<Token>, args: &[String], line: usize) -> Result<Vec<Token>> {
-    let value = |name: &str| -> Result<String> {
-        let n: usize = name[1..]
-            .parse()
-            .map_err(|_| anyhow::anyhow!("line {line}: {name} is not an argument number"))?;
-        match n.checked_sub(1).and_then(|i| args.get(i)) {
-            Some(arg) => Ok(arg.clone()),
-            None => bail!("line {line}: {name} was not given — this script takes {n} argument(s)"),
-        }
-    };
     tokens
         .into_iter()
         .map(|token| match &token {
-            Token::Word(w) | Token::Text(w) if w.starts_with('$') && w.len() > 1 => {
-                Ok(Token::Text(value(w)?))
-            }
+            Token::Word(w) if w.contains('$') => Ok(Token::Text(expand(w, args, line)?)),
+            Token::Text(t) if t.contains('$') => Ok(Token::Text(expand(t, args, line)?)),
             _ => Ok(token),
         })
         .collect()
+}
+
+/// One argument reference: `$1`, or `${1}` with modifiers — `${1:stem}`.
+///
+/// `/data/runs/march.tsv` gives `march.tsv`, `march`, `/data/runs` and `tsv`
+/// for `basename`, `stem`, `dir` and `ext`.
+fn reference(body: &str, args: &[String], line: usize) -> Result<String> {
+    let (number, modifiers) = match body.split_once(':') {
+        Some((number, rest)) => (number, rest),
+        None => (body, ""),
+    };
+    let n: usize = number
+        .parse()
+        .map_err(|_| anyhow::anyhow!("line {line}: ${number} is not an argument number"))?;
+    let mut value = match n.checked_sub(1).and_then(|i| args.get(i)) {
+        Some(arg) => arg.clone(),
+        None => bail!("line {line}: ${n} was not given — this script takes {n} argument(s)"),
+    };
+    for modifier in modifiers.split(':').filter(|m| !m.is_empty()) {
+        value = match modifier {
+            // Four words that say what they do, and no pattern matching.
+            //
+            // `basename` is the file name *with* its extension, because that is
+            // what `basename(1)` prints and what every language means by it;
+            // giving a familiar word a second meaning is how `${1:h}` comes to
+            // write a real file under a name nobody meant. A script runs
+            // unattended, where a name that is quietly wrong is the worst thing
+            // it can produce, so each word here means what it means elsewhere.
+            "basename" => part_of(&value, |p| p.file_name()),
+            "stem" => part_of(&value, |p| p.file_stem()),
+            "dir" => part_of(&value, |p| p.parent().map(|p| p.as_os_str())),
+            "ext" => part_of(&value, |p| p.extension()),
+            other => {
+                // The near misses, answered with the word that was meant.
+                let instead = match other {
+                    "t" | "name" | "file" | "filename" => " — `:basename` is the file name",
+                    "r" | "base" | "noext" | "root" => {
+                        " — `:stem` is the name without its extension"
+                    }
+                    "h" | "dirname" | "folder" | "parent" => " — `:dir` is the folder",
+                    "e" | "extension" | "suffix" => " — `:ext` is the extension",
+                    _ => "",
+                };
+                bail!(
+                    "line {line}: `:{other}` is not a modifier — basename, stem, dir, \
+                     ext{instead}"
+                )
+            }
+        };
+    }
+    Ok(value)
+}
+
+fn part_of(value: &str, part: impl Fn(&Path) -> Option<&std::ffi::OsStr>) -> String {
+    part(Path::new(value))
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Put every argument reference in `text` in its place.
+fn expand(text: &str, args: &[String], line: usize) -> Result<String> {
+    let mut out = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '$' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let body = match chars.get(i) {
+            Some('{') => {
+                i += 1;
+                let start = i;
+                while chars.get(i).is_some_and(|&c| c != '}') {
+                    i += 1;
+                }
+                if chars.get(i).is_none() {
+                    bail!("line {line}: a ${{…}} is not closed");
+                }
+                let body: String = chars[start..i].iter().collect();
+                i += 1;
+                body
+            }
+            // Bare `$1`: digits only, so `$1.csv` is the argument and then a
+            // suffix, which is what it looks like.
+            _ => {
+                let start = i;
+                while chars.get(i).is_some_and(|c| c.is_ascii_digit()) {
+                    i += 1;
+                }
+                if start == i {
+                    bail!("line {line}: `$` should be followed by an argument number");
+                }
+                chars[start..i].iter().collect()
+            }
+        };
+        out.push_str(&reference(&body, args, line)?);
+    }
+    Ok(out)
 }
 
 /// A statement's tokens, taken from the front as it is read.
@@ -1087,6 +1185,78 @@ export cut to "out.parquet"
         let missing = Script::parse("open $2 as in", &["only-one".to_string()])
             .expect_err("not given");
         assert!(missing.to_string().contains("$2 was not given"), "{missing}");
+    }
+
+    #[test]
+    fn an_argument_can_be_renamed_on_the_way_out() {
+        // The whole point of a modifier: the same file, said again with
+        // another suffix, without writing the name twice.
+        let commands = parse_with(
+            r#"open $1 as in; export in to "${1:stem}.csv""#,
+            &["/data/runs/march.tsv"],
+        );
+        assert_eq!(
+            commands[1],
+            Command::Export {
+                handle: "in".to_string(),
+                path: "march.csv".to_string()
+            }
+        );
+
+        for (script, arg, wanted) in [
+            (r#"export x to "${1:basename}""#, "/data/march.tsv", "march.tsv"),
+            (r#"export x to "${1:dir}/out.csv""#, "/data/march.tsv", "/data/out.csv"),
+            (r#"export x to "out.${1:ext}""#, "/data/march.tsv", "out.tsv"),
+            // Beside the file it came from, under the same name.
+            (
+                r#"export x to "${1:dir}/${1:stem}.csv""#,
+                "/data/march.tsv",
+                "/data/march.csv",
+            ),
+            // No extension to take off, and nothing pretends there was one.
+            (r#"export x to "${1:stem}.csv""#, "plain", "plain.csv"),
+        ] {
+            let commands = parse_with(script, &[arg]);
+            match &commands[0] {
+                Command::Export { path, .. } => assert_eq!(path, wanted, "{script} on {arg}"),
+                other => panic!("{other:?}"),
+            }
+        }
+
+        // `$` inside a /pattern/ is an anchor and stays one.
+        let commands = parse_with("filter x /^S1$/", &["unused"]);
+        assert_eq!(
+            commands[0],
+            Command::Filter {
+                handle: "x".to_string(),
+                regex: "^S1$".to_string()
+            }
+        );
+
+        let bad = Script::parse(r#"export x to "${1:z}""#, &["a.tsv".to_string()])
+            .expect_err("not a modifier");
+        assert!(bad.to_string().contains("basename, stem, dir, ext"), "{bad}");
+
+        // The shell letters are refused rather than obeyed, since `:h` there
+        // means the folder and reads here like the stem — the one mistake that
+        // would write a real file under a quietly wrong name.
+        // Near misses are answered with the word that was meant, rather than
+        // obeyed: a shell's `:h` is the folder and reads here like the stem,
+        // which is the one mistake that writes a real file under a wrong name.
+        for (tried, wanted) in [
+            ("h", "`:dir` is the folder"),
+            ("t", "`:basename` is the file name"),
+            ("noext", "`:stem` is the name without its extension"),
+            ("suffix", "`:ext` is the extension"),
+        ] {
+            let e = Script::parse(
+                &format!(r#"export x to "${{1:{tried}}}.csv""#),
+                &["/data/march.tsv".to_string()],
+            )
+            .expect_err(tried);
+            assert!(e.to_string().contains(&format!("`:{tried}` is not a modifier")), "{e}");
+            assert!(e.to_string().contains(wanted), "{tried}: {e}");
+        }
     }
 
     fn parse_with(text: &str, args: &[&str]) -> Vec<Command> {

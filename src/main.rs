@@ -136,6 +136,9 @@ struct Tabs {
     folder: PathBuf,
     /// Sessions, one per folder, written back by `W`.
     sessions: Sessions,
+    /// Whether the offer of a macro has been made. Once per run: a word worth
+    /// saying the first time something is written out, and a nuisance every
+    /// time after that.
     /// Whether this run belongs to the session saved here: it was started by
     /// reopening one, or `W` has been pressed. A run that named its files owns
     /// nothing that was saved, so it has nothing to lose on the way out.
@@ -509,9 +512,13 @@ impl Tabs {
             out.finish()?;
             Ok(Some(rows_out))
         })();
+        // Named as the folder sees it rather than in full: the status bar has
+        // a row and column count in front of it, and a long path pushes
+        // whatever follows off the end of the line — which is where the word
+        // about `M` was going.
+        let shown = relative_to(&self.folder, &path);
         let message = match written {
             Ok(Some(rows)) => {
-                let hint = " · M saves this as a macro";
                 // Remembered as it now stands, so that a second export to the
                 // same name is recognised as its own — and so that a file
                 // something else has since put there is not.
@@ -527,9 +534,8 @@ impl Tabs {
                     app.exports.push(written);
                 }
                 format!(
-                    "wrote {rows} rows × {} cols to {} as {}{hint}",
+                    "wrote {rows} rows × {} cols to {shown} as {} · M saves this as a macro",
                     cols.len(),
-                    path.display(),
                     target.label()
                 )
             }
@@ -3434,6 +3440,38 @@ mod tests {
             std::fs::read_to_string(folder.join("mine.lam")).unwrap(),
             "# hand written\n"
         );
+    }
+
+    #[test]
+    fn the_word_about_m_survives_a_long_path() {
+        let (folder, _) = project();
+        // A folder deep enough that the full path would fill the line.
+        let deep = folder.join("ref/dockers/private/metaphlan4-PRJNA1023797");
+        std::fs::create_dir_all(&deep).unwrap();
+        let file = folder.join("a.csv");
+        std::fs::write(&file, "a\n1\n").unwrap();
+        let mut tabs = Tabs::open(
+            std::slice::from_ref(&file),
+            HeaderSpec::default(),
+            Store::default(),
+        )
+        .unwrap();
+        tabs.folder = folder.clone();
+
+        export_to(&mut tabs, &deep.join("x.parquet"));
+        // Too long for the room left beside the indicators, so it comes down
+        // whole onto the line below, where the key hints usually sit.
+        let below = buffer_line(tabs.app_mut(), 120, 10, 9);
+        assert!(below.contains("M saves this as a macro"), "{below}");
+        assert!(below.contains("metaphlan4-PRJNA1023797/x.parquet"), "{below}");
+        assert!(!below.contains("hjkl move"), "the hints stood aside: {below}");
+
+        // A short one stays up on the status bar, where the hints are left be.
+        tabs.app_mut().status_msg = Some("done".into());
+        let bar = buffer_line(tabs.app_mut(), 120, 10, 8);
+        assert!(bar.contains("done"), "{bar}");
+        let below = buffer_line(tabs.app_mut(), 120, 10, 9);
+        assert!(below.contains("hjkl move"), "{below}");
     }
 
     #[test]

@@ -122,6 +122,25 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
 const HELP_KEY_WIDTH: usize = 30;
 
 const COL_SPACING: u16 = 1;
+
+/// Whether the status message has to go on the line below.
+///
+/// The status bar carries its indicators first, and what is left over is often
+/// not much. Rather than let the tail of a message fall off the end — which is
+/// where a word about what to press next kept disappearing behind a long path —
+/// a message that will not fit takes the hint line instead. The bar does not
+/// change height for it: a bar that grew and shrank would shift the table under
+/// the reader every time something was said. The hints are a cheat sheet, and
+/// can wait.
+fn message_overflows(app: &App, width: u16) -> bool {
+    let Some(message) = &app.status_msg else {
+        return false;
+    };
+    let area = Rect::new(0, 0, width, 1);
+    let spans = status_spans(app, &Clipped::default(), area, false);
+    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    used + 2 + message.chars().count() > width as usize
+}
 const NA: &str = "NA";
 
 /// The block a crop covers while it is being marked. Brighter and bluer than
@@ -942,7 +961,18 @@ fn gutter_width(app: &App) -> u16 {
     (max_row.to_string().len() as u16).max(2)
 }
 
+/// Draw the status bar, wrapped onto as many lines as it was given.
 fn render_status(frame: &mut Frame, area: Rect, app: &App, clipped: &Clipped) {
+    let spans = status_spans(app, clipped, area, !message_overflows(app, area.width));
+    frame.render_widget(Line::from(spans), area);
+}
+
+fn status_spans(
+    app: &App,
+    clipped: &Clipped,
+    area: Rect,
+    with_message: bool,
+) -> Vec<Span<'static>> {
     // In input mode the status bar becomes the search/filter prompt.
     if let Mode::Input(kind) = app.mode {
         let sigil = match kind {
@@ -960,15 +990,16 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App, clipped: &Clipped) {
             InputKind::Export => "write to ",
             InputKind::Macro => "macro ",
         };
-        let line = Line::from(vec![
+        return vec![
             Span::styled(
                 format!("{sigil}{}", app.input),
                 Style::new().fg(Color::White),
             ),
-            Span::styled("▏", Style::new().fg(Color::White).add_modifier(Modifier::SLOW_BLINK)),
-        ]);
-        frame.render_widget(line, area);
-        return;
+            Span::styled(
+                "▏",
+                Style::new().fg(Color::White).add_modifier(Modifier::SLOW_BLINK),
+            ),
+        ];
     }
 
     let (sel_row, count) = if app.row_count() == 0 {
@@ -1053,7 +1084,9 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App, clipped: &Clipped) {
             Style::new().fg(Color::Green),
         ));
     }
-    if let Some(msg) = &app.status_msg {
+    if let Some(msg) = &app.status_msg
+        && with_message
+    {
         spans.push(Span::styled(format!("  {msg}"), Style::new().fg(Color::Magenta)));
     }
 
@@ -1070,7 +1103,9 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App, clipped: &Clipped) {
             (clipped.title.as_ref().cloned(), Style::new().fg(Color::Cyan)),
         ] {
             let Some(text) = text else { continue };
-            let room = (area.width as usize).saturating_sub(used(&spans) + 2);
+            // Against everything the bar has, not just its first line.
+            let all = area.width as usize * area.height.max(1) as usize;
+            let room = all.saturating_sub(used(&spans) + 2);
             // Below a handful of characters there is nothing worth showing.
             if room < 6 {
                 break;
@@ -1081,12 +1116,28 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App, clipped: &Clipped) {
             ));
         }
     }
-    frame.render_widget(Line::from(spans), area);
+    spans
 }
 
 /// The bottom line: command hints normally, the input legend while typing, or
 /// the selected column's info when info mode (`i`) is on.
 fn render_help(frame: &mut Frame, area: Rect, app: &App, banner: Option<&str>) {
+    // A message with no room on the status bar comes down here whole, rather
+    // than being cut short up there.
+    if banner.is_none()
+        && !app.show_info
+        && message_overflows(app, area.width)
+        && let Some(message) = &app.status_msg
+    {
+        frame.render_widget(
+            Line::from(Span::styled(
+                format!(" {message}"),
+                Style::new().fg(Color::Magenta),
+            )),
+            area,
+        );
+        return;
+    }
     // A wizard driven by the loop takes the line over: it is what the next
     // keypress does.
     if let Some(banner) = banner {

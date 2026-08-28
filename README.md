@@ -438,7 +438,43 @@ That last one is why the extension decides rather than a flag: a shebang can
 carry only the interpreter, so `#!/usr/bin/env lambris` has to be enough on its
 own. `$1`, `$2` … stand for the arguments after the script, and are put in after
 the line has been broken into words — a path with a space or a quote in it
-arrives as one value and cannot turn into more syntax.
+arrives as one value and cannot turn into more syntax. Inside a `/pattern/` a
+`$` is an anchor and is left alone.
+
+**Naming the output after the input** is what an argument is usually for, so
+`${1}` takes four modifiers — and they chain:
+
+| | `/data/runs/march.tsv` becomes |
+| --- | --- |
+| `${1:basename}` | `march.tsv` |
+| `${1:stem}` | `march` |
+| `${1:dir}` | `/data/runs` |
+| `${1:ext}` | `tsv` |
+
+```sh
+export joined to "${1:stem}.parquet"          # march.tsv in, march.parquet out
+export joined to "${1:dir}/${1:stem}.csv"     # …beside the file it came from
+```
+
+Four words and no pattern matching: enough for *that file, named again with
+another suffix*, and nothing to escape.
+
+`basename` is the file name **with** its extension, because that is what
+`basename(1)` prints and what every language means by it; `stem` is the one
+without. Giving a familiar word a second meaning is precisely how the shells'
+own spelling goes wrong — `:t`, `:r`, `:h`, `:e`, where `:h` is the *folder*, so
+`"${1:h}.parquet"` reads like `march.parquet` and means `/data/runs.parquet`.
+
+A script runs unattended, where a name that is quietly wrong is the worst thing
+it can produce, so a word that is not one of the four is refused and the message
+names the one that was meant:
+
+```
+line 3: `:h` is not a modifier — basename, stem, dir, ext — `:dir` is the folder
+```
+
+(For reference: `sh` spells the same idea `"${1%.*}.csv"`, and getting the folder
+off as well needs a second variable; `fish` has `path change-extension`.)
 
 Nothing is drawn. A script is a *transformation*; [patterns](#patterns) are the
 tool for looking at something.
