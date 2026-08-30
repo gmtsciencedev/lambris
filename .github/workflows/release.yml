@@ -22,9 +22,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          # Both macOS targets are built on the Apple Silicon runner: the
+          # Xcode toolchain cross-compiles between the two architectures, and
+          # the Intel runner label no longer gets a machine — a job asking for
+          # it waits for one that is never coming.
+          - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
           # musl rather than gnu: statically linked, so it runs on cluster
           # nodes whose glibc is a decade old, which is where the big files are.
