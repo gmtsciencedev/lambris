@@ -63,6 +63,7 @@ cargo run --release
 | `r` | Set this column's width; `( r` evens out a whole block (`%` fits the values) |
 | `[` / `]` (or `Shift-←`/`Shift-→`) | Move the selected column left / right |
 | `u` | Put every hidden column back, in the file's own order |
+| `m` | Show the view as a markdown table, to copy somewhere (see [Markdown](#markdown)) |
 | `t` | Transpose the table (first column becomes the headers); `t`/`Esc` to return |
 | `J` | Join two tabs on a key column: `Enter` on each side (see [Join](#join)) |
 | `c` | Crop: mark one cell, then another — the rectangle becomes a tab (see [Cropping](#cropping)) |
@@ -307,6 +308,7 @@ choose beyond where it goes:
 | `out.tsv` | tab-separated |
 | `out.parquet` | parquet, types and all |
 | `out.xlsx` | one Excel sheet, a type per cell |
+| `out.md` | a markdown pipe table (see [Markdown](#markdown)) |
 | `out.csv.gz` | gzipped, either delimited form |
 
 A bare name lands in the folder `lambris` was started in, and `Tab` browses from
@@ -897,6 +899,36 @@ key columns, and the result can address any row of either side. Both sides are
 therefore materialised, and each is capped at **200 000 rows** — enough that the
 columns stay in the chunk cache. Past that it declines rather than trying; a long
 join can be abandoned with `Esc`/`Ctrl-C` like any other heavy operation.
+
+## Markdown
+
+`m` shows the view as a markdown table, drawn plainly so it can be dragged over
+with the mouse and dropped into an issue, a message or a document. `X` to a
+`.md` file writes the same thing, for a table too long to pick up off a screen.
+
+```markdown
+| sample | reads | note |
+| --- | ---: | --- |
+| S1 | 10 | a\|b |
+| S2 | 2500 |  |
+```
+
+Number columns are aimed right in the rule, so they line up once something
+renders it. A `|` in a value is escaped, since unescaped it would start another
+cell, and a newline becomes a space, since a row is a line. Nothing else is
+escaped: getting out of the way of every character markdown gives a meaning to
+would leave a table nobody could read, and this format exists to be read.
+
+The screen shows the first 1000 rows — a table going somewhere by way of the
+clipboard is a small one, and the footer says when there is more. Both paths go
+through the same row writer, so what is copied off the screen and what lands in
+a `.md` file agree down to the byte.
+
+There is **no markdown in**. A pipe table has no types, and a gap in it is
+indistinguishable from an empty string, so reading one back would invent
+information the file never had. It is a way of showing a table, not of holding
+one — which is also why `.md` sits alongside `.csv` and `.parquet` rather than
+replacing either.
 
 ## Masking rows
 

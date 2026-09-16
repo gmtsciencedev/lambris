@@ -3583,6 +3583,82 @@ mod tests {
     }
 
     #[test]
+    fn m_shows_the_view_as_a_markdown_table() {
+        // A pipe in a value, a number column, a gap.
+        let csv = "sample,reads,note\nS1,10,a|b\nS2,2500,\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+
+        app.handle_key(key('m'));
+        assert!(app.show_markdown);
+        assert_eq!(
+            app.markdown,
+            vec![
+                "| sample | reads | note |",
+                // Numbers aim right, so they line up once it is rendered.
+                "| --- | ---: | --- |",
+                // The pipe is escaped: unescaped it would start another cell.
+                "| S1 | 10 | a\\|b |",
+                // A gap is an empty cell; markdown has nothing else to offer.
+                "| S2 | 2500 |  |",
+            ]
+        );
+
+        // Drawn hard against the left edge with no border, so what the mouse
+        // drags over is the table and nothing else.
+        let line = buffer_line(&mut app, 40, 10, 1);
+        assert!(line.starts_with("| sample |"), "{line:?}");
+        // …and the way out is said below it, off the table.
+        let text = buffer_text(&mut app, 80, 10);
+        assert!(text.contains("m/Esc/q close"), "{text}");
+
+        // It is the *view*, so hiding a column and filtering carry through.
+        app.handle_key(key('m'));
+        assert!(!app.show_markdown, "m again puts it away");
+        app.selected_pos = 2;
+        app.handle_key(key('x'));
+        app.handle_key(key('m'));
+        assert_eq!(app.markdown[0], "| sample | reads |");
+    }
+
+    #[test]
+    fn a_md_export_and_the_m_view_are_the_same_table() {
+        let (folder, _) = project();
+        let csv = "sample,reads,note\nS1,10,a|b\nS2,2500,\n";
+        let file = write_text_fixture("csv", csv);
+        let mut tabs = Tabs::open(
+            std::slice::from_ref(&file),
+            HeaderSpec::default(),
+            Store::default(),
+        )
+        .unwrap();
+        tabs.folder = folder.clone();
+
+        // Arrange it, so this is the view rather than the file.
+        tabs.app_mut().selected_pos = 0;
+        tabs.key(key('s'));
+        assert!(tabs.step());
+
+        tabs.key(key('m'));
+        assert!(tabs.step());
+        let on_screen = tabs.app_mut().markdown.join("\n") + "\n";
+        tabs.key(key('m'));
+        assert!(tabs.step());
+
+        let out = folder.join("table.md");
+        export_to(&mut tabs, &out);
+        // What is copied off the screen and what lands in a file agree, down to
+        // the byte: both go through the same row writer.
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), on_screen);
+        assert!(on_screen.starts_with("| sample | reads | note |\n| --- | ---: | --- |\n"));
+
+        // And it gzips like the other text formats.
+        let zipped = folder.join("table.md.gz");
+        export_to(&mut tabs, &zipped);
+        let msg = tabs.app_mut().status_msg.clone().unwrap_or_default();
+        assert!(msg.contains("as markdown.gz"), "{msg}");
+    }
+
+    #[test]
     fn the_name_decides_the_format() {
         let (folder, _) = project();
         let file = write_text_fixture("csv", "a,b\n1,x\n2,y\n");
@@ -3616,6 +3692,8 @@ mod tests {
         for (name, expected) in [
             ("out", "give the name an extension"),
             ("out.docx", "is not something this can write"),
+            // Markdown has no types in it, so it is a way out and not a way in.
+            ("out.md.zip", "is not something this can write"),
             ("out.parquet.gz", "holds its own compression"),
             ("out.xlsx.gz", "already a zip"),
         ] {

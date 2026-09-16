@@ -11,6 +11,7 @@ use crate::formula::FormulaError;
 use crate::pattern::{
     Pattern, SavedColumn, SavedHeader, SavedMasks, SavedNumStyle, SavedSort, SavedSortKey,
 };
+use crate::export;
 use crate::interrupt;
 
 /// How a numeric column is displayed (set with `%`, `<`, `>`).
@@ -562,6 +563,12 @@ pub struct App {
     pub key_sort: Option<KeySort>,
     /// The first corner of a crop — a view row and a display position — while
     /// `c` waits for the opposite one.
+    /// The view written out as a markdown table, while `m` is showing it, and
+    /// whether there was more of it than that.
+    pub markdown: Vec<String>,
+    pub show_markdown: bool,
+    pub markdown_more: bool,
+    pub markdown_offset: usize,
     pub crop_mark: Option<(usize, usize)>,
     /// A crop asked for: the rectangle its two corners enclose.
     pub crop_request: Option<CropSpan>,
@@ -650,6 +657,10 @@ impl App {
             question: None,
             quit_anyway: false,
             key_sort: None,
+            markdown: Vec::new(),
+            show_markdown: false,
+            markdown_more: false,
+            markdown_offset: 0,
             crop_mark: None,
             crop_request: None,
             col_widths: HashMap::new(),
@@ -1226,6 +1237,9 @@ impl App {
         if self.show_help {
             return self.handle_help(key);
         }
+        if self.show_markdown {
+            return self.handle_markdown(key);
+        }
         if self.key_sort.is_some() {
             return self.handle_key_sort(key);
         }
@@ -1278,6 +1292,74 @@ impl App {
     }
 
     /// Scroll or dismiss the `?` key reference. Only `Ctrl-c` still quits.
+    /// How many rows `m` shows. A table headed somewhere else by way of the
+    /// clipboard is a small one; `X` to a `.md` file takes the whole view, and
+    /// the footer says so.
+    pub const MARKDOWN_ROWS: usize = 1000;
+
+    /// Write the view out as a markdown table, to be read off the screen.
+    ///
+    /// The same rows a `.md` export would write, made the same way, so what is
+    /// copied off the screen and what lands in a file cannot disagree.
+    fn build_markdown(&mut self) {
+        let cols = self.visible_cols().to_vec();
+        let total = self.row_count();
+        let taking = total.min(Self::MARKDOWN_ROWS);
+        let rows = self.view_slice(0, taking);
+        let mut columns = Vec::with_capacity(cols.len());
+        for &col in &cols {
+            match self.data.cells(col, &rows) {
+                Ok(cells) => columns.push(cells),
+                Err(e) => {
+                    self.status_msg = Some(format!("markdown failed: {e}"));
+                    return;
+                }
+            }
+        }
+        let names: Vec<&str> = cols
+            .iter()
+            .map(|&c| self.data.column_names[c].as_str())
+            .collect();
+        let numeric: Vec<bool> = cols.iter().map(|&c| self.data.is_numeric(c)).collect();
+        let mut lines = Vec::with_capacity(taking + 2);
+        lines.push(export::row_of(names.into_iter()));
+        lines.push(export::rule_of(&numeric));
+        for i in 0..taking {
+            let cells: Vec<&str> = columns
+                .iter()
+                .map(|col| col[i].as_deref().unwrap_or_default())
+                .collect();
+            lines.push(export::row_of(cells.into_iter()));
+        }
+        self.markdown = lines;
+        self.markdown_more = total > taking;
+        self.markdown_offset = 0;
+        self.show_markdown = true;
+    }
+
+    /// Scroll or dismiss the markdown table.
+    fn handle_markdown(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('c') if ctrl => self.should_quit = true,
+            KeyCode::Char('m') | KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => {
+                self.show_markdown = false;
+                self.markdown = Vec::new();
+                self.markdown_offset = 0;
+            }
+            KeyCode::Char('j') | KeyCode::Down => self.markdown_offset += 1,
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.markdown_offset = self.markdown_offset.saturating_sub(1)
+            }
+            KeyCode::PageDown | KeyCode::Char('f') if !ctrl => self.markdown_offset += 10,
+            KeyCode::PageUp | KeyCode::Char('b') => {
+                self.markdown_offset = self.markdown_offset.saturating_sub(10)
+            }
+            KeyCode::Char('g') | KeyCode::Home => self.markdown_offset = 0,
+            _ => {}
+        }
+    }
+
     fn handle_help(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let scroll = |off: usize, by: usize| off.saturating_add(by);
@@ -2072,6 +2154,9 @@ impl App {
                 }
             }
             KeyCode::Char('?') => self.show_help = true,
+            // `m` shows the view as a markdown table, to be picked up with the
+            // mouse and dropped somewhere else.
+            KeyCode::Char('m') => self.build_markdown(),
             // `J` starts the join wizard; `Enter` then picks the key column
             // under the cursor, once on each side.
             KeyCode::Char('J') => self.join_request = true,

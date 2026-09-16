@@ -83,6 +83,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     (
         "Other tables",
         &[
+            ("m", "show the view as a markdown table, to copy somewhere"),
             ("t", "transpose the table (t or Esc to come back)"),
             ("J", "join two tabs on a key column: Enter on each side"),
             ("c", "crop: mark one cell, then the opposite corner — it becomes a tab"),
@@ -102,7 +103,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             ("w", "remember this arrangement for the file (or a glob of files)"),
             ("W", "remember every tab open here — joins included; `lambris` reopens"),
-            ("X", "write this view out: .csv .tsv .parquet .xlsx .csv.gz"),
+            ("X", "write this view out: .csv .tsv .parquet .xlsx .md .csv.gz"),
             ("M", "write this session down as a script that can do it again"),
             ("z / Z", "undo / redo the last change to the view"),
         ],
@@ -203,6 +204,11 @@ pub fn render(
     // The key reference covers the table rather than sitting beside it.
     if app.show_help {
         render_help_page(frame, body_area, app);
+        render_status(frame, status_area, app, &clipped);
+        return Ok(());
+    }
+    if app.show_markdown {
+        render_markdown(frame, body_area, app);
         render_status(frame, status_area, app, &clipped);
         return Ok(());
     }
@@ -652,6 +658,28 @@ fn wrapped(text: &str, width: usize) -> Vec<String> {
 }
 
 /// Draw the `?` key reference over the table, scrolled to `app.help_offset`.
+/// The view as a markdown table, drawn to be taken off the screen.
+///
+/// No border and no gutter, and the text starts hard against the left edge:
+/// what the mouse drags over has to be the table and nothing else, or what
+/// lands in the clipboard is a border with some markdown inside it. How to
+/// close it goes on the hint line below instead.
+fn render_markdown(frame: &mut Frame, area: Rect, app: &mut App) {
+    let height = area.height as usize;
+    app.markdown_offset = app
+        .markdown_offset
+        .min(app.markdown.len().saturating_sub(height.max(1)));
+    let lines: Vec<Line> = app
+        .markdown
+        .iter()
+        .skip(app.markdown_offset)
+        .take(height)
+        .map(|line| Line::raw(line.as_str()))
+        .collect();
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 fn render_help_page(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut lines: Vec<Line> = Vec::new();
     for (section, keys) in HELP {
@@ -1138,6 +1166,23 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App, banner: Option<&str>) {
         );
         return;
     }
+    if app.show_markdown {
+        let more = match app.markdown_more {
+            true => format!(
+                " · first {} rows — X to a .md file takes the whole view",
+                App::MARKDOWN_ROWS
+            ),
+            false => String::new(),
+        };
+        frame.render_widget(
+            Line::from(Span::styled(
+                format!(" select it with the mouse · j/k scroll · m/Esc/q close{more}"),
+                Style::new().fg(Color::Black).bg(Color::Cyan),
+            )),
+            area,
+        );
+        return;
+    }
     // A wizard driven by the loop takes the line over: it is what the next
     // keypress does.
     if let Some(banner) = banner {
@@ -1241,7 +1286,7 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App, banner: Option<&str>) {
             Style::new().dim(),
         )),
         Mode::Input(InputKind::Export) => Line::from(Span::styled(
-            " the name decides the format · .csv .tsv .parquet .xlsx .gz · Tab browses",
+            " the name decides the format · .csv .tsv .parquet .xlsx .md .gz · Tab browses",
             Style::new().dim(),
         )),
         Mode::Input(InputKind::Macro) => Line::from(Span::styled(

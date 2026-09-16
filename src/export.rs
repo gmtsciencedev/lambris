@@ -38,6 +38,10 @@ pub enum Format {
     Tsv,
     Parquet,
     Xlsx,
+    /// A markdown pipe table. A way of *showing* a table rather than of
+    /// holding one: there are no types in it, and a gap and an empty string
+    /// come out the same. Written to be pasted into something that renders it.
+    Markdown,
 }
 
 /// Excel's own limits, and the reason `.xlsx` is the one format that can be
@@ -74,12 +78,13 @@ impl Target {
             "tsv" | "tab" => Format::Tsv,
             "parquet" => Format::Parquet,
             "xlsx" => Format::Xlsx,
+            "md" | "markdown" => Format::Markdown,
             "" => anyhow::bail!(
-                "give the name an extension: .csv, .tsv, .parquet, .xlsx, or .csv.gz"
+                "give the name an extension: .csv, .tsv, .parquet, .xlsx, .md, or .csv.gz"
             ),
             other => anyhow::bail!(
                 ".{other} is not something this can write — .csv, .tsv, .parquet, \
-                 .xlsx and .gz versions of the first two are"
+                 .xlsx, .md and .gz versions of the text ones are"
             ),
         };
         if gzipped && format == Format::Parquet {
@@ -121,6 +126,7 @@ impl Target {
             Format::Tsv => "tsv",
             Format::Parquet => "parquet",
             Format::Xlsx => "xlsx",
+            Format::Markdown => "markdown",
         };
         match self.gzipped {
             true => format!("{name}.gz"),
@@ -142,6 +148,16 @@ enum Sink {
         started: bool,
     },
     Parquet(Box<ArrowWriter<File>>),
+    /// A markdown pipe table: the column names and the rule before the first
+    /// batch, a row per line after that.
+    Markdown {
+        out: Plain,
+        names: Vec<String>,
+        /// Which columns the rule aims right, so numbers line up when it is
+        /// rendered.
+        numeric: Vec<bool>,
+        started: bool,
+    },
     /// A workbook, built in a temp file of its own and saved at the end.
     Xlsx(Box<Book>),
 }
@@ -178,6 +194,50 @@ impl Write for Plain {
             Plain::Gzip(out) => out.flush(),
         }
     }
+}
+
+/// Bytes on their way to `file`, through gzip when asked for.
+fn plain(file: File, gzipped: bool) -> Plain {
+    let out = BufWriter::new(file);
+    match gzipped {
+        true => Plain::Gzip(Box::new(GzEncoder::new(out, Compression::default()))),
+        false => Plain::Raw(out),
+    }
+}
+
+/// One row of a markdown pipe table.
+///
+/// A `|` in a value is escaped, since it would otherwise start another cell,
+/// and a newline becomes a space, since a row is a line. Nothing else is:
+/// escaping every character markdown gives a meaning to would leave a table
+/// nobody could read, and this format is for reading.
+pub fn row_of<'a>(cells: impl Iterator<Item = &'a str>) -> String {
+    let mut out = String::from("|");
+    for cell in cells {
+        out.push(' ');
+        for c in cell.chars() {
+            match c {
+                '|' => out.push_str("\\|"),
+                '\n' | '\r' => out.push(' '),
+                _ => out.push(c),
+            }
+        }
+        out.push_str(" |");
+    }
+    out
+}
+
+/// The rule under the column names, aiming the number columns right so that
+/// they line up once something renders it.
+pub fn rule_of(numeric: &[bool]) -> String {
+    let mut out = String::from("|");
+    for &numeric in numeric {
+        out.push_str(match numeric {
+            true => " ---: |",
+            false => " --- |",
+        });
+    }
+    out
 }
 
 impl Plain {
@@ -218,18 +278,30 @@ impl Export {
                 })),
             });
         }
+        if target.format == Format::Markdown {
+            let file =
+                File::create(path).with_context(|| format!("creating {}", path.display()))?;
+            return Ok(Self {
+                sink: Sink::Markdown {
+                    out: plain(file, target.gzipped),
+                    names: schema.fields().iter().map(|f| f.name().clone()).collect(),
+                    numeric: schema
+                        .fields()
+                        .iter()
+                        .map(|f| f.data_type().is_numeric())
+                        .collect(),
+                    started: false,
+                },
+            });
+        }
         let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
         let sink = match target.format {
             Format::Parquet => Sink::Parquet(Box::new(
                 ArrowWriter::try_new(file, schema, None).context("starting the parquet file")?,
             )),
             format => {
-                let out = BufWriter::new(file);
                 Sink::Text {
-                    out: match target.gzipped {
-                        true => Plain::Gzip(Box::new(GzEncoder::new(out, Compression::default()))),
-                        false => Plain::Raw(out),
-                    },
+                    out: plain(file, target.gzipped),
                     delimiter: match format {
                         Format::Tsv => b'\t',
                         _ => b',',
@@ -244,6 +316,32 @@ impl Export {
     pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         match &mut self.sink {
             Sink::Parquet(writer) => writer.write(batch).context("writing rows")?,
+            Sink::Markdown {
+                out,
+                names,
+                numeric,
+                started,
+            } => {
+                if !*started {
+                    writeln!(out, "{}", row_of(names.iter().map(String::as_str)))?;
+                    writeln!(out, "{}", rule_of(numeric))?;
+                    *started = true;
+                }
+                // One formatter per column for the batch, as everywhere else
+                // that turns a column into what it looks like.
+                let options = FormatOptions::default().with_null("");
+                let columns: Vec<ArrayFormatter> = batch
+                    .columns()
+                    .iter()
+                    .map(|array| ArrayFormatter::try_new(array.as_ref(), &options))
+                    .collect::<std::result::Result<_, _>>()
+                    .context("preparing a row")?;
+                for i in 0..batch.num_rows() {
+                    let cells: Vec<String> =
+                        columns.iter().map(|c| c.value(i).to_string()).collect();
+                    writeln!(out, "{}", row_of(cells.iter().map(String::as_str)))?;
+                }
+            }
             Sink::Xlsx(book) => {
                 // Each column is worked out once for the whole batch, then the
                 // cells are written a row at a time: constant memory mode
@@ -288,7 +386,7 @@ impl Export {
             Sink::Parquet(writer) => {
                 writer.close().context("finishing the parquet file")?;
             }
-            Sink::Text { out, .. } => out.finish()?,
+            Sink::Text { out, .. } | Sink::Markdown { out, .. } => out.finish()?,
             Sink::Xlsx(mut book) => {
                 let path = book.path.clone();
                 book.book
