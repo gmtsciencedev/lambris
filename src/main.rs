@@ -506,7 +506,18 @@ impl Tabs {
                     return Ok(None);
                 }
                 let rows = app.view_slice(start, export::BATCH);
-                out.write(&app.data.gather(&rows, &cols)?)?;
+                // Where the cells of this batch link to, by their place in it.
+                let mut links = HashMap::new();
+                if app.data.has_links() {
+                    for (i, &row) in rows.iter().enumerate() {
+                        for (j, &col) in cols.iter().enumerate() {
+                            if let Some(target) = app.data.link(col, row) {
+                                links.insert((i, j), target.to_string());
+                            }
+                        }
+                    }
+                }
+                out.write(&app.data.gather(&rows, &cols)?, &links)?;
                 rows_out += rows.len();
             }
             out.finish()?;
@@ -1811,7 +1822,13 @@ mod tests {
         let leaf = root.file_name().unwrap().to_string_lossy().into_owned();
         assert!(text.contains(&leaf), "folder name missing: {text}");
         // Narrow: the title keeps the deep end of the path, not its head.
-        let text = buffer_text(tabs.app_mut(), 30, 20);
+        //
+        // Narrower than this path rather than a fixed 30: macOS buries its
+        // temporary folders under /var/folders/… and Linux puts them straight
+        // in /tmp, so a fixed width tests the elision on one and the length of
+        // somebody's temp directory on the other.
+        let narrow = (root.to_string_lossy().chars().count() as u16).saturating_sub(4);
+        let text = buffer_text(tabs.app_mut(), narrow.max(12), 20);
         assert!(text.contains('…') && text.contains(&leaf[leaf.len() - 6..]));
 
         // Tab again walks the list; arrows do too, and it wraps.
@@ -3580,6 +3597,163 @@ mod tests {
         assert_eq!(written.cell_display(0, 1).unwrap().as_deref(), Some("S2"));
         // A tsv, because that is what the name said.
         assert!(std::fs::read_to_string(&out).unwrap().contains('\t'));
+    }
+
+    /// A workbook whose cells carry hyperlinks: one with its own text, one
+    /// showing the target, one with a target that needs its brackets.
+    fn linked_xlsx_fixture() -> PathBuf {
+        use rust_xlsxwriter::{Url, Workbook};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut book = Workbook::new();
+        let sheet = book.add_worksheet();
+        sheet.set_name("Links").unwrap();
+        for (c, name) in ["sample", "run", "note"].iter().enumerate() {
+            sheet.write_string(0, c as u16, *name).unwrap();
+        }
+        sheet
+            .write_url_with_text(1, 0, Url::new("https://lims.example/run/8812"), "S18572Nr1")
+            .unwrap();
+        sheet.write_number(1, 1, 8812.0).unwrap();
+        sheet
+            .write_url(1, 2, Url::new("https://example.com/plain"))
+            .unwrap();
+        // A target with a bracket in it, which would close the link early.
+        sheet
+            .write_url_with_text(2, 0, Url::new("https://ex.com/a_(b)"), "S18572Nr2")
+            .unwrap();
+        sheet.write_number(2, 1, 8813.0).unwrap();
+        sheet.write_string(2, 2, "none").unwrap();
+
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!("lambris_test_links_{n}.xlsx"));
+        book.save(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn excel_hyperlinks_come_through_and_leave_as_markdown_links() {
+        let (folder, _) = project();
+        let book = linked_xlsx_fixture();
+        let mut tabs = Tabs::open(
+            std::slice::from_ref(&book),
+            HeaderSpec::default(),
+            Store::default(),
+        )
+        .unwrap();
+        tabs.folder = folder.clone();
+        let app = tabs.app_mut();
+
+        // The link is held against the cell it was drawn on — not a row above
+        // it, which is what the header row would cost if it were not taken off.
+        assert_eq!(app.data.cell_display(0, 0).unwrap().as_deref(), Some("S18572Nr1"));
+        assert_eq!(app.data.link(0, 0), Some("https://lims.example/run/8812"));
+        assert_eq!(app.data.link(1, 0), None, "the number is not a link");
+
+        tabs.key(key('m'));
+        assert!(tabs.step());
+        let md = tabs.app_mut().markdown.clone();
+        assert_eq!(md[0], "| sample | run | note |");
+        // Text that differs from the target is the case only a hyperlink can
+        // carry, and the one a bare URL in a cell could never express.
+        assert_eq!(
+            md[2],
+            "| [S18572Nr1](https://lims.example/run/8812) | 8812 | \
+             [https://example.com/plain](https://example.com/plain) |"
+        );
+        // A target with a bracket goes in angle brackets, or the `)` would
+        // close the link and the rest would spill into the table.
+        assert!(md[3].contains("[S18572Nr2](<https://ex.com/a_(b)>)"), "{}", md[3]);
+
+        // Written out, the file says the same as the screen.
+        let out = folder.join("linked.md");
+        tabs.key(key('m'));
+        assert!(tabs.step());
+        export_to(&mut tabs, &out);
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), md.join("\n") + "\n");
+
+        // The other formats carry values alone: a link is not one.
+        let csv = folder.join("linked.csv");
+        export_to(&mut tabs, &csv);
+        let text = std::fs::read_to_string(&csv).unwrap();
+        assert!(text.contains("S18572Nr1,8812,"), "{text}");
+        assert!(!text.contains("lims.example"), "{text}");
+    }
+
+    #[test]
+    fn a_link_is_drawn_underlined_and_travels_with_a_crop() {
+        let (_folder, _) = project();
+        let book = linked_xlsx_fixture();
+        let mut tabs = Tabs::open(
+            std::slice::from_ref(&book),
+            HeaderSpec::default(),
+            Store::default(),
+        )
+        .unwrap();
+
+        // Underlined where the link is, plain where there is none.
+        let mut terminal = Terminal::new(TestBackend::new(44, 8)).unwrap();
+        terminal
+            .draw(|f| ui::render(f, tabs.app_mut(), &ui::TabStrip::default(), None).unwrap())
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let underlined = |y: u16| -> String {
+            (0..44u16)
+                .filter(|&x| {
+                    buf.cell((x, y))
+                        .unwrap()
+                        .modifier
+                        .contains(ratatui::style::Modifier::UNDERLINED)
+                })
+                .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                .collect::<String>()
+                .trim()
+                .to_string()
+        };
+        assert!(underlined(2).starts_with("S18572Nr1"), "{:?}", underlined(2));
+        assert!(!underlined(2).contains("8812"), "the number is not linked");
+
+        // …and it is the link that underlines it: a file with none has no
+        // underlined row of data at all. (The column names are underlined
+        // whatever the file, which is the header's own styling.)
+        let plain = write_text_fixture("csv", "sample,run\nS1,8812\n");
+        let mut other = App::new(Dataset::load(&plain).unwrap());
+        let mut terminal = Terminal::new(TestBackend::new(44, 8)).unwrap();
+        terminal
+            .draw(|f| ui::render(f, &mut other, &ui::TabStrip::default(), None).unwrap())
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        assert!(
+            (0..44u16).all(|x| !buf
+                .cell((x, 2))
+                .unwrap()
+                .modifier
+                .contains(ratatui::style::Modifier::UNDERLINED)),
+            "nothing to link to, nothing underlined"
+        );
+
+        // A crop is the same cells in a smaller frame, so the links come too.
+        crop_cells(&mut tabs, (0, 0), (1, 0));
+        let cropped = tabs.app_mut();
+        assert_eq!(cropped.data.column_names, vec!["sample"]);
+        assert_eq!(cropped.data.link(0, 0), Some("https://lims.example/run/8812"));
+        assert_eq!(cropped.data.link(0, 1), Some("https://ex.com/a_(b)"));
+
+        // And turning the table turns them with it.
+        tabs.current = 0;
+        tabs.key(key('t'));
+        assert!(tabs.step());
+        let turned = tabs.app_mut();
+        assert!(turned.is_transposed);
+        // `note` was the third column and is now the second row; the first
+        // record is the column after the one holding the field names.
+        assert_eq!(turned.data.column_names[1], "S18572Nr1");
+        assert_eq!(turned.data.link(1, 1), Some("https://example.com/plain"));
+        // The first column's values became the column names, and a name has
+        // nowhere to carry a link — so `sample`'s goes no further.
+        assert_eq!(turned.data.link(1, 0), None);
     }
 
     #[test]

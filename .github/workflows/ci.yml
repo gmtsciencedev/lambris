@@ -34,4 +34,12 @@ jobs:
           key: ${{ matrix.os }}-${{ matrix.rust }}-${{ hashFiles('Cargo.lock') }}
       # `--locked` so CI builds what Cargo.lock says, and says so if it drifts.
       - run: cargo test --locked
-      - run: cargo clippy --all-targets --locked -- -D warnings
+      # Denied on the pinned toolchain only. Clippy gains lints with every
+      # release, so denying them on `stable` means the build breaks one morning
+      # because somebody else shipped a lint, on a commit nobody touched — a
+      # gate that cries wolf is one people learn to ignore. On stable they are
+      # printed, so what is coming is visible without being fatal.
+      - if: matrix.rust != 'stable'
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - if: matrix.rust == 'stable'
+        run: cargo clippy --all-targets --locked

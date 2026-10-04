@@ -1322,14 +1322,16 @@ impl App {
             .collect();
         let numeric: Vec<bool> = cols.iter().map(|&c| self.data.is_numeric(c)).collect();
         let mut lines = Vec::with_capacity(taking + 2);
-        lines.push(export::row_of(names.into_iter()));
+        lines.push(export::row_of(names.into_iter().map(|n| (n, None))));
         lines.push(export::rule_of(&numeric));
         for i in 0..taking {
-            let cells: Vec<&str> = columns
-                .iter()
-                .map(|col| col[i].as_deref().unwrap_or_default())
-                .collect();
-            lines.push(export::row_of(cells.into_iter()));
+            let row = cols.iter().zip(&columns).map(|(&col, values)| {
+                (
+                    values[i].as_deref().unwrap_or_default(),
+                    self.data.link(col, rows[i]),
+                )
+            });
+            lines.push(export::row_of(row));
         }
         self.markdown = lines;
         self.markdown_more = total > taking;
@@ -2285,12 +2287,12 @@ impl App {
                 self.input.pop();
                 self.refresh_completions();
             }
-            // Goto only accepts digits; search/filter take any character.
-            KeyCode::Char(c) => {
-                if !matches!(kind, InputKind::Goto) || c.is_ascii_digit() {
-                    self.input.push(c);
-                    self.refresh_completions();
-                }
+            // Goto only accepts digits; search/filter take any character. Said
+            // as a guard, so a digitless key in Goto falls through to the arm
+            // that does nothing rather than arriving here to be turned away.
+            KeyCode::Char(c) if !matches!(kind, InputKind::Goto) || c.is_ascii_digit() => {
+                self.input.push(c);
+                self.refresh_completions();
             }
             _ => {}
         }

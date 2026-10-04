@@ -919,6 +919,37 @@ cell, and a newline becomes a space, since a row is a line. Nothing else is
 escaped: getting out of the way of every character markdown gives a meaning to
 would leave a table nobody could read, and this format exists to be read.
 
+### Links from a workbook
+
+A cell in an `.xlsx` sheet can carry a hyperlink: text that shows one thing and
+points at another — `S18572Nr1` linking to its record in a LIMS. lambris holds
+those links, underlines the cells that have them, and writes them out as
+markdown links.
+
+```markdown
+| sample | run |
+| --- | --- |
+| [S18572Nr1](https://lims.example/run/8812) | 8812 |
+```
+
+This is the case only a hyperlink can express. Where Excel shows the target
+itself the cell value *is* the URL, and a renderer that autolinks a bare URL
+reaches the same place on its own.
+
+Links are held against the cell they were drawn on, so sorting, filtering and
+hiding carry them along. A crop takes the same cells in a smaller frame and
+keeps them; transposing turns them with the table. A join builds a new table out
+of two, and goes without.
+
+A target holding a space or a bracket is written in `<…>`, markdown's own way of
+saying where a destination ends — a `)` in the middle of a URL would otherwise
+close the link early and spill the rest into the table.
+
+The other formats carry values alone, which is what they are for: `.csv`,
+`.parquet` and `.xlsx` exports write the cell's text. Links travel in `.md`.
+
+### How much is shown
+
 The screen shows the first 1000 rows — a table going somewhere by way of the
 clipboard is a small one, and the footer says when there is more. Both paths go
 through the same row writer, so what is copied off the screen and what lands in

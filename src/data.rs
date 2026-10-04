@@ -22,7 +22,7 @@ use flate2::read::MultiGzDecoder;
 use crate::formula::{Formula, FormulaError, Value};
 // `DataType` is imported anonymously: it carries the cell accessors we need
 // (`as_datetime`), and the name would collide with Arrow's own `DataType`.
-use calamine::{open_workbook_auto, Data, DataType as _, Range, Reader};
+use calamine::{open_workbook_auto, Data, DataType as _, Range, Reader, Sheets};
 use chrono::{NaiveDate, NaiveTime};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use regex::Regex;
@@ -241,6 +241,9 @@ pub struct Dataset {
     pub column_types: Vec<String>,
     pub nrows: usize,
     pub ncols: usize,
+    /// Where a cell links to, by `(row, column)`, for the cells a workbook
+    /// hung a hyperlink on. Empty for every other kind of file.
+    links: HashMap<(usize, usize), String>,
     cache: Mutex<ChunkCache>,
 }
 
@@ -321,6 +324,7 @@ impl Dataset {
             column_types,
             nrows,
             ncols,
+            links: HashMap::new(),
             cache: Mutex::new(ChunkCache::new(CACHE_CHUNKS)),
         })
     }
@@ -486,6 +490,7 @@ impl Dataset {
             column_types: self.column_types.clone(),
             nrows: 0,
             ncols: self.ncols,
+            links: HashMap::new(),
             cache: Mutex::new(ChunkCache::new(1)),
         };
         probe.refresh_schema();
@@ -576,13 +581,25 @@ impl Dataset {
     /// taking one is to have a piece small enough to send somewhere.
     pub fn cropped(&self, rows: &[usize], cols: &[usize], label: String) -> Result<Self> {
         let batch = self.gather(rows, cols)?;
-        Ok(Self::in_memory(
+        let mut cropped = Self::in_memory(
             batch,
             self.path.clone(),
             label,
             None,
             self.header,
-        ))
+        );
+        // A crop is the same cells in a smaller frame, so what they link to
+        // comes with them.
+        if self.has_links() {
+            for (i, &row) in rows.iter().enumerate() {
+                for (j, &col) in cols.iter().enumerate() {
+                    if let Some(target) = self.link(col, row) {
+                        cropped.links.insert((i, j), target.to_string());
+                    }
+                }
+            }
+        }
+        Ok(cropped)
     }
 
     fn in_memory(
@@ -617,6 +634,7 @@ impl Dataset {
             column_types,
             nrows,
             ncols,
+            links: HashMap::new(),
             cache: Mutex::new(ChunkCache::new(CACHE_CHUNKS)),
         }
     }
@@ -665,13 +683,26 @@ impl Dataset {
             .collect();
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
             .context("building transposed batch")?;
-        Ok(Dataset::in_memory(
+        let mut turned = Dataset::in_memory(
             batch,
             self.path.clone(),
             format!("{} ⇄ transposed", self.label),
             None, // a transposed view is not the file's own layout
             HeaderSpec::default(),
-        ))
+        );
+        // Turning the table turns the links with it: a cell that was row `r` of
+        // column `c` is now row `c` of column `r`, one across for the leading
+        // column of names.
+        if self.has_links() {
+            for (i, &col) in field_cols.iter().enumerate() {
+                for (r, &row) in orig_rows.iter().enumerate() {
+                    if let Some(target) = self.link(col, row) {
+                        turned.links.insert((i, r + 1), target.to_string());
+                    }
+                }
+            }
+        }
+        Ok(turned)
     }
 
     /// Left-join `right` onto this dataset: every row of `left_rows` is kept,
@@ -998,6 +1029,17 @@ impl Dataset {
     }
 
     /// The full (untruncated) display value of a single cell; `None` if null.
+    /// Where this cell links to, for a workbook cell carrying a hyperlink.
+    pub fn link(&self, col: usize, row: usize) -> Option<&str> {
+        self.links.get(&(row, col)).map(String::as_str)
+    }
+
+    /// Whether any cell here links anywhere, so the drawing and the writing can
+    /// skip the question entirely for the files that have none.
+    pub fn has_links(&self) -> bool {
+        !self.links.is_empty()
+    }
+
     pub fn cell_display(&self, col: usize, row: usize) -> Result<Option<String>> {
         let batch = self.chunk(row / CHUNK)?;
         let array = batch.column(col);
@@ -2005,7 +2047,8 @@ fn load_workbook(path: &Path, header: HeaderSpec) -> Result<Vec<Dataset>> {
         let range = workbook
             .worksheet_range(&name)
             .with_context(|| format!("reading sheet {name} of {}", path.display()))?;
-        if let Some(dataset) = sheet_dataset(path, &name, &range, header)? {
+        if let Some(mut dataset) = sheet_dataset(path, &name, &range, header)? {
+            dataset.links = sheet_links(&mut workbook, &name, &range, header);
             sheets.push(dataset);
         }
     }
@@ -2028,6 +2071,50 @@ fn load_sheet(path: &Path, sheet: &str, header: HeaderSpec) -> Result<Dataset> {
 
 /// Turn one worksheet range into a dataset, or `None` when the sheet holds
 /// nothing worth a tab.
+/// Where the cells of this sheet link to, by the table's own `(row, column)`.
+///
+/// A hyperlink is anchored in the sheet's own coordinates, counting every
+/// physical row and column, while the table starts after whatever the used
+/// range and the header reading left behind. Both offsets are taken off here,
+/// so the links land on the cells they were drawn on rather than some rows
+/// above or below them.
+///
+/// Only xlsx carries these: the `.xls` and `.ods` readers do not offer them,
+/// and such a sheet simply has none.
+fn sheet_links(
+    workbook: &mut Sheets<std::io::BufReader<std::fs::File>>,
+    name: &str,
+    range: &Range<Data>,
+    header: HeaderSpec,
+) -> HashMap<(usize, usize), String> {
+    let Sheets::Xlsx(book) = workbook else {
+        return HashMap::new();
+    };
+    let Ok(links) = book.hyperlinks_by_sheet_name(name) else {
+        return HashMap::new();
+    };
+    let (top, left) = range.start().unwrap_or((0, 0));
+    // The rows the table does not hold: the ones skipped, plus the one that
+    // gave the column their names.
+    let above = top as usize + header.skip() + usize::from(header.named());
+    let mut out = HashMap::new();
+    for link in links {
+        let Some(target) = link.target else { continue };
+        // A hyperlink can be hung on a whole range, and then every cell in it
+        // carries it.
+        for row in link.range.start.0..=link.range.end.0 {
+            for col in link.range.start.1..=link.range.end.1 {
+                let (row, col) = (row as usize, col as usize);
+                if row < above || col < left as usize {
+                    continue;
+                }
+                out.insert((row - above, col - left as usize), target.clone());
+            }
+        }
+    }
+    out
+}
+
 fn sheet_dataset(
     path: &Path,
     name: &str,

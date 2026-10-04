@@ -529,6 +529,11 @@ fn render_table(
             } else if idx < frozen && !sel_cell {
                 style = style.bg(frozen_bg);
             }
+            // A cell a workbook hung a link on is underlined, so the link is
+            // something you can see rather than something only an export knows.
+            if app.data.link(col, orig).is_some() {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
             if sel_cell {
                 style = style.add_modifier(Modifier::REVERSED);
             }

@@ -9,6 +9,7 @@
 //! filtered view of a file far too large to fit is written the same way as a
 //! small one.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -211,10 +212,13 @@ fn plain(file: File, gzipped: bool) -> Plain {
 /// and a newline becomes a space, since a row is a line. Nothing else is:
 /// escaping every character markdown gives a meaning to would leave a table
 /// nobody could read, and this format is for reading.
-pub fn row_of<'a>(cells: impl Iterator<Item = &'a str>) -> String {
+pub fn row_of<'a>(cells: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> String {
     let mut out = String::from("|");
-    for cell in cells {
+    for (cell, link) in cells {
         out.push(' ');
+        if link.is_some() {
+            out.push('[');
+        }
         for c in cell.chars() {
             match c {
                 '|' => out.push_str("\\|"),
@@ -222,9 +226,30 @@ pub fn row_of<'a>(cells: impl Iterator<Item = &'a str>) -> String {
                 _ => out.push(c),
             }
         }
+        if let Some(target) = link {
+            out.push(']');
+            out.push_str(&destination(target));
+        }
         out.push_str(" |");
     }
     out
+}
+
+/// A link destination in brackets.
+///
+/// Plain targets go bare, as `(https://example.com)`. A target holding a space
+/// or a bracket of its own is wrapped in `<…>`, which is markdown's own way of
+/// saying where a destination ends — the alternative is a `)` in the middle of
+/// a URL closing the link early and the rest of it spilling into the table.
+fn destination(target: &str) -> String {
+    let plain = !target.is_empty()
+        && !target
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '(' | ')' | '<' | '>'));
+    match plain {
+        true => format!("({target})"),
+        false => format!("(<{}>)", target.replace('<', "%3C").replace('>', "%3E")),
+    }
 }
 
 /// The rule under the column names, aiming the number columns right so that
@@ -313,7 +338,14 @@ impl Export {
         Ok(Self { sink })
     }
 
-    pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+    /// Write a batch, with `links` giving the target of any cell in it that
+    /// has one, by its `(row within the batch, column)`. Only markdown has
+    /// anywhere to put them; the other formats carry values alone.
+    pub fn write(
+        &mut self,
+        batch: &RecordBatch,
+        links: &HashMap<(usize, usize), String>,
+    ) -> Result<()> {
         match &mut self.sink {
             Sink::Parquet(writer) => writer.write(batch).context("writing rows")?,
             Sink::Markdown {
@@ -323,7 +355,8 @@ impl Export {
                 started,
             } => {
                 if !*started {
-                    writeln!(out, "{}", row_of(names.iter().map(String::as_str)))?;
+                    // The column names are names, never links.
+                    writeln!(out, "{}", row_of(names.iter().map(|n| (n.as_str(), None))))?;
                     writeln!(out, "{}", rule_of(numeric))?;
                     *started = true;
                 }
@@ -339,7 +372,10 @@ impl Export {
                 for i in 0..batch.num_rows() {
                     let cells: Vec<String> =
                         columns.iter().map(|c| c.value(i).to_string()).collect();
-                    writeln!(out, "{}", row_of(cells.iter().map(String::as_str)))?;
+                    let row = cells.iter().enumerate().map(|(col, cell)| {
+                        (cell.as_str(), links.get(&(i, col)).map(String::as_str))
+                    });
+                    writeln!(out, "{}", row_of(row))?;
                 }
             }
             Sink::Xlsx(book) => {
