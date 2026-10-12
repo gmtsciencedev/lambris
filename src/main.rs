@@ -3757,6 +3757,147 @@ mod tests {
     }
 
     #[test]
+    fn a_prompt_can_be_edited_anywhere_in_it() {
+        let csv = "sample,reads\nS1,10\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+
+        app.handle_key(key('&'));
+        type_str(&mut app, "S1");
+        assert_eq!(app.input_at, 2, "the caret follows what is typed");
+
+        // Back to the start and type there.
+        app.handle_key(code(KeyCode::Left));
+        app.handle_key(code(KeyCode::Left));
+        assert_eq!(app.input_at, 0);
+        app.handle_key(code(KeyCode::Left));
+        assert_eq!(app.input_at, 0, "it stops at the start");
+        type_str(&mut app, "^");
+        assert_eq!(app.input, "^S1");
+        assert_eq!(app.input_at, 1);
+
+        // Backspace takes what is before the caret; Delete what is under it.
+        app.handle_key(code(KeyCode::End));
+        assert_eq!(app.input_at, 3);
+        app.handle_key(code(KeyCode::Backspace));
+        assert_eq!(app.input, "^S");
+        app.handle_key(code(KeyCode::Home));
+        app.handle_key(code(KeyCode::Delete));
+        assert_eq!(app.input, "S");
+        assert_eq!(app.input_at, 0);
+        app.handle_key(code(KeyCode::Backspace));
+        assert_eq!(app.input, "S", "there is nothing before the start to take");
+
+        // Drawn where it is, not always at the end.
+        app.handle_key(code(KeyCode::Esc));
+        app.handle_key(key('&'));
+        type_str(&mut app, "abc");
+        app.handle_key(code(KeyCode::Left));
+        let line = buffer_line(&mut app, 40, 10, 8);
+        assert!(line.starts_with("&ab▏c"), "{line:?}");
+
+        // A prompt that comes with text puts the caret at its end, ready to
+        // be added to.
+        app.handle_key(code(KeyCode::Esc));
+        app.selected_pos = 1;
+        app.handle_key(key('R'));
+        assert_eq!(app.input, "reads");
+        assert_eq!(app.input_at, 5);
+
+        // Characters are walked one at a time, whatever their width in bytes.
+        app.handle_key(code(KeyCode::Esc));
+        app.handle_key(key('&'));
+        type_str(&mut app, "µg");
+        app.handle_key(code(KeyCode::Left));
+        app.handle_key(code(KeyCode::Backspace));
+        assert_eq!(app.input, "g", "the whole character went, not half of it");
+    }
+
+    #[test]
+    fn semicolon_goes_to_a_column_by_name() {
+        use std::time::{Duration, Instant};
+        let csv = "sample,Total Reads,depth,junk,reads_pc\nS1,10,1.5,x,0.5\n";
+        let mut app = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        let t0 = Instant::now();
+        // Taps, far enough apart that nothing reads them as a held key.
+        let mut at = 0u64;
+        let tap = |app: &mut App, k: char, at: &mut u64| {
+            *at += 400;
+            app.handle_key_at(key(k), t0 + Duration::from_millis(*at));
+        };
+
+        // Nothing looked for yet, so `;` asks.
+        tap(&mut app, ';', &mut at);
+        type_str(&mut app, "reads");
+        app.handle_key(code(KeyCode::Enter));
+        assert_eq!(app.selected_pos, 1, "Total Reads");
+        assert_eq!(app.status_msg.as_deref(), Some("→ Total Reads"));
+        assert_eq!(app.column_pattern(), Some("reads"));
+
+        // With a pattern in hand `;` steps on, and `,` steps back. The matching
+        // columns are 1 and 4, so each direction comes round an end.
+        tap(&mut app, ';', &mut at);
+        assert_eq!(app.selected_pos, 4);
+        tap(&mut app, ';', &mut at);
+        assert_eq!(app.selected_pos, 1, "round the end to the first");
+        tap(&mut app, ',', &mut at);
+        assert_eq!(app.selected_pos, 4, "round the start to the last");
+
+        // It is shown while it lasts, so it is clear why `;` steps where it does.
+        let text = buffer_text(&mut app, 80, 10);
+        assert!(text.contains(";reads"), "{text}");
+        // …and the way out beside it.
+        assert!(text.contains("[Esc clears]"), "{text}");
+
+        // Esc drops it, before it takes anything else away.
+        app.handle_key(code(KeyCode::Esc));
+        assert_eq!(app.column_pattern(), None);
+        assert_eq!(app.status_msg.as_deref(), Some("column pattern dropped"));
+        assert!(!buffer_text(&mut app, 80, 10).contains(";reads"));
+
+        // A regex anchors it to one column exactly.
+        tap(&mut app, ';', &mut at);
+        type_str(&mut app, "^depth$");
+        app.handle_key(code(KeyCode::Enter));
+        assert_eq!(app.selected_pos, 2);
+
+        // Looking for something else is `Esc` then `;`: the pattern goes, and
+        // with nothing in hand the key asks again. Holding `;` down simply
+        // steps on, as every press of it does.
+        app.handle_key(code(KeyCode::Esc));
+        assert_eq!(app.column_pattern(), None);
+        tap(&mut app, ';', &mut at);
+        assert!(matches!(app.mode, app::Mode::Input(app::InputKind::GotoColumn)));
+        app.handle_key(code(KeyCode::Esc));
+
+        // A name matching only a hidden column says where it went, rather than
+        // reporting nothing found and sending you looking for it.
+        app.selected_pos = 3;
+        app.handle_key(key('x'));
+        tap(&mut app, ';', &mut at);
+        type_str(&mut app, "junk");
+        app.handle_key(code(KeyCode::Enter));
+        let said = app.status_msg.clone().unwrap();
+        assert!(said.contains("junk is hidden"), "{said}");
+        assert!(said.contains("u puts every hidden column back"), "{said}");
+
+        // `,` before anything has been looked for says what to press.
+        let mut fresh = App::new(Dataset::load(&write_text_fixture("csv", csv)).unwrap());
+        fresh.handle_key(key(','));
+        assert_eq!(
+            fresh.status_msg.as_deref(),
+            Some("no column looked for yet — ; asks for one")
+        );
+
+        // A broken pattern complains instead of jumping anywhere.
+        let before = fresh.selected_pos;
+        fresh.handle_key(key(';'));
+        type_str(&mut fresh, "[");
+        fresh.handle_key(code(KeyCode::Enter));
+        assert_eq!(fresh.selected_pos, before);
+        assert!(fresh.status_msg.clone().unwrap().starts_with("bad pattern"));
+    }
+
+    #[test]
     fn m_shows_the_view_as_a_markdown_table() {
         // A pipe in a value, a number column, a gap.
         let csv = "sample,reads,note\nS1,10,a|b\nS2,2500,\n";

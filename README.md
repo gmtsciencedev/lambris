@@ -42,6 +42,7 @@ cargo run --release
 | `g` / `G` | Jump to first / last row |
 | `0` / `$` | Jump to first / last column |
 | `:` | Go to a row number (1-based, uses original row numbers under a filter) |
+| `;` / `,` | Find a column by name; `;` steps on, `,` back, `Esc` then `;` looks for another |
 | `/` | Global search across all columns (regex, case-insensitive); jumps to the first match |
 | `-` | Column search — same as `/` but confined to the selected column |
 | `n` / `N` | Jump to next / previous search match (within scope) |
@@ -613,6 +614,49 @@ without a word, and the saved session waits for the next bare `lambris`.
 beside the patterns, in `sessions.json`, so nothing is written into the folder
 being worked in. If a file has gone since, the rest still open and the status bar
 names what is missing.
+
+## Typing at a prompt
+
+Every prompt — a search, a filter, a pattern to remember, a name for a file, a
+formula — takes the arrow keys. `←` and `→` walk the caret through what is
+typed, `Home` and `End` go to its ends, `Backspace` takes the character before
+it and `Delete` the one under it. A prompt that opens with text already in it,
+such as `R` renaming a column, puts the caret at the end, ready to add to.
+
+The caret walks whole characters rather than bytes, so a name holding a `µ` or
+an accent is edited a letter at a time.
+
+## Going to a column
+
+A joined table can be fifteen columns wide, and walking to one with `l` gets old.
+`;` asks for a name and goes there — part of a name is enough, and it reads as a
+regex without regard to case, so `reads` finds `Total Reads` and `^id$` finds the
+column actually called that.
+
+The pattern is then kept, and `;` means *on to the next one that matches* —
+`,` steps back, each coming round the end. The status bar shows what is being
+looked for (`;reads`) for as long as it lasts, so it is plain why the key goes
+where it goes.
+
+Looking for something else is **`Esc` then `;`**: `Esc` drops the pattern, ahead
+of anything else `Esc` would otherwise take away, and with nothing in hand `;`
+asks again. The indicator carries that where it is needed:
+
+```
+;reads [Esc clears]
+```
+
+It pairs with `:`, which goes to a row. The keys sit next to each other, and so
+do the two ideas.
+
+A name that matches only a hidden column says where it went:
+
+```
+Total Reads is hidden — u puts every hidden column back
+```
+
+That is worth more than reporting nothing found, which would send you looking
+for a column that is one keypress from being shown again.
 
 ## Sorting by part of a column
 

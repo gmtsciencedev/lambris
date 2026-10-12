@@ -65,6 +65,8 @@ pub enum InputKind {
     Filter,
     /// Jump to a (1-based, original) row number.
     Goto,
+    /// Jump to a column by name.
+    GotoColumn,
     /// Open a file path in a new tab.
     Open,
     /// Name the file (or glob) a saved pattern is tied to.
@@ -565,6 +567,12 @@ pub struct App {
     /// `c` waits for the opposite one.
     /// The view written out as a markdown table, while `m` is showing it, and
     /// whether there was more of it than that.
+    /// The last pattern `;` was given, so `;` and `,` can walk the columns it
+    /// matches without being told again.
+    column_query: Option<String>,
+    /// Where the caret sits in `input`, counted in characters so that a name
+    /// with a `µ` or an accent in it is walked a letter at a time.
+    pub input_at: usize,
     pub markdown: Vec<String>,
     pub show_markdown: bool,
     pub markdown_more: bool,
@@ -657,6 +665,8 @@ impl App {
             question: None,
             quit_anyway: false,
             key_sort: None,
+            column_query: None,
+            input_at: 0,
             markdown: Vec::new(),
             show_markdown: false,
             markdown_more: false,
@@ -1860,6 +1870,7 @@ impl App {
             });
             self.mode = Mode::Input(InputKind::Recipe);
             self.input = text;
+            self.input_at = self.input.chars().count();
             return;
         }
         let suggestion = match self.new_column.as_mut() {
@@ -1876,6 +1887,7 @@ impl App {
         };
         self.mode = Mode::Input(InputKind::ColumnName);
         self.input = suggestion;
+        self.input_at = self.input.chars().count();
     }
 
     /// Add the column, or rename the selected one — whichever this name is for.
@@ -2099,6 +2111,8 @@ impl App {
             KeyCode::Esc => {
                 if self.crop_mark.take().is_some() {
                     self.status_msg = Some("crop dropped".into());
+                } else if self.column_query.take().is_some() {
+                    self.status_msg = Some("column pattern dropped".into());
                 } else if self.join_active {
                     self.cancel_join = true;
                 } else if self.search.is_some() {
@@ -2211,6 +2225,12 @@ impl App {
             KeyCode::Char('-') => self.enter_input(InputKind::ColumnSearch),
             KeyCode::Char('&') => self.enter_input(InputKind::Filter),
             KeyCode::Char(':') => self.enter_input(InputKind::Goto),
+            // `;` goes to a column as `:` goes to a row — the keys sit next to
+            // each other, and so do the two ideas.
+            KeyCode::Char(';') => self.next_column(),
+            // `,` steps back through the columns `;` was last asked for, the
+            // way it reverses `f` in vi.
+            KeyCode::Char(',') => self.find_column(false),
             KeyCode::Char('n') => self.jump_match(true),
             KeyCode::Char('N') => self.jump_match(false),
 
@@ -2276,6 +2296,7 @@ impl App {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 self.input.clear();
+                self.input_at = 0;
                 self.completions = None;
                 self.notice = None;
                 if self.new_column.take().is_some() {
@@ -2284,14 +2305,33 @@ impl App {
             }
             KeyCode::Enter => self.commit_input(kind),
             KeyCode::Backspace => {
-                self.input.pop();
-                self.refresh_completions();
+                if self.input_at > 0 {
+                    self.input_at -= 1;
+                    let at = self.byte_at(self.input_at);
+                    self.input.remove(at);
+                    self.refresh_completions();
+                }
             }
+            KeyCode::Delete => {
+                if self.input_at < self.input.chars().count() {
+                    let at = self.byte_at(self.input_at);
+                    self.input.remove(at);
+                    self.refresh_completions();
+                }
+            }
+            KeyCode::Left => self.input_at = self.input_at.saturating_sub(1),
+            KeyCode::Right => {
+                self.input_at = (self.input_at + 1).min(self.input.chars().count())
+            }
+            KeyCode::Home => self.input_at = 0,
+            KeyCode::End => self.input_at = self.input.chars().count(),
             // Goto only accepts digits; search/filter take any character. Said
             // as a guard, so a digitless key in Goto falls through to the arm
             // that does nothing rather than arriving here to be turned away.
             KeyCode::Char(c) if !matches!(kind, InputKind::Goto) || c.is_ascii_digit() => {
-                self.input.push(c);
+                let at = self.byte_at(self.input_at);
+                self.input.insert(at, c);
+                self.input_at += 1;
                 self.refresh_completions();
             }
             _ => {}
@@ -2354,6 +2394,7 @@ impl App {
         if complete {
             if let Some(common) = listing.common_prefix() {
                 self.input = common;
+                self.input_at = self.input.chars().count();
             }
             if listing.entries.len() == 1 && !listing.entries[0].is_dir {
                 self.completions = None;
@@ -2391,6 +2432,7 @@ impl App {
         };
         let Some(text) = listing.selected_input() else { return };
         self.input = text;
+        self.input_at = self.input.chars().count();
         if entry_is_dir {
             return self.open_completions(false); // list what is inside it
         }
@@ -2412,6 +2454,16 @@ impl App {
         }
     }
 
+    /// Where character `caret` begins in `input`, for the string operations
+    /// that count bytes.
+    fn byte_at(&self, caret: usize) -> usize {
+        self.input
+            .char_indices()
+            .nth(caret)
+            .map(|(i, _)| i)
+            .unwrap_or(self.input.len())
+    }
+
     fn enter_input(&mut self, kind: InputKind) {
         self.mode = Mode::Input(kind);
         self.status_msg = None;
@@ -2427,21 +2479,26 @@ impl App {
             // Renaming starts from the name it has now.
             InputKind::ColumnName => Some(self.data.column_names[self.selected_col()].clone()),
             InputKind::Goto
+            | InputKind::GotoColumn
             | InputKind::Open
             | InputKind::Recipe
             | InputKind::Export
             | InputKind::Macro => None,
         }
         .unwrap_or_default();
+        // Prefilled text is there to be edited, so the caret waits at its end.
+        self.input_at = self.input.chars().count();
     }
 
     fn commit_input(&mut self, kind: InputKind) {
         let query = std::mem::take(&mut self.input);
+        self.input_at = 0;
         self.mode = Mode::Normal;
         self.completions = None;
         // These take the text literally rather than as a regex.
         match kind {
             InputKind::Goto => return self.goto_line(&query),
+            InputKind::GotoColumn => return self.goto_column(&query),
             InputKind::Pattern => {
                 self.save_pattern = Some(query.trim().to_string());
                 return;
@@ -2476,6 +2533,7 @@ impl App {
                 InputKind::Search | InputKind::ColumnSearch => self.search = None,
                 InputKind::Filter => self.clear_filter(),
                 InputKind::Goto
+                | InputKind::GotoColumn
                 | InputKind::Open
                 | InputKind::Pattern
                 | InputKind::Recipe
@@ -2497,6 +2555,7 @@ impl App {
             InputKind::ColumnSearch => self.apply_search(query, re, Some(self.selected_col())),
             InputKind::Filter => self.apply_filter(query, re),
             InputKind::Goto
+                | InputKind::GotoColumn
                 | InputKind::Open
                 | InputKind::Pattern
                 | InputKind::Recipe
@@ -2507,6 +2566,87 @@ impl App {
     }
 
     /// Jump to a 1-based original row number, honouring the active filter.
+    /// Move the cursor to the first column on display whose name matches.
+    ///
+    /// Matched the way every other search here matches: a regex, read without
+    /// regard to case, so `reads` finds `Total Reads` and `^id$` finds the one
+    /// column actually called that.
+    ///
+    /// A name that matches only a hidden column says so. The alternative —
+    /// reporting nothing found — sends you looking for a column that is right
+    /// there with `u` away from being shown again.
+    fn goto_column(&mut self, text: &str) {
+        // An empty answer means the pattern already in hand, so `;` `Enter`
+        // steps forward as `,` steps back.
+        let pattern = match text.trim().is_empty() {
+            false => text.to_string(),
+            true => match self.column_query.clone() {
+                Some(pattern) => pattern,
+                None => return,
+            },
+        };
+        if let Err(e) = build_regex(&pattern) {
+            self.status_msg = Some(format!("bad pattern: {e}"));
+            return;
+        }
+        self.column_query = Some(pattern);
+        self.find_column(true);
+    }
+
+    /// `;`: on to the next column matching the pattern in hand, or ask for one.
+    ///
+    /// Looking for something else is `Esc` and then `;` — `Esc` drops the
+    /// pattern, and with nothing in hand `;` asks again. The status bar says so
+    /// while a pattern is held.
+    fn next_column(&mut self) {
+        match self.column_query.is_some() {
+            true => self.find_column(true),
+            false => self.enter_input(InputKind::GotoColumn),
+        }
+    }
+
+    /// What `;` is looking for, while it is looking for anything.
+    pub fn column_pattern(&self) -> Option<&str> {
+        self.column_query.as_deref()
+    }
+
+    /// Step to the next column matching the pattern `;` was last given.
+    fn find_column(&mut self, forward: bool) {
+        let Some(pattern) = self.column_query.clone() else {
+            self.status_msg = Some("no column looked for yet — ; asks for one".into());
+            return;
+        };
+        let Ok(re) = build_regex(&pattern) else { return };
+        let shown = self.cols.len();
+        if shown == 0 {
+            return;
+        }
+        let from = self.selected_pos;
+        // Starting one along from the cursor and coming round to it, so a run
+        // of presses walks every column that matches and then begins again.
+        let found = (1..=shown)
+            .map(|step| match forward {
+                true => (from + step) % shown,
+                false => (from + shown - step % shown) % shown,
+            })
+            .find(|&pos| re.is_match(&self.data.column_names[self.cols[pos]]));
+        if let Some(pos) = found {
+            self.selected_pos = pos;
+            self.status_msg = Some(format!("→ {}", self.data.column_names[self.cols[pos]]));
+            return;
+        }
+        let hidden = (0..self.data.ncols)
+            .filter(|c| !self.cols.contains(c))
+            .find(|&c| re.is_match(&self.data.column_names[c]));
+        self.status_msg = Some(match hidden {
+            Some(col) => format!(
+                "{} is hidden — u puts every hidden column back",
+                self.data.column_names[col]
+            ),
+            None => format!("no column matching {pattern}"),
+        });
+    }
+
     fn goto_line(&mut self, text: &str) {
         if text.is_empty() || self.data.nrows == 0 {
             return;

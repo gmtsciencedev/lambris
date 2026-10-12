@@ -29,12 +29,20 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "Typing at a prompt",
+        &[
+            ("← / →", "move the caret · Home / End to its ends"),
+            ("Backspace / Delete", "take the character before the caret / under it"),
+        ],
+    ),
+    (
         "Finding",
         &[
             ("/", "search every column (regex, case-insensitive)"),
             ("-", "search within the selected column only"),
             ("n / N", "next / previous match"),
             ("&", "keep only rows matching a regex"),
+            (";  /  ,", "find a column by name: ; on, , back · Esc then ; for another"),
             ("d / D", "take this row out of the view / put every one back"),
             ("Esc", "clear the search, then the filter"),
         ],
@@ -1013,6 +1021,7 @@ fn status_spans(
             InputKind::ColumnSearch => "-",
             InputKind::Filter => "&",
             InputKind::Goto => ":",
+            InputKind::GotoColumn => "column ",
             InputKind::Open => "open ",
             InputKind::Pattern => "pattern ",
             InputKind::Recipe => match app.new_column.as_ref().and_then(|n| n.kind) {
@@ -1023,15 +1032,24 @@ fn status_spans(
             InputKind::Export => "write to ",
             InputKind::Macro => "macro ",
         };
+        // Split at the caret, so it is drawn where it actually is rather than
+        // always at the end — which is what lets the arrows mean anything.
+        let at = app
+            .input
+            .char_indices()
+            .nth(app.input_at)
+            .map(|(i, _)| i)
+            .unwrap_or(app.input.len());
         return vec![
             Span::styled(
-                format!("{sigil}{}", app.input),
+                format!("{sigil}{}", &app.input[..at]),
                 Style::new().fg(Color::White),
             ),
             Span::styled(
                 "▏",
                 Style::new().fg(Color::White).add_modifier(Modifier::SLOW_BLINK),
             ),
+            Span::styled(app.input[at..].to_string(), Style::new().fg(Color::White)),
         ];
     }
 
@@ -1067,6 +1085,18 @@ fn status_spans(
             None => format!("  /{}", search.query),
         };
         spans.push(Span::styled(label, Style::new().fg(Color::Cyan)));
+    }
+    // What `;` is looking for, so that it is clear why the key steps where it
+    // does and why `Esc` takes this before anything else.
+    if let Some(pattern) = app.column_pattern() {
+        spans.push(Span::styled(
+            format!("  ;{pattern}"),
+            Style::new().fg(Color::Cyan),
+        ));
+        // The way out, beside the thing to get out of: `Esc` drops the pattern
+        // and `;` then asks for another, which is how you look for something
+        // else now that holding the key does not.
+        spans.push(Span::styled(" [Esc clears]", Style::new().dim()));
     }
     if let Some(q) = &app.filter_query {
         spans.push(Span::styled(
@@ -1292,6 +1322,10 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App, banner: Option<&str>) {
         )),
         Mode::Input(InputKind::Export) => Line::from(Span::styled(
             " the name decides the format · .csv .tsv .parquet .xlsx .md .gz · Tab browses",
+            Style::new().dim(),
+        )),
+        Mode::Input(InputKind::GotoColumn) => Line::from(Span::styled(
+            " a name, or part of one · Enter goes there · then ; and , walk the matches",
             Style::new().dim(),
         )),
         Mode::Input(InputKind::Macro) => Line::from(Span::styled(
