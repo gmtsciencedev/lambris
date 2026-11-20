@@ -834,7 +834,20 @@ impl Dataset {
         if let Some(batch) = self.cache.lock().unwrap().get(k) {
             return Ok(batch);
         }
-        let batch = Arc::new(self.with_computed(self.load_chunk(k)?)?);
+        let loaded = self.load_chunk(k)?;
+        // Every cell read indexes the chunk by `row % CHUNK`, trusting the row
+        // count the file was indexed with; a chunk that disagrees would send
+        // those reads past its end.
+        let expected = CHUNK.min(self.nrows.saturating_sub(k * CHUNK));
+        if loaded.num_rows() != expected {
+            anyhow::bail!(
+                "rows {}.. of {} read back as {} rows instead of {expected}",
+                k * CHUNK + 1,
+                self.label,
+                loaded.num_rows()
+            );
+        }
+        let batch = Arc::new(self.with_computed(loaded)?);
         self.cache.lock().unwrap().put(k, batch.clone());
         Ok(batch)
     }
@@ -1961,7 +1974,7 @@ fn load_csv_meta(
         return commented_meta(source, delimiter, body_start, names);
     }
     // Skip past the ignored rows; the next record is the header, or data.
-    let header_at = skip_records(path, body_start, header.skip())?;
+    let header_at = skip_records(path, body_start, header.skip(), delimiter)?;
     let format = CsvFormat::default()
         .with_header(header.named())
         .with_delimiter(delimiter);
@@ -1971,11 +1984,11 @@ fn load_csv_meta(
         .infer_schema(BufReader::new(infer_file), Some(CSV_INFER_ROWS))
         .with_context(|| format!("inferring schema from {}", path.display()))?;
     let data_start = if header.named() {
-        skip_records(path, header_at, 1)?
+        skip_records(path, header_at, 1, delimiter)?
     } else {
         header_at
     };
-    let (chunk_offsets, nrows) = build_index_from(path, data_start)?;
+    let (chunk_offsets, nrows) = build_index_from(path, data_start, delimiter)?;
     Ok((
         source.backend(delimiter, chunk_offsets),
         Arc::new(schema),
@@ -1995,7 +2008,7 @@ fn commented_meta(
     names: Vec<String>,
 ) -> Result<(Backend, SchemaRef, usize, HeaderSpec, bool)> {
     let path = &source.path.clone();
-    let (chunk_offsets, nrows) = build_index_from(path, data_start)?;
+    let (chunk_offsets, nrows) = build_index_from(path, data_start, delimiter)?;
 
     // Types come from the data rows only (header, if any, is already excluded).
     let types = if nrows == 0 {
@@ -2114,83 +2127,86 @@ fn infer_types_from(path: &Path, delimiter: u8, data_start: u64) -> Result<Vec<D
         .collect())
 }
 
-/// Byte offset just past `n` records starting at `from`, quote-aware (so a
-/// newline inside a quoted field doesn't end a record) — or EOF if the file
-/// holds fewer records than that.
-fn skip_records(path: &Path, from: u64, n: usize) -> Result<u64> {
-    if n == 0 {
-        return Ok(from);
-    }
+/// Walk the records of a delimited file from `from`, calling `stop` with the
+/// count so far and the byte offset just past each record; the walk ends when
+/// it returns `true` or at EOF. Returns the last offset and the count.
+///
+/// Records are found by `csv_core` configured exactly as the chunk reader
+/// configures it, so a boundary found here is one the reader agrees with. A
+/// hand-rolled newline scan does not: the reader skips blank lines, and treats
+/// a `"` as a quote only at the start of a field (`5" screw` is plain text),
+/// and each disagreement shifts every row after it.
+fn walk_records(
+    path: &Path,
+    from: u64,
+    delimiter: u8,
+    mut stop: impl FnMut(usize, u64) -> bool,
+) -> Result<(u64, usize)> {
+    use csv_core::ReadRecordResult;
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(from))?;
-    let mut reader = BufReader::new(file);
-    let mut buf = [0u8; 64 * 1024];
-    let mut pos = from;
-    let mut in_quotes = false;
-    let mut seen = 0usize;
+    let mut parser = csv_core::ReaderBuilder::new().delimiter(delimiter).build();
+    let mut buf = vec![0u8; 64 * 1024];
+    // The field contents are not wanted; these are scratch the parser writes
+    // into and that is overwritten whenever it fills.
+    let mut fields = vec![0u8; 64 * 1024];
+    let mut ends = vec![0usize; 1024];
+    let (mut pos, mut rows) = (from, 0usize);
     loop {
-        let read = reader.read(&mut buf)?;
-        if read == 0 {
-            return Ok(pos);
-        }
-        for &b in &buf[..read] {
-            pos += 1;
-            match b {
-                b'"' => in_quotes = !in_quotes,
-                b'\n' if !in_quotes => {
-                    seen += 1;
-                    if seen == n {
-                        return Ok(pos);
+        // An empty read is how the parser is told the input has ended.
+        let n = file.read(&mut buf)?;
+        let mut input = &buf[..n];
+        loop {
+            // The parser reads *any* empty input as the end of the file, so
+            // what is left of a buffer that ran out exactly at a record's end
+            // must not be handed to it — the next read is.
+            if input.is_empty() && n > 0 {
+                break;
+            }
+            let (result, read, _, _) = parser.read_record(input, &mut fields, &mut ends);
+            input = &input[read..];
+            pos += read as u64;
+            match result {
+                ReadRecordResult::InputEmpty => break,
+                ReadRecordResult::OutputFull | ReadRecordResult::OutputEndsFull => {}
+                ReadRecordResult::Record => {
+                    rows += 1;
+                    if stop(rows, pos) {
+                        return Ok((pos, rows));
                     }
                 }
-                _ => {}
+                ReadRecordResult::End => return Ok((pos, rows)),
             }
+        }
+        if n == 0 {
+            return Ok((pos, rows));
         }
     }
 }
 
-/// Scan data rows starting at `data_start`, recording the byte offset of every
-/// chunk boundary (each `CHUNK`-th row) and the total row count. The scan is
-/// quote-aware: a `"` toggles quoting (so a `""` escape flips back), and only
-/// newlines outside quotes end a record — matching RFC 4180.
-fn build_index_from(path: &Path, data_start: u64) -> Result<(Vec<u64>, usize)> {
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(data_start))?;
-    let mut reader = BufReader::new(file);
-    let mut buf = [0u8; 64 * 1024];
-    let mut pos = data_start;
-    let mut in_quotes = false;
-    let mut rows: usize = 0;
-    let mut record_has_content = false;
-    let mut offsets = vec![data_start]; // offsets[0] = start of row 0
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        for &b in &buf[..n] {
-            pos += 1;
-            match b {
-                b'"' => {
-                    in_quotes = !in_quotes;
-                    record_has_content = true;
-                }
-                b'\n' if !in_quotes => {
-                    rows += 1;
-                    // `pos` is now the start of the next row.
-                    if rows.is_multiple_of(CHUNK) {
-                        offsets.push(pos);
-                    }
-                    record_has_content = false;
-                }
-                b'\r' => {}
-                _ => record_has_content = true,
-            }
-        }
+/// Byte offset just past `n` records starting at `from` — or EOF if the file
+/// holds fewer records than that.
+fn skip_records(path: &Path, from: u64, n: usize, delimiter: u8) -> Result<u64> {
+    if n == 0 {
+        return Ok(from);
     }
-    // A final record with no trailing newline still counts.
-    if record_has_content {
-        rows += 1;
+    Ok(walk_records(path, from, delimiter, |seen, _| seen == n)?.0)
+}
+
+/// Index the data rows starting at `data_start`: the byte offset of every
+/// chunk boundary (each `CHUNK`-th row) and the total row count.
+fn build_index_from(path: &Path, data_start: u64, delimiter: u8) -> Result<(Vec<u64>, usize)> {
+    let mut offsets = vec![data_start]; // offsets[0] = start of row 0
+    let (_, rows) = walk_records(path, data_start, delimiter, |rows, pos| {
+        // `pos` is where the next row starts.
+        if rows.is_multiple_of(CHUNK) {
+            offsets.push(pos);
+        }
+        false
+    })?;
+    // A boundary pushed after the very last row starts nothing.
+    if rows > 0 && rows.is_multiple_of(CHUNK) {
+        offsets.pop();
     }
     Ok((offsets, rows))
 }

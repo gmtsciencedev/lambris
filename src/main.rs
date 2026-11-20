@@ -2059,6 +2059,60 @@ mod tests {
         assert_eq!(start + window.len() - 1, last, "the last entry is on screen");
     }
 
+    /// The text reader and the row index must agree on where every record
+    /// ends, or each cell read past a disagreement lands on the wrong row —
+    /// or past the end of its chunk. Each case runs over a chunk boundary.
+    #[test]
+    fn row_index_agrees_with_the_reader_across_chunks() {
+        fn check(name: &str, content: String, want: usize) {
+            let d = Dataset::load(&write_text_fixture("tsv", &content)).unwrap();
+            assert_eq!(d.nrows, want, "{name}: row count");
+            let rows: Vec<usize> = (0..d.nrows).collect();
+            let ids = d.cells(0, &rows).unwrap();
+            for (i, id) in ids.iter().enumerate() {
+                assert_eq!(id.as_deref(), Some(i.to_string().as_str()), "{name}: row {i}");
+            }
+        }
+        let n = 9000;
+        let rows = |line: &dyn Fn(usize) -> String, eol: &str| -> String {
+            let mut s = format!("id\ttext{eol}");
+            for i in 0..n {
+                s.push_str(&line(i));
+                s.push_str(eol);
+            }
+            s
+        };
+        let plain = |i: usize| format!("{i}\tv{i}");
+        // Blank lines are skipped by the reader, so they are not rows.
+        let blank = |i: usize| match i {
+            100 | 8500 => format!("{i}\tv{i}\n"),
+            _ => plain(i),
+        };
+        check("blank lines", rows(&blank, "\n"), n);
+        // A `"` inside a field is text, not the start of a quoted span.
+        let inches = |i: usize| match i {
+            100 => format!("{i}\ta 5\" screw"),
+            200 => format!("{i}\tanother 3\" nail"),
+            _ => plain(i),
+        };
+        check("quote mid-field", rows(&inches, "\n"), n);
+        // A quoted field may hold a newline, and that is one record.
+        let quoted = |i: usize| match i {
+            100 => format!("{i}\t\"two\nlines\""),
+            _ => plain(i),
+        };
+        check("quoted newline", rows(&quoted, "\n"), n);
+        check("crlf", rows(&plain, "\r\n"), n);
+        let mut open_end = rows(&plain, "\n");
+        open_end.pop();
+        check("no final newline", open_end, n);
+        let mut exact = String::from("id\ttext\n");
+        for i in 0..8192 {
+            exact.push_str(&format!("{}\n", plain(i)));
+        }
+        check("exactly one chunk", exact, 8192);
+    }
+
     /// Two related tables: `meta` keyed by sample, `dict` describing each one.
     fn join_fixtures() -> (PathBuf, PathBuf) {
         let meta = write_text_fixture("csv", "sample,depth\nS1,10\nS2,20\nS3,30\n");
