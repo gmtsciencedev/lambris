@@ -5529,7 +5529,7 @@ mod tests {
     fn a_hidden_left_key_lets_the_right_key_through() {
         let left = write_text_fixture("csv", "sample,depth\nS1,10\n");
         let right = write_text_fixture("csv", "sample,label\nS1,control\nS9,other\n");
-        let mut tabs = Tabs::open(&[left, right], HeaderSpec::default(), Store::default()).unwrap();
+        let tabs = Tabs::open(&[left, right], HeaderSpec::default(), Store::default()).unwrap();
         let left_rows = tabs.tabs[0][0].view_rows(JOIN_MAX_ROWS);
         let right_rows = tabs.tabs[1][0].view_rows(JOIN_MAX_ROWS);
         let (data, _) = Dataset::join(
