@@ -108,6 +108,7 @@ pub struct JoinOrigin {
     pub right_tab: usize,
     pub left_key: String,
     pub right_key: String,
+    pub kind: crate::data::JoinKind,
 }
 
 /// A run of rows taken from another tab (`c`), described by where it started

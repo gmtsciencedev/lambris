@@ -19,6 +19,8 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 
+use crate::data::JoinKind;
+
 use crate::pattern::{
     Pattern, SavedColumn, SavedCrop, SavedHeader, SavedJoin, SavedMasks, SavedSort, SavedSortKey,
     Session, SessionTab,
@@ -93,6 +95,7 @@ pub enum Command {
     Join {
         left: (String, String),
         right: (String, String),
+        kind: JoinKind,
         handle: String,
     },
     Crop {
@@ -669,6 +672,18 @@ fn parse_statement(tokens: Vec<Token>) -> Result<Command> {
             }
         }
         "join" => {
+            // `join outer a.k with b.k as h`: the kind is a bare word, which a
+            // side never is — a side always carries its dot.
+            let kind = match c.peek() {
+                Some(Token::Word(w)) => match JoinKind::from_word(w) {
+                    Some(kind) => {
+                        c.next();
+                        kind
+                    }
+                    None => JoinKind::Left,
+                },
+                _ => JoinKind::Left,
+            };
             let left = side(&mut c)?;
             c.expect("with")?;
             let right = side(&mut c)?;
@@ -676,6 +691,7 @@ fn parse_statement(tokens: Vec<Token>) -> Result<Command> {
             Command::Join {
                 left,
                 right,
+                kind,
                 handle: c.name("a name for it")?,
             }
         }
@@ -846,10 +862,15 @@ impl fmt::Display for Command {
             Command::Join {
                 left,
                 right,
+                kind,
                 handle,
             } => write!(
                 f,
-                "join {}.{} with {}.{} as {handle}",
+                "join {}{}.{} with {}.{} as {handle}",
+                match kind {
+                    JoinKind::Left => String::new(),
+                    other => format!("{} ", other.word()),
+                },
                 left.0,
                 quoted(&left.1),
                 right.0,
@@ -970,6 +991,7 @@ impl Script {
                 Command::Join {
                     left,
                     right,
+                    kind,
                     handle: name,
                 } => {
                     let sides = (find(&handles, &left.0, line)?, find(&handles, &right.0, line)?);
@@ -983,6 +1005,7 @@ impl Script {
                                 right: sides.1,
                                 left_key: left.1.clone(),
                                 right_key: right.1.clone(),
+                                kind: *kind,
                             }),
                             ..SessionTab::default()
                         },
@@ -1143,13 +1166,14 @@ filter meta /^S1[0-9]/
 mask meta batch "A" "B"
 mask reads rows 2 7
 join meta.sample with reads."sample name" as joined
+join outer meta.sample with reads.id as both
 crop joined rows sample "S1".."S9" cols first "middle one" last as cut
 crop joined rows 2..6 as head
 transpose cut
 export cut to "out.parquet"
 "#;
         let commands = parse(text);
-        assert_eq!(commands.len(), 18, "{commands:#?}");
+        assert_eq!(commands.len(), 19, "{commands:#?}");
 
         // Written back out, every one of them reads as itself again.
         let written: String = commands

@@ -66,7 +66,7 @@ cargo run --release
 | `u` | Put every hidden column back, in the file's own order |
 | `m` | Show the view as a markdown table, to copy somewhere (see [Markdown](#markdown)) |
 | `t` | Transpose the table (first column becomes the headers); `t`/`Esc` to return |
-| `J` | Join two tabs on a key column: `Enter` on each side (see [Join](#join)) |
+| `J` | Join two tabs on a key column: `Enter` on each side, `J` again for inner/left/right/outer (see [Join](#join)) |
 | `c` | Crop: mark one cell, then another — the rectangle becomes a tab (see [Cropping](#cropping)) |
 | `Tab` / `Shift-Tab` | Switch to the next / previous tab (wraps around) |
 | `o` | Open another file in a new tab; at the prompt `Tab` browses the folder |
@@ -507,7 +507,7 @@ separate judgement — it is the line `X` already draws.
 | `sort h col [desc] [chars 1..4 nat]` | |
 | `filter h /re/` | |
 | `mask h col "v"` / `mask h rows 4` | |
-| `join a.k with b.k as h` | |
+| `join [inner\|right\|outer] a.k with b.k as h` | left when no kind is given |
 | `crop h rows col "a".."b" cols x y as c` | |
 | `transpose h` | |
 | `export h to out.parquet` | |
@@ -570,8 +570,10 @@ own, so it is written down as the recipe it is — the two tabs and the key colu
 — and **made again** when the session reopens:
 
 ```json
-{ "join": { "left": 0, "right": 1, "left_key": "sample", "right_key": "sample" } }
+{ "join": { "left": 0, "right": 1, "left_key": "sample", "right_key": "sample", "kind": "outer" } }
 ```
+
+`kind` is one of `inner`, `right`, `outer`; a left join leaves it out.
 
 Tabs are saved in order and a join always points at earlier ones, so the whole
 lot rebuilds in a single pass — a join of a join included. Being a recipe rather
@@ -909,23 +911,36 @@ tabs, `h`/`l` move across columns — and press `Enter`; then do the same on the
 other side and press `Enter` again. The bottom line says which step you are on
 and names the column you picked. `Esc` backs out at any point.
 
-The result opens as a new tab, labelled `left ⋈ right`:
+The join is a **left join** unless you say otherwise: pressing `J` again while
+the wizard runs steps through **left → inner → right → outer**, keeping a pick
+already made, and the bottom line names the kind in force.
+
+| Kind | Rows kept | Tab label |
+| --- | --- | --- |
+| left | every row of the first side | `a ⟕ b` |
+| inner | only rows whose key is on both sides | `a ⋈ b` |
+| right | every row of the second side | `a ⟖ b` |
+| outer | every row of either side | `a ⟗ b` |
+
+A kept row that matched nothing carries `NA` across the other side's columns.
+Rows come out in the order of the side kept whole — the second side's for a
+right join, the first side's otherwise — and an outer join ends with the rows
+only the second side had. A key appearing several times multiplies rows, as a
+join does. The status line counts what happened to the rows that matched
+nothing on each side, kept or dropped:
 
 ```
-#  sample depth label            row 1/3  col 1/3   3 rows · 2 matched, 1 unmatched
+#  sample depth label    row 1/3  col 1/3   left join · 3 rows · 2 matched · 1 left-only kept · 0 right-only dropped
 1  S1     10    control
 2  S2     20    treated
 3  S3     30    NA
 ```
 
-It is a **left join**: every row of the first side is kept, and one that matched
-nothing carries `NA` across the second side's columns — so what *didn't* match
-stays visible instead of silently disappearing. A key appearing several times on
-the right multiplies the left row, as a join does. The status line reports how
-many rows matched and how many didn't.
-
 - The second side's **key column is dropped**, since it would repeat the first
-  one exactly. Any other name clash gets a `_2` suffix.
+  one: a row only the second side supplied (right and outer joins) gets its key
+  written into the first side's key column. If the first side's key column is
+  hidden, the second side's key is kept instead. Any other name clash gets a
+  `_2` suffix.
 - Keys are compared as the **trimmed text you see**, so a number in one file
   matches the same number stored as text in another. A blank key matches
   nothing — pairing rows on "no value" is never what you meant.

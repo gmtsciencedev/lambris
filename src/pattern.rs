@@ -304,6 +304,14 @@ pub struct SavedJoin {
     /// The key columns, by name.
     pub left_key: String,
     pub right_key: String,
+    /// Which unmatched rows are kept. Left when absent, which is what every
+    /// join was before there was a choice.
+    #[serde(default, skip_serializing_if = "is_left")]
+    pub kind: crate::data::JoinKind,
+}
+
+fn is_left(kind: &crate::data::JoinKind) -> bool {
+    *kind == crate::data::JoinKind::Left
 }
 
 /// A crop, as a session writes it down: which tab it was taken from, and the

@@ -705,18 +705,24 @@ impl Dataset {
         Ok(turned)
     }
 
-    /// Left-join `right` onto this dataset: every row of `left_rows` is kept,
-    /// with the matching row of `right` appended, or nulls where nothing
-    /// matched. Rows are given in view order, so an active filter or sort on
-    /// either side is respected, and a transposed view joins as the table it
-    /// shows. Keys are compared as the trimmed text the viewer displays, so a
-    /// number in one file matches the same number stored as text in the other.
+    /// Join `right` onto `left` on their key columns. Which unmatched rows
+    /// survive is `kind`'s call: an inner join keeps only pairs, a left or right
+    /// join keeps every row of that side with nulls across the other, an outer
+    /// join keeps both. Rows are given in view order, so an active filter or
+    /// sort on either side is respected, and a transposed view joins as the
+    /// table it shows. Keys are compared as the trimmed text the viewer
+    /// displays, so a number in one file matches the same number stored as text
+    /// in the other.
     ///
-    /// Duplicate keys on the right multiply the left row, as a join does.
-    /// Returns `None` if `cancel` fires.
+    /// Rows come out in the order of the side that is kept whole — the right
+    /// one for a right join, the left one otherwise — and an outer join ends
+    /// with the right rows that matched nothing, in the right side's order.
+    /// Duplicate keys multiply rows, as a join does. Returns `None` if `cancel`
+    /// fires.
     pub fn join(
         left: JoinSide<'_>,
         right: JoinSide<'_>,
+        kind: JoinKind,
         cancel: impl Fn() -> bool,
     ) -> Result<Option<(Dataset, JoinReport)>> {
         let (left_rows, left_key) = (left.rows, left.key);
@@ -733,57 +739,40 @@ impl Dataset {
         let left_keys = this.cells(left_key, left_rows)?;
         let right_keys = right_data.cells(right_key, right_rows)?;
 
-        // Index the right side by key. Blank keys match nothing — joining on
-        // "no value" would pair up rows that have nothing in common.
-        let mut index: HashMap<&str, Vec<usize>> = HashMap::new();
-        for (i, key) in right_keys.iter().enumerate() {
-            if let Some(key) = key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
-                index.entry(key).or_default().push(right_rows[i]);
-            }
-        }
-
-        // Walk the left side, building the row pairing of the result.
-        let mut take_left: Vec<u32> = Vec::with_capacity(left_rows.len());
-        let mut take_right: Vec<Option<u32>> = Vec::with_capacity(left_rows.len());
-        let mut report = JoinReport::default();
-        'rows: for (i, key) in left_keys.iter().enumerate() {
-            if i % 1024 == 0 && cancel() {
-                return Ok(None);
-            }
-            let hits = key
-                .as_deref()
-                .map(str::trim)
-                .filter(|k| !k.is_empty())
-                .and_then(|k| index.get(k));
-            match hits {
-                Some(rows) => {
-                    report.matched += 1;
-                    for &r in rows {
-                        if take_left.len() >= JOIN_MAX_ROWS {
-                            report.truncated = true;
-                            break 'rows;
-                        }
-                        take_left.push(left_rows[i] as u32);
-                        take_right.push(Some(r as u32));
-                    }
-                }
-                None => {
-                    report.unmatched += 1;
-                    if take_left.len() >= JOIN_MAX_ROWS {
-                        report.truncated = true;
-                        break 'rows;
-                    }
-                    take_left.push(left_rows[i] as u32);
-                    take_right.push(None);
-                }
-            }
-        }
-        report.rows = take_left.len();
+        // A right join is a left join walked from the other side; the pairs are
+        // swapped back afterwards so the columns keep their places.
+        let flipped = kind == JoinKind::Right;
+        let (drive, other) = match flipped {
+            false => ((&left_keys, left_rows), (&right_keys, right_rows)),
+            true => ((&right_keys, right_rows), (&left_keys, left_rows)),
+        };
+        let Some(walk) = pair_rows(drive, other, kind, &cancel) else {
+            return Ok(None);
+        };
+        let (take_left, take_right): (Vec<Option<u32>>, Vec<Option<u32>>) = match flipped {
+            false => walk.pairs.into_iter().unzip(),
+            true => walk.pairs.into_iter().map(|(r, l)| (l, r)).unzip(),
+        };
+        let (left_only, right_only) = match flipped {
+            false => (walk.drive_only, walk.other_only),
+            true => (walk.other_only, walk.drive_only),
+        };
+        let report = JoinReport {
+            rows: take_left.len(),
+            matched: walk.matched,
+            left_only,
+            right_only,
+            truncated: walk.truncated,
+        };
 
         // Gather both sides through Arrow, so column types survive the join and
         // an unmatched row reads as a null rather than an empty string.
         let left_idx = UInt32Array::from(take_left);
         let right_idx = UInt32Array::from(take_right);
+        // Rows that only the right side supplied have no left key; the right
+        // key fills it in, so the key column is never blank on a kept row.
+        let fill_key = matches!(kind, JoinKind::Right | JoinKind::Outer);
+        let key_shown = left.cols.contains(&left_key);
         // Only the columns each side is showing, in the order it shows them.
         let mut names: Vec<String> = Vec::new();
         let mut columns: Vec<ArrayRef> = Vec::new();
@@ -791,12 +780,21 @@ impl Dataset {
             let Some(full) = this.full_column(col, &cancel)? else {
                 return Ok(None);
             };
-            columns.push(arrow::compute::take(full.as_ref(), &left_idx, None)?);
+            let mut taken = arrow::compute::take(full.as_ref(), &left_idx, None)?;
+            if col == left_key && fill_key {
+                let Some(other) = right_data.full_column(right_key, &cancel)? else {
+                    return Ok(None);
+                };
+                let other = arrow::compute::take(other.as_ref(), &right_idx, None)?;
+                taken = coalesce(&taken, &other)?;
+            }
+            columns.push(taken);
             names.push(this.column_names[col].clone());
         }
         for &col in right.cols {
-            // The right key column would repeat the left one exactly.
-            if col == right_key {
+            // The right key column would repeat the left one exactly — unless
+            // the left key is hidden, and then it is the only key on show.
+            if col == right_key && key_shown {
                 continue;
             }
             let Some(full) = right_data.full_column(col, &cancel)? else {
@@ -816,7 +814,7 @@ impl Dataset {
         let dataset = Dataset::in_memory(
             batch,
             this.path.clone(),
-            format!("{} ⋈ {}", this.label, right_data.label),
+            format!("{} {} {}", this.label, kind.symbol(), right_data.label),
             None, // a join is not the file's own layout
             HeaderSpec::default(),
         );
@@ -1510,17 +1508,180 @@ pub struct JoinSide<'a> {
     pub key: usize,
 }
 
+/// Which unmatched rows a join keeps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JoinKind {
+    /// Only rows whose key is on both sides.
+    Inner,
+    /// Every row of the first side.
+    #[default]
+    Left,
+    /// Every row of the second side.
+    Right,
+    /// Every row of either side.
+    Outer,
+}
+
+impl JoinKind {
+    pub const ALL: [JoinKind; 4] = [JoinKind::Left, JoinKind::Inner, JoinKind::Right, JoinKind::Outer];
+
+    /// The word for it, as a script and the status line write it.
+    pub fn word(self) -> &'static str {
+        match self {
+            JoinKind::Inner => "inner",
+            JoinKind::Left => "left",
+            JoinKind::Right => "right",
+            JoinKind::Outer => "outer",
+        }
+    }
+
+    pub fn from_word(word: &str) -> Option<JoinKind> {
+        JoinKind::ALL.into_iter().find(|k| k.word() == word)
+    }
+
+    /// The relational-algebra sign, for the label of the tab it makes.
+    pub fn symbol(self) -> &'static str {
+        match self {
+            JoinKind::Inner => "⋈",
+            JoinKind::Left => "⟕",
+            JoinKind::Right => "⟖",
+            JoinKind::Outer => "⟗",
+        }
+    }
+
+    /// The next kind in the order `J` steps through them.
+    pub fn next(self) -> JoinKind {
+        let at = JoinKind::ALL.iter().position(|&k| k == self).unwrap_or(0);
+        JoinKind::ALL[(at + 1) % JoinKind::ALL.len()]
+    }
+
+    pub fn keeps_left(self) -> bool {
+        matches!(self, JoinKind::Left | JoinKind::Outer)
+    }
+
+    pub fn keeps_right(self) -> bool {
+        matches!(self, JoinKind::Right | JoinKind::Outer)
+    }
+}
+
 /// What a join produced, for the status line.
 #[derive(Default, Debug, PartialEq)]
 pub struct JoinReport {
     /// Rows in the result.
     pub rows: usize,
-    /// Left rows that found at least one match.
+    /// Rows of the side kept whole (the left one, but the right one for a
+    /// right join) that found at least one match.
     pub matched: usize,
-    /// Left rows that found none, and so carry nulls on the right.
-    pub unmatched: usize,
+    /// Left rows that matched nothing — kept with nulls by a left or outer
+    /// join, dropped otherwise.
+    pub left_only: usize,
+    /// Right rows that matched nothing — kept with nulls by a right or outer
+    /// join, dropped otherwise.
+    pub right_only: usize,
     /// Whether the result hit [`JOIN_MAX_ROWS`] and was cut short.
     pub truncated: bool,
+}
+
+/// The row pairing of a join, walked from one side (`drive`) against the
+/// other. Rows are `(view rows, displayed keys)` as the side shows them.
+struct Pairing {
+    pairs: Vec<(Option<u32>, Option<u32>)>,
+    matched: usize,
+    drive_only: usize,
+    other_only: usize,
+    truncated: bool,
+}
+
+/// Pair up the rows of two sides by key. Unmatched rows of `drive` are kept
+/// unless the join is inner; for an outer join the unmatched rows of `other`
+/// follow at the end. Blank keys match nothing — joining on "no value" would
+/// pair up rows that have nothing in common. `None` if `cancel` fires.
+fn pair_rows(
+    drive: (&Vec<Option<String>>, &[usize]),
+    other: (&Vec<Option<String>>, &[usize]),
+    kind: JoinKind,
+    cancel: &impl Fn() -> bool,
+) -> Option<Pairing> {
+    fn key(k: &Option<String>) -> Option<&str> {
+        k.as_deref().map(str::trim).filter(|k| !k.is_empty())
+    }
+    let ((drive_keys, drive_rows), (other_keys, other_rows)) = (drive, other);
+    // Index the other side by key, by position so its matches can be ticked.
+    let mut index: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, k) in other_keys.iter().enumerate() {
+        if let Some(k) = key(k) {
+            index.entry(k).or_default().push(i);
+        }
+    }
+    let keep_drive = kind != JoinKind::Inner;
+    let mut hit = vec![false; other_rows.len()];
+    let mut out = Pairing {
+        pairs: Vec::with_capacity(drive_rows.len()),
+        matched: 0,
+        drive_only: 0,
+        other_only: 0,
+        truncated: false,
+    };
+    for (i, k) in drive_keys.iter().enumerate() {
+        if i % 1024 == 0 && cancel() {
+            return None;
+        }
+        let row = Some(drive_rows[i] as u32);
+        match key(k).and_then(|k| index.get(k)) {
+            Some(matches) => {
+                out.matched += 1;
+                for &j in matches {
+                    hit[j] = true;
+                    if out.pairs.len() < JOIN_MAX_ROWS {
+                        out.pairs.push((row, Some(other_rows[j] as u32)));
+                    } else {
+                        out.truncated = true;
+                    }
+                }
+            }
+            None => {
+                out.drive_only += 1;
+                if !keep_drive {
+                    continue;
+                }
+                if out.pairs.len() < JOIN_MAX_ROWS {
+                    out.pairs.push((row, None));
+                } else {
+                    out.truncated = true;
+                }
+            }
+        }
+    }
+    // Counted whatever the kind, so the status line can say what was dropped.
+    for (j, &was_hit) in hit.iter().enumerate() {
+        if was_hit {
+            continue;
+        }
+        out.other_only += 1;
+        if kind == JoinKind::Outer {
+            if out.pairs.len() < JOIN_MAX_ROWS {
+                out.pairs.push((None, Some(other_rows[j] as u32)));
+            } else {
+                out.truncated = true;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// `primary`, with its nulls filled from `fallback` row for row. When the two
+/// differ in type both are read as text, the way keys are compared.
+fn coalesce(primary: &ArrayRef, fallback: &ArrayRef) -> Result<ArrayRef> {
+    let (primary, fallback) = match primary.data_type() == fallback.data_type() {
+        true => (primary.clone(), fallback.clone()),
+        false => (
+            arrow::compute::cast(primary, &DataType::Utf8)?,
+            arrow::compute::cast(fallback, &DataType::Utf8)?,
+        ),
+    };
+    let present = arrow::compute::is_not_null(&primary)?;
+    Ok(arrow::compute::kernels::zip::zip(&present, &primary, &fallback)?)
 }
 
 /// `name`, or the first `name_2`, `name_3`, … not already taken — the two

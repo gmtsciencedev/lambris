@@ -16,7 +16,7 @@ use clap::Parser;
 use crossterm::event::{self, Event, KeyEventKind};
 
 use app::App;
-use data::{Dataset, HeaderSpec, JoinSide, JOIN_MAX_ROWS};
+use data::{Dataset, HeaderSpec, JoinKind, JoinSide, JOIN_MAX_ROWS};
 use pattern::{
     relative_to, resolve_in, SavedCrop, SavedJoin, Session, SessionTab, Sessions, Store,
 };
@@ -155,6 +155,8 @@ struct Tabs {
 struct JoinWizard {
     /// The first pick: which tab, and which of its columns.
     left: Option<(usize, usize)>,
+    /// Which unmatched rows to keep; `J` steps through the kinds.
+    kind: JoinKind,
 }
 
 impl Tabs {
@@ -260,7 +262,7 @@ impl Tabs {
                     };
                     let left_key = key(left, &join.left_key)?;
                     let right_key = key(right, &join.right_key)?;
-                    joined_view(&tabs, (left, left_key), (right, right_key))
+                    joined_view(&tabs, (left, left_key), (right, right_key), join.kind)
                 });
                 match made {
                     Some(mut app) => {
@@ -748,6 +750,7 @@ impl Tabs {
                 (Some(join), _) => commands.push(script::Command::Join {
                     left: (handles[join.left].clone(), join.left_key.clone()),
                     right: (handles[join.right].clone(), join.right_key.clone()),
+                    kind: join.kind,
                     handle: handle.clone(),
                 }),
                 (_, Some(crop)) => commands.push(script::Command::Crop {
@@ -853,6 +856,7 @@ impl Tabs {
                         right: origin.right_tab,
                         left_key: origin.left_key.clone(),
                         right_key: origin.right_key.clone(),
+                        kind: origin.kind,
                     }),
                     crop: None,
                     transposed,
@@ -936,10 +940,13 @@ impl Tabs {
             ));
         }
         let wizard = self.join.as_ref()?;
+        let kind = wizard.kind.word();
         Some(match wizard.left {
-            None => " join: go to the first key column — Tab switches tabs · Enter picks · Esc cancels".into(),
+            None => format!(
+                " {kind} join: go to the first key column — Tab switches tabs · Enter picks · J inner/left/right/outer · Esc cancels"
+            ),
             Some((tab, col)) => format!(
-                " join on {} — now the second key column · Enter joins · Esc cancels",
+                " {kind} join on {} — now the second key column · Enter joins · J inner/left/right/outer · Esc cancels",
                 self.column_label(tab, col).unwrap_or_else(|| "?".into()),
             ),
         })
@@ -1040,7 +1047,17 @@ impl Tabs {
             self.crop(span);
         }
         if join_request {
-            self.join = Some(JoinWizard { left: None });
+            // `J` starts the wizard, and once it is running steps the kind on,
+            // keeping a pick already made.
+            match &mut self.join {
+                Some(wizard) => wizard.kind = wizard.kind.next(),
+                None => {
+                    self.join = Some(JoinWizard {
+                        left: None,
+                        kind: JoinKind::default(),
+                    })
+                }
+            }
         }
         if cancel_join {
             self.join = None;
@@ -1230,8 +1247,9 @@ impl Tabs {
                 self.app_mut().status_msg = Some(format!("join on {named} …"));
             }
             Some(left) => {
+                let kind = wizard.kind;
                 self.join = None;
-                self.run_join(left, pick);
+                self.run_join(left, pick, kind);
             }
         }
     }
@@ -1239,13 +1257,13 @@ impl Tabs {
     /// Join the two picked columns and open the result in a new tab. Each side
     /// contributes the rows it is currently showing, so filters, sorts and
     /// transposed views all carry through.
-    fn run_join(&mut self, left: (usize, usize), right: (usize, usize)) {
+    fn run_join(&mut self, left: (usize, usize), right: (usize, usize), kind: JoinKind) {
         // A tab could have been closed between the two picks.
         if self.tabs.get(left.0).is_none() || self.tabs.get(right.0).is_none() {
             self.app_mut().status_msg = Some("join: that tab is gone".into());
             return;
         }
-        match joined_view(&self.tabs, left, right) {
+        match joined_view(&self.tabs, left, right, kind) {
             Some(view) => {
                 self.tabs.push(vec![view]);
                 self.current = self.tabs.len() - 1;
@@ -1264,6 +1282,7 @@ fn joined_view(
     tabs: &[Vec<App>],
     left: (usize, usize),
     right: (usize, usize),
+    kind: JoinKind,
 ) -> Option<App> {
     let ((left_tab, left_col), (right_tab, right_col)) = (left, right);
     let left_app = tabs.get(left_tab)?.last()?;
@@ -1283,6 +1302,7 @@ fn joined_view(
             cols: right_app.visible_cols(),
             key: right_col,
         },
+        kind,
         interrupt::requested,
     );
     let (dataset, report) = joined.ok()??;
@@ -1293,10 +1313,20 @@ fn joined_view(
         right_tab,
         left_key: left_app.data.column_names[left_col].clone(),
         right_key: right_app.data.column_names[right_col].clone(),
+        kind,
     }));
+    // What happened to the rows that found no partner: kept with NA across
+    // the other side, or dropped — counted either way.
+    let fate = |kept: bool| if kept { "kept" } else { "dropped" };
     let mut msg = format!(
-        "{} rows · {} matched, {} unmatched",
-        report.rows, report.matched, report.unmatched
+        "{} join · {} rows · {} matched · {} left-only {} · {} right-only {}",
+        kind.word(),
+        report.rows,
+        report.matched,
+        report.left_only,
+        fate(kind.keeps_left()),
+        report.right_only,
+        fate(kind.keeps_right()),
     );
     if report.truncated {
         msg.push_str(&format!(" · cut at {JOIN_MAX_ROWS}"));
@@ -5351,7 +5381,7 @@ mod tests {
         let joined = &tabs.app_mut().data;
         // The right key column is dropped: it would repeat the left one.
         assert_eq!(joined.column_names, vec!["sample", "depth", "label"]);
-        assert!(joined.label.contains('⋈'), "label: {}", joined.label);
+        assert!(joined.label.contains('⟕'), "label: {}", joined.label);
         assert_eq!(joined.nrows, 3, "every left row is kept");
         assert_eq!(joined.cell_display(2, 0).unwrap().as_deref(), Some("control"));
         assert_eq!(joined.cell_display(2, 1).unwrap().as_deref(), Some("treated"));
@@ -5361,7 +5391,102 @@ mod tests {
         assert_eq!(joined.column_types[1], "Int64");
         assert!(joined.is_numeric(1));
         let msg = tabs.app_mut().status_msg.clone().unwrap_or_default();
-        assert!(msg.contains("2 matched, 1 unmatched"), "unexpected: {msg}");
+        assert!(msg.contains("2 matched · 1 left-only kept"), "unexpected: {msg}");
+    }
+
+    /// Run the wizard with `J` pressed `steps` extra times after the first
+    /// pick, which steps the kind on from left.
+    fn join_kind(steps: usize) -> Tabs {
+        let left = write_text_fixture("csv", "sample,depth\nS1,10\nS2,20\nS3,30\n");
+        let right = write_text_fixture("csv", "sample,label\nS4,extra\nS1,control\nS2,treated\n");
+        let mut tabs = Tabs::open(&[left, right], HeaderSpec::default(), Store::default()).unwrap();
+        tabs.key(key('J'));
+        assert!(tabs.step());
+        tabs.key(KeyEvent::from(KeyCode::Enter));
+        assert!(tabs.step());
+        for _ in 0..steps {
+            tabs.key(key('J'));
+            assert!(tabs.step());
+        }
+        tabs.key(KeyEvent::from(KeyCode::Tab));
+        assert!(tabs.step());
+        tabs.key(KeyEvent::from(KeyCode::Enter));
+        assert!(tabs.step());
+        assert_eq!(tabs.tabs.len(), 3, "the join opened a tab");
+        tabs
+    }
+
+    #[test]
+    fn j_in_the_wizard_steps_the_kind_and_keeps_the_pick() {
+        let left = write_text_fixture("csv", "sample\nS1\n");
+        let mut tabs = Tabs::open(&[left], HeaderSpec::default(), Store::default()).unwrap();
+        tabs.key(key('J'));
+        assert!(tabs.step());
+        assert!(tabs.join_banner().unwrap().starts_with(" left join"));
+        tabs.key(KeyEvent::from(KeyCode::Enter));
+        assert!(tabs.step());
+        for word in ["inner", "right", "outer", "left"] {
+            tabs.key(key('J'));
+            assert!(tabs.step());
+            let banner = tabs.join_banner().unwrap();
+            assert!(banner.starts_with(&format!(" {word} join on")), "{banner}");
+        }
+    }
+
+    #[test]
+    fn inner_join_keeps_only_pairs() {
+        let mut tabs = join_kind(1);
+        let joined = &tabs.app_mut().data;
+        assert!(joined.label.contains('⋈'), "label: {}", joined.label);
+        assert_eq!(joined.nrows, 2);
+        assert_eq!(column_values(tabs.app_mut(), 0), vec!["S1", "S2"]);
+        let msg = tabs.app_mut().status_msg.clone().unwrap_or_default();
+        assert!(msg.contains("1 left-only dropped · 1 right-only dropped"), "{msg}");
+    }
+
+    #[test]
+    fn right_join_keeps_the_right_rows_in_their_order() {
+        let mut tabs = join_kind(2);
+        let app = tabs.app_mut();
+        assert_eq!(app.data.column_names, vec!["sample", "depth", "label"]);
+        assert_eq!(app.data.nrows, 3);
+        // The right side's order, and its key filling in where the left had none.
+        assert_eq!(column_values(app, 0), vec!["S4", "S1", "S2"]);
+        assert_eq!(column_values(app, 2), vec!["extra", "control", "treated"]);
+        assert!(app.data.is_null(1, 0), "S4 has no depth");
+        // The key column keeps the left side's type.
+        assert_eq!(app.data.column_types[1], "Int64");
+    }
+
+    #[test]
+    fn outer_join_keeps_both_sides() {
+        let mut tabs = join_kind(3);
+        let app = tabs.app_mut();
+        assert!(app.data.label.contains('⟗'), "label: {}", app.data.label);
+        // The left rows in order, then what only the right side had.
+        assert_eq!(column_values(app, 0), vec!["S1", "S2", "S3", "S4"]);
+        assert!(app.data.is_null(2, 2), "S3 has no label");
+        assert!(app.data.is_null(1, 3), "S4 has no depth");
+        let msg = app.status_msg.clone().unwrap_or_default();
+        assert!(msg.contains("4 rows · 2 matched · 1 left-only kept · 1 right-only kept"), "{msg}");
+    }
+
+    #[test]
+    fn a_hidden_left_key_lets_the_right_key_through() {
+        let left = write_text_fixture("csv", "sample,depth\nS1,10\n");
+        let right = write_text_fixture("csv", "sample,label\nS1,control\nS9,other\n");
+        let mut tabs = Tabs::open(&[left, right], HeaderSpec::default(), Store::default()).unwrap();
+        let left_rows = tabs.tabs[0][0].view_rows(JOIN_MAX_ROWS);
+        let right_rows = tabs.tabs[1][0].view_rows(JOIN_MAX_ROWS);
+        let (data, _) = Dataset::join(
+            JoinSide { data: &tabs.tabs[0][0].data, rows: &left_rows, cols: &[1], key: 0 }, // sample hidden
+            JoinSide { data: &tabs.tabs[1][0].data, rows: &right_rows, cols: tabs.tabs[1][0].visible_cols(), key: 0 },
+            JoinKind::Outer,
+            || false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(data.column_names, vec!["depth", "sample", "label"]);
     }
 
     #[test]

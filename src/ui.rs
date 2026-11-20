@@ -93,7 +93,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             ("m", "show the view as a markdown table, to copy somewhere"),
             ("t", "transpose the table (t or Esc to come back)"),
-            ("J", "join two tabs on a key column: Enter on each side"),
+            ("J", "join two tabs on a key column: Enter on each side · J again: inner/left/right/outer"),
             ("c", "crop: mark one cell, then the opposite corner — it becomes a tab"),
         ],
     ),
